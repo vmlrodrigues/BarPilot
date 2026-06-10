@@ -4,6 +4,8 @@
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2B-black?logo=apple&logoColor=white)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
+[![Download for Mac](https://img.shields.io/badge/Download_for_Mac-007AFF?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/vmlrodrigues/BarPilot/releases/latest/download/BarPilot.dmg)
+
 A macOS **menu-bar app** that shows your GitHub Copilot AIU credit **cost** for a
 selected period at a glance. Click the menu-bar item to open a window with the
 full breakdown — summary, models, daily, sessions, and top calls.

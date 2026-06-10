@@ -3,3 +3,7 @@
 BarPilot.app/
 *.xcodeproj
 .DS_Store
+.release-staging/
+*.dmg
+holding/
+AuthKey_*.p8
