@@ -27,6 +27,19 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN_PATH" "$APP/Contents/MacOS/$BIN_NAME"
 cp Info.plist "$APP/Contents/Info.plist"
 
+# Generate the app icon (.icns) from AppIcon.png, if present.
+if [ -f AppIcon.png ]; then
+    echo "▸ Generating app icon …"
+    ICONSET="$(mktemp -d)/AppIcon.iconset"
+    mkdir -p "$ICONSET"
+    for size in 16 32 128 256 512; do
+        sips -z "$size" "$size"             AppIcon.png --out "$ICONSET/icon_${size}x${size}.png"    >/dev/null
+        sips -z "$((size*2))" "$((size*2))" AppIcon.png --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+    done
+    iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+    rm -rf "$(dirname "$ICONSET")"
+fi
+
 # Ad-hoc sign so it launches cleanly via Finder / `open`.
 codesign --force --sign - "$APP" 2>/dev/null || true
 
