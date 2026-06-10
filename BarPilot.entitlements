@@ -2,14 +2,6 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!--
-	  BarPilot is a Developer ID (non-sandboxed) app. It reads other apps'
-	  local telemetry files under ~/Library and writes the optional
-	  LaunchAgent/helper there, so it must NOT be sandboxed. It needs no
-	  other entitlements: no network, microphone, camera, or screen capture.
-	  Hardened Runtime is enabled at signing time (codesign --options
-	  runtime), which notarisation requires.
-	-->
 	<key>com.apple.security.app-sandbox</key>
 	<false/>
 </dict>
