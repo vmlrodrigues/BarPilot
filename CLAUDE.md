@@ -7,7 +7,8 @@ top calls). Formerly named **TokenTally** — the app, bundle id, product/target
 and `Sources/` dir were all renamed to BarPilot; the folder was later renamed too.
 
 It reads your local GitHub Copilot OTel telemetry directly off disk (**no
-external dependencies**); the only network use is the built-in GitHub auto-updater.
+external dependencies**); network use is limited to the GitHub auto-updater and
+the USD→AUD exchange-rate fetch.
 
 ## Build / run / verify
 
@@ -79,6 +80,7 @@ Sources/BarPilot/
   Setup.swift        TelemetrySetup — opt-in native OTel enablement.
   Updater.swift      Silent GitHub-Releases auto-updater (Developer ID-gated).
   LoginItem.swift    "Start at Login" via SMAppService (macOS 13+).
+  Currency.swift     USD/AUD display currency + live USD→AUD rate (open.er-api.com).
 Info.plist           LSUIElement (menu-bar-only) agent bundle.
 build-app.sh         Build + assemble + ad-hoc codesign the .app.
 ```
@@ -114,6 +116,13 @@ refresh / window-open re-reads disk.
   keep the "no network for your *data*" wording accurate.
 - **Start at Login** via `SMAppService.mainApp` (`LoginItem.swift`), toggled from
   the right-click menu — no third-party dependency.
+- **Currency (USD/AUD):** everything is computed/stored in USD; AUD is a
+  display-time conversion via a live rate (`Currency.swift`, open.er-api.com,
+  fetched on launch + every 24h, cached in UserDefaults for offline use). The
+  budget stays canonical USD (`monthlyBudgetUSD`); in AUD it's shown converted and
+  rounded to a whole dollar (`budgetMoneyString`), and the budget dialog reads/writes
+  in the displayed currency. `effectiveCurrency` falls back to USD if AUD is selected
+  before a rate has loaded. All cost display goes through `Store.costString`.
 
 ## Gotchas
 

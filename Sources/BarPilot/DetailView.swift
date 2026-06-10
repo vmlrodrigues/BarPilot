@@ -77,7 +77,7 @@ struct DetailView: View {
             }
 
             HStack(alignment: .lastTextBaseline, spacing: 10) {
-                Text(Fmt.cost(store.report.totalCredits))
+                Text(store.costString(credits: store.report.totalCredits))
                     .font(.system(size: 34, weight: .bold, design: .rounded))
                     .monospacedDigit()
                 Text("\(Fmt.credits(store.report.totalCredits)) credits")
@@ -186,6 +186,7 @@ struct DetailView: View {
 // ---------------------------------------------------------------------------
 
 struct BudgetBar: View {
+    @EnvironmentObject var store: UsageStore
     let title: String
     let spentCredits: Double
     let budgetCredits: Double
@@ -202,7 +203,7 @@ struct BudgetBar: View {
                 Text(title)
                     .font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("\(Fmt.money(monthlyBudget)) / mo")
+                Text("\(store.budgetMoneyString(usd: monthlyBudget)) / mo")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .help("Monthly budget. Change it from the menu-bar icon’s right-click menu → “Set Monthly Budget…”.")
@@ -228,12 +229,12 @@ struct BudgetBar: View {
             .frame(height: 14)
 
             HStack(spacing: 5) {
-                Text(Fmt.cost(spentCredits))
+                Text(store.costString(credits: spentCredits))
                     .monospacedDigit()
                     .foregroundStyle(over ? Color.red : Color.primary)
                 Text("of")
                     .foregroundStyle(.secondary)
-                Text(hasBudget ? Fmt.cost(budgetCredits) : "—")
+                Text(hasBudget ? store.costString(credits: budgetCredits) : "—")
                     .monospacedDigit()
                     .foregroundStyle(.secondary)
                 Text("budget")
@@ -241,7 +242,7 @@ struct BudgetBar: View {
                 Spacer()
                 if hasBudget {
                     Text(over
-                         ? "OVER by \(Fmt.cost(spentCredits - budgetCredits))"
+                         ? "OVER by \(store.costString(credits: spentCredits - budgetCredits))"
                          : String(format: "%.0f%% used", pct))
                         .foregroundStyle(over ? Color.red : Color.secondary)
                         .monospacedDigit()
@@ -257,6 +258,7 @@ struct BudgetBar: View {
 // ---------------------------------------------------------------------------
 
 struct Sparkline: View {
+    @EnvironmentObject var store: UsageStore
     let totals: [DayTotal]
 
     var body: some View {
@@ -277,7 +279,7 @@ struct Sparkline: View {
                             .fill(Color.accentColor.opacity(0.85))
                             .frame(width: barW,
                                    height: max(1, geo.size.height * CGFloat(t.credits / maxVal)))
-                            .help("\(t.day): \(Fmt.cost(t.credits))")
+                            .help("\(t.day): \(store.costString(credits: t.credits))")
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)

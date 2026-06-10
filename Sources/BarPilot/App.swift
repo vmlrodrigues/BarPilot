@@ -104,10 +104,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refresh.target = self
         menu.addItem(refresh)
         menu.addItem(.separator())
-        let budget = NSMenuItem(title: "Set Monthly Budget (\(Fmt.money(store.monthlyBudget)))…",
+        let budget = NSMenuItem(title: "Set Monthly Budget (\(store.budgetMoneyString(usd: store.monthlyBudget)))…",
                                 action: #selector(setBudget), keyEquivalent: "")
         budget.target = self
         menu.addItem(budget)
+
+        let currency = NSMenuItem(title: "Currency", action: nil, keyEquivalent: "")
+        let currencyMenu = NSMenu()
+        for c in Currency.allCases {
+            let item = NSMenuItem(title: c.menuLabel, action: #selector(setCurrency(_:)), keyEquivalent: "")
+            item.target = self
+            item.state = (store.displayCurrency == c) ? .on : .off
+            item.representedObject = c.rawValue
+            currencyMenu.addItem(item)
+        }
+        currency.submenu = currencyMenu
+        menu.addItem(currency)
         menu.addItem(.separator())
 
         let login = NSMenuItem(title: "Start at Login", action: #selector(toggleStartAtLogin), keyEquivalent: "")
@@ -136,6 +148,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func setBudget() {
         store.promptForBudget()
+    }
+
+    @objc private func setCurrency(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let c = Currency(rawValue: raw) else { return }
+        store.displayCurrency = c
     }
 
     @objc private func toggleStartAtLogin() {

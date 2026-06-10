@@ -13,7 +13,7 @@ full breakdown — summary, models, daily, sessions, and top calls.
 Written in **Swift / SwiftUI**, fully self-contained with **no external
 dependencies**: it reads your local GitHub Copilot OTel telemetry directly off
 disk — your usage data never leaves your machine. The only network access is
-checking GitHub for app updates.
+checking GitHub for app updates and fetching the USD→AUD exchange rate.
 
 ## What it shows
 
@@ -38,7 +38,8 @@ checking GitHub for app updates.
     then configures it natively on your confirmation. After enabling, restart
     VS Code and relaunch the Copilot app.
 
-Credits are shown to 2 decimal places; cost in USD (100 credits = $1.00).
+Credits are shown to 2 decimal places; cost in your selected currency — USD by
+default, or AUD (100 credits = $1.00 USD).
 
 ## Data sources
 
@@ -125,10 +126,14 @@ If you truly see nothing, confirm it's running: `pgrep -lf BarPilot`.
   the background. (Only Developer ID release builds self-update; dev builds don't.)
 - **Start at Login:** toggle it from the right-click menu to have BarPilot launch
   automatically when you log in.
+- **Currency:** show costs in **US $** or **Australian $** (right-click → Currency).
+  The USD→AUD rate is fetched from a public service on launch and refreshed daily
+  (cached for offline use); your monthly budget stays in USD and is shown converted
+  and rounded to a whole dollar when displaying AUD.
 - **Left-click** the menu-bar icon to open the usage window; **right-click** (or
   control-click) it for a menu with **Open Usage Window**, **Refresh Now**,
-  **Set Monthly Budget…**, **Start at Login**, **Check for Updates**, and
-  **Quit BarPilot**. (You can also quit from the button in the window footer.)
+  **Set Monthly Budget…**, **Currency**, **Start at Login**, **Check for Updates**,
+  and **Quit BarPilot**. (You can also quit from the button in the window footer.)
 
 ## License
 

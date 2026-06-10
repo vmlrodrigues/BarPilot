@@ -64,12 +64,13 @@ private struct TableScaffold<Header: View, Row: View, Footer: View>: View {
     }
 }
 
-private func totalFooter(_ credits: Double) -> some View {
+@MainActor
+private func totalFooter(_ credits: Double, _ store: UsageStore) -> some View {
     HStack {
         Text("Total").fontWeight(.semibold)
         Spacer()
         Text("\(Fmt.credits(credits)) credits").monospacedDigit()
-        Text(Fmt.cost(credits)).monospacedDigit().fontWeight(.semibold)
+        Text(store.costString(credits: credits)).monospacedDigit().fontWeight(.semibold)
     }
 }
 
@@ -78,6 +79,7 @@ private func totalFooter(_ credits: Double) -> some View {
 // ---------------------------------------------------------------------------
 
 struct SummaryTab: View {
+    @EnvironmentObject var store: UsageStore
     let rows: [SummaryRow]
     let total: Double
 
@@ -95,10 +97,10 @@ struct SummaryTab: View {
                 Text(r.model).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
                 Text(Fmt.int(r.calls)).numCol(60)
                 Text(Fmt.credits(r.credits)).numCol(95)
-                Text(Fmt.cost(r.credits)).numCol(70)
+                Text(store.costString(credits: r.credits)).numCol(70)
             }
         } footer: {
-            totalFooter(total)
+            totalFooter(total, store)
         }
     }
 }
@@ -108,6 +110,7 @@ struct SummaryTab: View {
 // ---------------------------------------------------------------------------
 
 struct ModelsTab: View {
+    @EnvironmentObject var store: UsageStore
     let rows: [ModelRow]
     let total: Double
 
@@ -130,7 +133,7 @@ struct ModelsTab: View {
                 Text(Fmt.int(r.outputTokens)).numCol(95)
             }
         } footer: {
-            totalFooter(total)
+            totalFooter(total, store)
         }
     }
 }
@@ -140,6 +143,7 @@ struct ModelsTab: View {
 // ---------------------------------------------------------------------------
 
 struct DailyTab: View {
+    @EnvironmentObject var store: UsageStore
     let rows: [DailyRow]
     let total: Double
 
@@ -160,7 +164,7 @@ struct DailyTab: View {
                 Text(Fmt.credits(r.credits)).numCol(95)
             }
         } footer: {
-            totalFooter(total)
+            totalFooter(total, store)
         }
     }
 }
@@ -170,6 +174,7 @@ struct DailyTab: View {
 // ---------------------------------------------------------------------------
 
 struct SessionsTab: View {
+    @EnvironmentObject var store: UsageStore
     let rows: [SessionRow]
     let total: Double
 
@@ -197,7 +202,7 @@ struct SessionsTab: View {
                 Text(Fmt.int(r.outputTokens)).numCol(62)
             }
         } footer: {
-            totalFooter(total)
+            totalFooter(total, store)
         }
     }
 }
