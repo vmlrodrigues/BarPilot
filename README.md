@@ -41,6 +41,20 @@ checking GitHub for app updates and fetching the USD→AUD exchange rate.
 Credits are shown to 2 decimal places; cost in your selected currency — USD by
 default, or AUD (100 credits = $1.00 USD).
 
+> [!NOTE]
+> **On first launch the menu-bar icon may not be visible if your menu bar is
+> already full.** macOS inserts new status items toward the **left/centre (by the
+> notch)**, where a crowded bar — especially on a notched Mac — can push them out
+> of sight. The simplest fix is a free menu-bar manager like
+> **[Ice](https://github.com/jordanbaird/Ice)**, which lets you see and rearrange
+> hidden items:
+>
+> ```sh
+> brew install jordanbaird-ice@beta
+> ```
+>
+> Use the **`@beta`** build — the current stable release has a bug on macOS **Tahoe**.
+
 ## Data sources
 
 Both are read directly off disk, merged, and de-duplicated:
