@@ -1,5 +1,9 @@
 # BarPilot
 
+![Platform](https://img.shields.io/badge/platform-macOS%2013.0%2B-brightgreen)
+![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2B-black?logo=apple&logoColor=white)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A macOS **menu-bar app** that shows your GitHub Copilot AIU credit **cost** for a
 selected period at a glance. Click the menu-bar item to open a window with the
 full breakdown — summary, models, daily, sessions, and top calls.
@@ -49,6 +53,11 @@ cost = `credits / 100` (100 credits = $1.00). Model names are normalised so
 The JSONL file is large (100 MB+), so it's memory-mapped and scanned in a single
 pass — only the few hundred lines carrying a usage attribute are JSON-parsed.
 A full refresh of both sources takes well under a second.
+
+## Requirements
+
+- macOS 13.0 (Ventura) or later
+- Apple Silicon Mac — any M-series chip (M1 or later). Intel Macs are not supported.
 
 ## Build & run
 
