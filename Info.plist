@@ -23,6 +23,6 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
-    <string>Reads local OTel telemetry only. No network access.</string>
+    <string>Reads local OTel telemetry. Network used only to check for app updates.</string>
 </dict>
 </plist>

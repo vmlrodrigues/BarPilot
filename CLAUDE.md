@@ -6,8 +6,8 @@ it for a detail window with the full breakdown (summary, models, daily, sessions
 top calls). Formerly named **TokenTally** — the app, bundle id, product/target,
 and `Sources/` dir were all renamed to BarPilot; the folder was later renamed too.
 
-It reads your local GitHub Copilot OTel telemetry directly off disk: **no
-network**, **no external dependencies**.
+It reads your local GitHub Copilot OTel telemetry directly off disk (**no
+external dependencies**); the only network use is the built-in GitHub auto-updater.
 
 ## Build / run / verify
 
@@ -77,6 +77,8 @@ Sources/BarPilot/
   DetailView.swift   Window UI: header, sparkline, budget bar.
   Tabs.swift         Summary / Models / Daily / Sessions / Top tables.
   Setup.swift        TelemetrySetup — opt-in native OTel enablement.
+  Updater.swift      Silent GitHub-Releases auto-updater (Developer ID-gated).
+  LoginItem.swift    "Start at Login" via SMAppService (macOS 13+).
 Info.plist           LSUIElement (menu-bar-only) agent bundle.
 build-app.sh         Build + assemble + ad-hoc codesign the .app.
 ```
@@ -103,6 +105,15 @@ refresh / window-open re-reads disk.
   → confirm dialog → native config (patch VS Code `settings.json`; write a helper
   script 0755 + LaunchAgent in `~/Library`, `launchctl load`). Never automatic,
   never a startup prompt. All under `~/Library` — no admin/sudo.
+- **Auto-update is a built-in GitHub-Releases updater (NOT Sparkle)** —
+  `Updater.swift`. Silent: checks the Releases API, downloads the notarised DMG,
+  verifies Team ID `9N354A3UZK` + Gatekeeper, swaps the bundle via a detached
+  helper script, relaunches. Gated to Developer ID builds (`isDeveloperIDSigned`)
+  so dev builds never self-update. Sparkle rejected as too heavy for a
+  hand-assembled SwiftPM bundle. **The app now makes network calls** (GitHub) —
+  keep the "no network for your *data*" wording accurate.
+- **Start at Login** via `SMAppService.mainApp` (`LoginItem.swift`), toggled from
+  the right-click menu — no third-party dependency.
 
 ## Gotchas
 

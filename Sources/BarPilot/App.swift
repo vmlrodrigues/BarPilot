@@ -41,6 +41,7 @@ struct AppMain {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let store = UsageStore()
+    private let updater = Updater()
 
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
@@ -77,6 +78,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.statusItem.button?.title = " " + title
             }
             .store(in: &cancellables)
+
+        updater.start()
     }
 
     /// Left-click toggles the window; right-click (or control-click) shows a menu.
@@ -106,6 +109,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         budget.target = self
         menu.addItem(budget)
         menu.addItem(.separator())
+
+        let login = NSMenuItem(title: "Start at Login", action: #selector(toggleStartAtLogin), keyEquivalent: "")
+        login.target = self
+        login.state = LoginItem.isEnabled ? .on : .off
+        menu.addItem(login)
+        let updates = NSMenuItem(title: "Check for Updates", action: #selector(checkForUpdates), keyEquivalent: "")
+        updates.target = self
+        menu.addItem(updates)
+        menu.addItem(.separator())
+
         let quit = NSMenuItem(title: "Quit BarPilot", action: #selector(quit), keyEquivalent: "q")
         quit.target = self
         menu.addItem(quit)
@@ -123,6 +136,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func setBudget() {
         store.promptForBudget()
+    }
+
+    @objc private func toggleStartAtLogin() {
+        LoginItem.toggle()
+    }
+
+    @objc private func checkForUpdates() {
+        Updater.checkNow()
     }
 
     @objc private func quit() {

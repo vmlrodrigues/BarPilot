@@ -10,9 +10,10 @@ A macOS **menu-bar app** that shows your GitHub Copilot AIU credit **cost** for 
 selected period at a glance. Click the menu-bar item to open a window with the
 full breakdown — summary, models, daily, sessions, and top calls.
 
-Written in **Swift / SwiftUI**, fully self-contained: it reads your local GitHub
-Copilot OTel telemetry directly off disk, with **no network calls** and **no
-external dependencies**.
+Written in **Swift / SwiftUI**, fully self-contained with **no external
+dependencies**: it reads your local GitHub Copilot OTel telemetry directly off
+disk — your usage data never leaves your machine. The only network access is
+checking GitHub for app updates.
 
 ## What it shows
 
@@ -118,10 +119,16 @@ If you truly see nothing, confirm it's running: `pgrep -lf BarPilot`.
 
 - The app refreshes automatically every 60 seconds, on window open, and when you
   press the refresh button or change the period. Your period choice is remembered.
+- **Auto-update:** BarPilot checks GitHub for a newer release shortly after launch
+  and every few hours. When one is found it downloads the notarised DMG, verifies
+  it's signed by the same developer, then installs it and relaunches — silently, in
+  the background. (Only Developer ID release builds self-update; dev builds don't.)
+- **Start at Login:** toggle it from the right-click menu to have BarPilot launch
+  automatically when you log in.
 - **Left-click** the menu-bar icon to open the usage window; **right-click** (or
   control-click) it for a menu with **Open Usage Window**, **Refresh Now**,
-  **Set Monthly Budget…**, and **Quit BarPilot**. (You can also quit from the
-  button in the window footer.)
+  **Set Monthly Budget…**, **Start at Login**, **Check for Updates**, and
+  **Quit BarPilot**. (You can also quit from the button in the window footer.)
 
 ## License
 
