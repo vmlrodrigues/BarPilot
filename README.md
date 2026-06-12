@@ -54,6 +54,16 @@ default, or AUD (100 credits = $1.00 USD).
 > ```
 >
 > Use the **`@beta`** build — the current stable release has a bug on macOS **Tahoe**.
+>
+> Once Ice is installed, run this to enable the **Always Hidden** section (it is off
+> by default), then relaunch Ice:
+>
+> ```sh
+> defaults write com.jordanbaird.Ice EnableAlwaysHiddenSection -bool true
+> ```
+>
+> BarPilot will appear in the **Always Hidden** section. Open Ice → **Settings →
+> Menu Bar Layout** and drag BarPilot up into the **Visible** section.
 
 ## Data sources
 
