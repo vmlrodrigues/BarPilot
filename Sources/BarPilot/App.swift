@@ -80,6 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
 
         updater.start()
+        Task.detached(priority: .background) { SpanCache.prune() }
     }
 
     /// Left-click toggles the window; right-click (or control-click) shows a menu.

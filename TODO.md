@@ -20,33 +20,25 @@ Steps:
 
 ---
 
-## Xcode Copilot support
+## Xcode and Android Studio / JetBrains Copilot support — blocked upstream
 
-GitHub Copilot for Xcode (`com.github.copilot-for-xcode`) is a separate product
-from both current data sources. If it emits OTel spans, they'd land under
-`~/Library/Application Support/com.github.copilot-for-xcode/` (path unconfirmed).
+Neither Copilot for Xcode nor the JetBrains Copilot plugin emit local OTel telemetry.
+Both are blocked at the language-server level and cannot be supported until GitHub/
+Microsoft ships proper OTel support in those clients.
 
-Steps:
-1. Install Copilot for Xcode, enable any available telemetry option, and find what
-   files are written and in what format.
-2. Add a path constant + `loadXcode()` loader in `Sources.swift`, wired into `loadAll()`.
-3. Add detection / setup logic in `Sources.swift` + `Setup.swift` (same pattern as
-   VS Code / Mac App).
+**Xcode (confirmed by source inspection):**
+- `COPILOT_OTEL_EXPORTER_TYPE=file` is silently dropped — the Xcode extension launches
+  the language server with a hardcoded env var whitelist of only 3 vars (`PATH`,
+  `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`). The env var never reaches
+  the language server.
+- No `agent-traces.jsonl` or `.db` is written anywhere on disk.
+- The only local per-turn data is raw token counts in a plain-text log file
+  (`~/Library/Logs/GitHubCopilot/github-copilot-for-xcode.log`) — no AIU values,
+  no reliable model attribution.
 
-The existing JSONL parser already handles both flat Mac App and nested OTLP envelope
-shapes, so if the file format is either of those it should work with minimal changes.
+**JetBrains / Android Studio (confirmed via open issues):**
+- Same failure mode — env var whitelist strips OTel vars before language server launch.
+- No local trace files written.
+- Open feature requests: microsoft/copilot-intellij-feedback #1680 and #1778.
 
----
-
-## Android Studio / JetBrains Copilot support
-
-The GitHub Copilot JetBrains plugin runs inside IDEs that live under
-`~/Library/Application Support/JetBrains/<IDE + version>/`. Not currently read.
-
-Steps:
-1. Install the Copilot JetBrains plugin in Android Studio (or IntelliJ), enable any
-   available telemetry option, and locate the output file + format.
-2. Note: the plugin may push telemetry to GitHub's backend only (no local file) — verify
-   before assuming local OTel file support exists.
-3. If a local file is confirmed: add a path constant + loader in `Sources.swift`,
-   detection in `Setup.swift`, same pattern as the other sources.
+Revisit when GitHub ships OTel support in either client.
