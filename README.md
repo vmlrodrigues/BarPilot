@@ -74,6 +74,8 @@ Both are read directly off disk, merged, and de-duplicated:
 | VS Code Copilot Chat | SQLite | `~/Library/Application Support/Code/User/globalStorage/github.copilot-chat/agent-traces.db` |
 | GitHub Copilot Mac App | JSONL | `~/Library/Application Support/com.github.githubapp/agent-traces.jsonl` |
 
+**Copilot for Xcode and JetBrains IDEs (Android Studio, IntelliJ, etc.) are not supported** — those clients do not write local OTel telemetry to disk. Support will follow if GitHub adds it.
+
 A source is silently skipped if its file is absent. Credits = `nano_aiu / 1e9`;
 cost = `credits / 100` (100 credits = $1.00). Model names are normalised so
 `claude-sonnet-4-6` (VS Code) and `claude-sonnet-4.6` (Mac App) merge.

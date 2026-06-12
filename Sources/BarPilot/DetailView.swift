@@ -145,6 +145,9 @@ struct DetailView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
+                Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
                 Button("Quit") { NSApp.terminate(nil) }
                     .buttonStyle(.borderless)
                     .font(.caption)

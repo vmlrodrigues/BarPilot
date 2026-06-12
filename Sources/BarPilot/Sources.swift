@@ -25,16 +25,18 @@ enum DataSources {
     }
 
     /// Load every usage record from all available sources, plus a status report.
+    /// Live records are merged into the local cache on every call; the full cache
+    /// is returned so data survives source-file wipes caused by extension updates.
     static func loadAll() -> (records: [UsageRecord], status: SourcesStatus) {
         var status = SourcesStatus()
-        var records: [UsageRecord] = []
+        var liveRecords: [UsageRecord] = []
 
         let dbPath = vscodeDBPath()
         if FileManager.default.fileExists(atPath: dbPath) {
             let recs = loadSQLite(path: dbPath)
             status.vscodeFound = true
             status.vscodeCount = recs.count
-            records.append(contentsOf: recs)
+            liveRecords.append(contentsOf: recs)
         }
 
         let jsonlPath = macAppJSONLPath()
@@ -42,13 +44,14 @@ enum DataSources {
             let recs = loadJSONL(path: jsonlPath)
             status.macAppFound = true
             status.macAppCount = recs.count
-            records.append(contentsOf: recs)
+            liveRecords.append(contentsOf: recs)
         }
 
         status.vscodeConfigured = isVSCodeTelemetryConfigured()
         status.macAppConfigured = isMacAppTelemetryConfigured()
 
-        return (records, status)
+        SpanCache.merge(liveRecords)
+        return (SpanCache.load(), status)
     }
 
     // -----------------------------------------------------------------------

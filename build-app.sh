@@ -17,7 +17,7 @@ BIN_NAME="BarPilot"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"   # "-" = ad-hoc
 ENTITLEMENTS="${ENTITLEMENTS:-}"      # optional path to a .entitlements plist
 HARDENED="${HARDENED:-}"              # non-empty → Hardened Runtime + secure timestamp
-VERSION="${VERSION:-}"                # non-empty → stamp into the bundle Info.plist
+VERSION="${VERSION:-$(cat VERSION 2>/dev/null)}"   # stamp into the bundle Info.plist
 
 echo "▸ Building ($CONFIG) …"
 swift build -c "$CONFIG"

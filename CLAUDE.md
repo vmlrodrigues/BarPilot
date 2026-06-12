@@ -10,6 +10,14 @@ It reads your local GitHub Copilot OTel telemetry directly off disk (**no
 external dependencies**); network use is limited to the GitHub auto-updater and
 the USD→AUD exchange-rate fetch.
 
+## Release checklist
+
+Before running `make release VERSION=x.y.z`:
+1. Update `VERSION` with the new version number.
+2. **Update `CHANGELOG.md`** — change `[Unreleased]` to `[x.y.z] — YYYY-MM-DD` and
+   add a new `## [Unreleased]` section at the top for future changes.
+3. Commit both files on the feature branch, merge to `main`, then release.
+
 ## Build / run / verify
 
 ```sh
