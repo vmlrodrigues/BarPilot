@@ -200,6 +200,8 @@ struct BudgetBar: View {
         let over = hasBudget && spentCredits > budgetCredits
         let pct = hasBudget ? (spentCredits / budgetCredits) * 100 : 0
         let maxCredits = max(budgetCredits * 1.25, spentCredits, 1)
+        let monthlyCredits = monthlyBudget * 100
+        let wholePct = monthlyCredits > 0 ? (spentCredits / monthlyCredits) * 100 : 0
 
         VStack(alignment: .leading, spacing: 5) {
             HStack {
@@ -242,12 +244,17 @@ struct BudgetBar: View {
                     .foregroundStyle(.secondary)
                 Text("budget")
                     .foregroundStyle(.secondary)
-                Spacer()
                 if hasBudget {
                     Text(over
-                         ? "OVER by \(store.costString(credits: spentCredits - budgetCredits))"
-                         : String(format: "%.0f%% used", pct))
+                         ? "(OVER by \(store.costString(credits: spentCredits - budgetCredits)))"
+                         : String(format: "(%.0f%%)", pct))
                         .foregroundStyle(over ? Color.red : Color.secondary)
+                        .monospacedDigit()
+                }
+                Spacer()
+                if hasBudget {
+                    Text(String(format: "%.0f%% of monthly budget", wholePct))
+                        .foregroundStyle(.secondary)
                         .monospacedDigit()
                 }
             }

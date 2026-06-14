@@ -6,6 +6,17 @@ All notable changes to BarPilot are documented here.
 
 ---
 
+## [0.4.1] — 2026-06-14
+
+### Fixed
+- Budget bar now shows the prorated percentage in parentheses next to the period
+  budget (`A$62.20 of A$130.90 budget (48%)`), and the right-side label shows
+  the spend as a percentage of the full monthly budget (`22% of monthly budget`).
+  Previously the 48% appeared on the right with no context, making it look like
+  48% of the monthly budget rather than the pro-rated period budget.
+
+---
+
 ## [0.4.0] — 2026-06-12
 
 ### Added
