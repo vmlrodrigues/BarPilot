@@ -59,6 +59,7 @@ struct DailyRow: Identifiable {
     let model: String
     let calls: Int
     let credits: Double
+    var cost: Double { credits / 100.0 }
 }
 
 struct SessionRow: Identifiable {
@@ -83,6 +84,7 @@ struct TopRow: Identifiable {
     let credits: Double
     let inputTokens: Int
     let outputTokens: Int
+    var cost: Double { credits / 100.0 }
 }
 
 /// One bar in the daily mini-chart (a single day's total across all models).

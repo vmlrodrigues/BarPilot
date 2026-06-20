@@ -6,6 +6,19 @@ All notable changes to BarPilot are documented here.
 
 ---
 
+## [0.4.4] — 2026-06-21
+
+### Improved
+- **Daily tab:** added Cost column; Day header is now clickable to toggle sort
+  order (latest first by default); bold "Daily total" subtotal row after each
+  day's model breakdown shows summed calls, credits, and cost.
+- **Top tab:** Model column is now flex (adapts to name length); Op column
+  tightened to 90 px — just wide enough for `invoke_agent`; blue ⓘ on the Op
+  header opens a popover explaining `chat` vs `invoke_agent`; In/Out token
+  columns replaced with a Cost column.
+
+---
+
 ## [0.4.3] — 2026-06-20
 
 ### Improved

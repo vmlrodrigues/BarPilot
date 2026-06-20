@@ -139,29 +139,85 @@ struct ModelsTab: View {
 }
 
 // ---------------------------------------------------------------------------
-// Daily — credits per day per model
+// Daily — credits + cost per day per model, with daily subtotals
 // ---------------------------------------------------------------------------
 
 struct DailyTab: View {
     @EnvironmentObject var store: UsageStore
     let rows: [DailyRow]
     let total: Double
+    @State private var sortAscending = false
+
+    private enum DailyItem: Identifiable {
+        case detail(DailyRow)
+        case subtotal(day: String, calls: Int, credits: Double)
+        var id: String {
+            switch self {
+            case .detail(let r): return r.id.uuidString
+            case .subtotal(let d, _, _): return "total-\(d)"
+            }
+        }
+    }
+
+    private var items: [DailyItem] {
+        var days: [String] = []
+        var grouped: [String: [DailyRow]] = [:]
+        for row in rows {
+            if grouped[row.day] == nil { days.append(row.day) }
+            grouped[row.day, default: []].append(row)
+        }
+        let sortedDays = sortAscending ? days.sorted() : days.sorted().reversed()
+        var result: [DailyItem] = []
+        for day in sortedDays {
+            let dayRows = grouped[day] ?? []
+            for row in dayRows { result.append(.detail(row)) }
+            result.append(.subtotal(
+                day: day,
+                calls: dayRows.reduce(0) { $0 + $1.calls },
+                credits: dayRows.reduce(0.0) { $0 + $1.credits }
+            ))
+        }
+        return result
+    }
 
     var body: some View {
-        TableScaffold(count: rows.count) {
+        TableScaffold(count: items.count) {
             HStack {
-                Text("Day").headCol(95, .leading)
+                Button { sortAscending.toggle() } label: {
+                    HStack(spacing: 2) {
+                        Text("Day")
+                        Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
+                            .font(.caption2)
+                    }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .frame(width: 95, alignment: .leading)
+                }
+                .buttonStyle(.borderless)
                 Text("Model").headCol(nil, .leading).frame(maxWidth: .infinity, alignment: .leading)
                 Text("Calls").headCol(55)
-                Text("Credits").headCol(95)
+                Text("Credits").headCol(80)
+                Text("Cost").headCol(70)
             }
         } row: { i in
-            let r = rows[i]
-            HStack {
-                Text(r.day).font(.callout).monospacedDigit().frame(width: 95, alignment: .leading)
-                Text(r.model).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
-                Text(Fmt.int(r.calls)).numCol(55)
-                Text(Fmt.credits(r.credits)).numCol(95)
+            let item = items[i]
+            switch item {
+            case .detail(let r):
+                HStack {
+                    Text(r.day).font(.callout).monospacedDigit().frame(width: 95, alignment: .leading)
+                    Text(r.model).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
+                    Text(Fmt.int(r.calls)).numCol(55)
+                    Text(Fmt.credits(r.credits)).numCol(80)
+                    Text(store.costString(credits: r.credits)).numCol(70)
+                }
+            case .subtotal(let day, let calls, let credits):
+                HStack {
+                    Text(day).font(.callout.weight(.semibold)).monospacedDigit().frame(width: 95, alignment: .leading)
+                    Text("Daily total").font(.callout).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading)
+                    Text(Fmt.int(calls)).numCol(55).fontWeight(.semibold)
+                    Text(Fmt.credits(credits)).numCol(80).fontWeight(.semibold)
+                    Text(store.costString(credits: credits)).numCol(70).fontWeight(.semibold)
+                }
             }
         } footer: {
             totalFooter(total, store)
@@ -212,31 +268,56 @@ struct SessionsTab: View {
 // ---------------------------------------------------------------------------
 
 struct TopTab: View {
+    @EnvironmentObject var store: UsageStore
     let rows: [TopRow]
+    @State private var showingOpInfo = false
 
     var body: some View {
         TableScaffold(count: rows.count) {
             HStack {
                 Text("#").headCol(26, .leading)
                 Text("When").headCol(92, .leading)
-                Text("Model").headCol(108, .leading)
-                Text("Op").headCol(nil, .leading).frame(maxWidth: .infinity, alignment: .leading)
+                Text("Model").headCol(nil, .leading).frame(maxWidth: .infinity, alignment: .leading)
+                HStack(spacing: 3) {
+                    Text("Op")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Button { showingOpInfo.toggle() } label: {
+                        Image(systemName: "info.circle")
+                            .font(.caption2)
+                            .foregroundStyle(.blue)
+                    }
+                    .buttonStyle(.borderless)
+                    .popover(isPresented: $showingOpInfo) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("**chat**").font(.caption.weight(.semibold))
+                            Text("A standard Copilot Chat turn — one request and one response.")
+                                .foregroundStyle(.secondary)
+                            Text("**invoke\\_agent**").font(.caption.weight(.semibold))
+                            Text("An agent/multi-step call — chains multiple LLM calls and is typically more expensive.")
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.caption)
+                        .padding()
+                        .frame(width: 280)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .frame(width: 90, alignment: .leading)
                 Text("Credits").headCol(78)
-                Text("In").headCol(68)
-                Text("Out").headCol(58)
+                Text("Cost").headCol(65)
             }
         } row: { i in
             let r = rows[i]
             HStack {
                 Text("\(r.rank)").font(.callout).foregroundStyle(.secondary).frame(width: 26, alignment: .leading)
                 Text(shortDate(r.startedAt)).font(.callout).monospacedDigit().frame(width: 92, alignment: .leading)
-                Text(r.model).font(.callout).frame(width: 108, alignment: .leading).lineLimit(1)
+                Text(r.model).font(.callout).frame(maxWidth: .infinity, alignment: .leading).lineLimit(1)
                 Text(r.operationName).font(.callout).foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .leading).lineLimit(1)
+                    .frame(width: 90, alignment: .leading).lineLimit(1)
                     .help(r.spanId)
                 Text(Fmt.credits(r.credits)).numCol(78)
-                Text(Fmt.int(r.inputTokens)).numCol(68)
-                Text(Fmt.int(r.outputTokens)).numCol(58)
+                Text(store.costString(credits: r.credits)).numCol(65)
             }
         } footer: {
             HStack {
