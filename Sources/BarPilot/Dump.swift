@@ -17,12 +17,10 @@ enum Dump {
         }
 
         let (records, status) = DataSources.loadAll()
+        let defaultRange = PeriodResolver.range(kind: .thisMonth, customFrom: Date(), customTo: Date())
+        let from = value("--from") ?? defaultRange.from
+        let to = value("--to") ?? defaultRange.to
         let today = PeriodResolver.todayStr()
-        let cal = Calendar.current
-        let now = Date()
-        let monthFirst = cal.date(from: cal.dateComponents([.year, .month], from: now)) ?? now
-        let from = value("--from") ?? PeriodResolver.dateStr(monthFirst)
-        let to = value("--to") ?? today
 
         let report = Aggregator.build(records: records, fromStr: from, toStr: to, todayStr: today)
 

@@ -6,6 +6,21 @@ All notable changes to BarPilot are documented here.
 
 ---
 
+## [0.4.2] — 2026-06-20
+
+### Fixed
+- Period boundaries (Today, This Month, Last 7 Days, Last 30 Days, This Year)
+  now use **UTC midnight** rather than local midnight, aligning exactly with
+  GitHub's billing cycle reset (UTC midnight on the 1st of each month).
+  Previously, users in UTC+ timezones would see "This Month" roll over at local
+  midnight — up to 14 hours before GitHub's actual reset — causing June costs
+  to disappear into "Last Month" prematurely.
+- Date range header tooltip explains that ranges use UTC midnight to match
+  GitHub's billing cycle.
+- `--dump` default date range now uses the same UTC-based month start as the UI.
+
+---
+
 ## [0.4.1] — 2026-06-14
 
 ### Fixed

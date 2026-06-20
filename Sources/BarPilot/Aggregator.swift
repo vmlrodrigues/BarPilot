@@ -199,47 +199,62 @@ enum Aggregator {
 }
 
 // ---------------------------------------------------------------------------
-// Period → (fromStr, toStr) date strings, computed in the LOCAL calendar
-// (local date components).
+// Period → (fromStr, toStr) date strings. All computed boundaries use UTC
+// so that "This Month" / "This Year" / "Today" align with GitHub's billing
+// cycle, which resets at UTC midnight on the 1st of each month.
 // ---------------------------------------------------------------------------
 
 enum PeriodResolver {
 
+    private static let utcCal: Calendar = {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(identifier: "UTC")!
+        return c
+    }()
+
     static func todayStr() -> String {
-        dateStr(Date())
+        utcDateStr(Date())
     }
 
+    // UTC date string — used for all computed period boundaries.
+    private static func utcDateStr(_ date: Date) -> String {
+        let c = utcCal.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
+
+    // Local date string — used only for custom DatePicker dates, where the
+    // user has selected a calendar date in their local timezone.
     static func dateStr(_ date: Date) -> String {
         let c = Calendar.current.dateComponents([.year, .month, .day], from: date)
         return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
     }
 
     static func range(kind: PeriodKind, customFrom: Date, customTo: Date) -> (from: String, to: String) {
-        let cal = Calendar.current
         let now = Date()
-        let today = dateStr(now)
+        let today = utcDateStr(now)
 
         switch kind {
         case .today:
             return (today, today)
         case .last7:
-            let from = cal.date(byAdding: .day, value: -6, to: now) ?? now
-            return (dateStr(from), today)
+            let from = utcCal.date(byAdding: .day, value: -6, to: now) ?? now
+            return (utcDateStr(from), today)
         case .thisMonth:
-            let comps = cal.dateComponents([.year, .month], from: now)
-            let first = cal.date(from: comps) ?? now
-            return (dateStr(first), today)
+            let comps = utcCal.dateComponents([.year, .month], from: now)
+            let first = utcCal.date(from: comps) ?? now
+            return (utcDateStr(first), today)
         case .last30:
-            let from = cal.date(byAdding: .day, value: -29, to: now) ?? now
-            return (dateStr(from), today)
+            let from = utcCal.date(byAdding: .day, value: -29, to: now) ?? now
+            return (utcDateStr(from), today)
         case .thisYear:
-            let comps = cal.dateComponents([.year], from: now)
-            let first = cal.date(from: comps) ?? now
-            return (dateStr(first), today)
+            let comps = utcCal.dateComponents([.year], from: now)
+            let first = utcCal.date(from: comps) ?? now
+            return (utcDateStr(first), today)
         case .allTime:
             return ("2000-01-01", today)
         case .custom:
-            // Keep ordering sane even if the user inverts the pickers.
+            // DatePicker gives local midnight — use local calendar so the
+            // selected calendar date maps correctly to a UTC date string.
             let a = dateStr(customFrom), b = dateStr(customTo)
             return a <= b ? (a, b) : (b, a)
         }

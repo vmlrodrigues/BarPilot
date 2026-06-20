@@ -74,6 +74,7 @@ struct DetailView: View {
                 Text("\(store.report.fromStr)  →  \(store.report.toStr)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                    .help("Date ranges start and end at UTC midnight, matching GitHub's billing cycle reset (UTC midnight on the 1st).")
             }
 
             HStack(alignment: .lastTextBaseline, spacing: 10) {
