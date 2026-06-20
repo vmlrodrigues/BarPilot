@@ -9,6 +9,7 @@ import AppKit
 
 struct DetailView: View {
     @EnvironmentObject var store: UsageStore
+    @State private var showingUTCInfo = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -71,10 +72,26 @@ struct DetailView: View {
                         .labelsHidden()
                 }
                 Spacer()
-                Text("\(store.report.fromStr)  →  \(store.report.toStr)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .help("Date ranges start and end at UTC midnight, matching GitHub's billing cycle reset (UTC midnight on the 1st).")
+                HStack(spacing: 4) {
+                    Text("\(store.report.fromStr)  →  \(store.report.toStr)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button {
+                        showingUTCInfo.toggle()
+                    } label: {
+                        Image(systemName: "info.circle")
+                            .font(.caption)
+                            .foregroundStyle(.blue)
+                    }
+                    .buttonStyle(.borderless)
+                    .popover(isPresented: $showingUTCInfo) {
+                        Text("Date ranges use UTC midnight to match GitHub's billing cycle, which resets at UTC midnight on the 1st of each month.")
+                            .font(.caption)
+                            .padding()
+                            .frame(width: 280)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
             }
 
             HStack(alignment: .lastTextBaseline, spacing: 10) {

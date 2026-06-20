@@ -6,6 +6,15 @@ All notable changes to BarPilot are documented here.
 
 ---
 
+## [0.4.3] — 2026-06-20
+
+### Improved
+- UTC info icon (ⓘ) next to the date range is now blue and clickable, opening
+  a popover explaining that date ranges use UTC midnight to match GitHub's
+  billing cycle.
+
+---
+
 ## [0.4.2] — 2026-06-20
 
 ### Fixed
