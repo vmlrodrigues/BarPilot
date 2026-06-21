@@ -156,7 +156,7 @@ enum Aggregator {
     private static func buildSessions(_ recs: [UsageRecord]) -> [SessionRow] {
         struct Acc {
             var calls = 0; var credits = 0.0; var inTok = 0; var outTok = 0
-            var startedAt = Int64.max
+            var startedAt = Int64.max; var lastActiveAt = Int64.min
             var topModel = ""; var topModelCredits = -1.0
         }
         var acc: [String: Acc] = [:]
@@ -168,6 +168,7 @@ enum Aggregator {
             a.inTok += r.inputTokens
             a.outTok += r.outputTokens
             a.startedAt = min(a.startedAt, r.startMs)
+            a.lastActiveAt = max(a.lastActiveAt, r.startMs)
             // Attribute the session to its highest-credit call's model.
             if r.credits > a.topModelCredits {
                 a.topModelCredits = r.credits
@@ -176,7 +177,8 @@ enum Aggregator {
             acc[key] = a
         }
         return acc.map {
-            SessionRow(sessionId: $0.key, model: $0.value.topModel, startedAt: $0.value.startedAt,
+            SessionRow(sessionId: $0.key, model: $0.value.topModel,
+                       startedAt: $0.value.startedAt, lastActiveAt: $0.value.lastActiveAt,
                        calls: $0.value.calls, credits: $0.value.credits,
                        inputTokens: $0.value.inTok, outputTokens: $0.value.outTok)
         }

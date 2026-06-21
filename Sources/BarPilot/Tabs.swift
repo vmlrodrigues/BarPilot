@@ -234,28 +234,69 @@ struct SessionsTab: View {
     let rows: [SessionRow]
     let total: Double
 
+    enum SortKey { case started, lastActive, calls, cost }
+    @State private var sortKey: SortKey = .lastActive
+    @State private var sortAscending = false
+
+    private var sorted: [SessionRow] {
+        rows.sorted {
+            switch sortKey {
+            case .started:    return sortAscending ? $0.startedAt    < $1.startedAt    : $0.startedAt    > $1.startedAt
+            case .lastActive: return sortAscending ? $0.lastActiveAt < $1.lastActiveAt : $0.lastActiveAt > $1.lastActiveAt
+            case .calls:      return sortAscending ? $0.calls        < $1.calls        : $0.calls        > $1.calls
+            case .cost:       return sortAscending ? $0.credits      < $1.credits      : $0.credits      > $1.credits
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func colHeader(_ label: String, key: SortKey, width: CGFloat, align: Alignment = .leading) -> some View {
+        Button {
+            if sortKey == key { sortAscending.toggle() }
+            else { sortKey = key; sortAscending = false }
+        } label: {
+            HStack(spacing: 2) {
+                if align == .trailing {
+                    Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
+                        .font(.caption2)
+                        .opacity(sortKey == key ? 1 : 0)
+                }
+                Text(label)
+                if align != .trailing {
+                    Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
+                        .font(.caption2)
+                        .opacity(sortKey == key ? 1 : 0)
+                }
+            }
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .frame(width: width, alignment: align)
+        }
+        .buttonStyle(.borderless)
+    }
+
     var body: some View {
-        TableScaffold(count: rows.count) {
+        TableScaffold(count: sorted.count) {
             HStack {
                 Text("Session").headCol(nil, .leading).frame(maxWidth: .infinity, alignment: .leading)
-                Text("Started").headCol(92, .leading)
-                Text("Calls").headCol(42)
+                colHeader("Started", key: .started, width: 88)
+                colHeader("Last active", key: .lastActive, width: 88)
+                colHeader("Calls", key: .calls, width: 42, align: .trailing)
                 Text("Credits").headCol(78)
-                Text("In").headCol(70)
-                Text("Out").headCol(62)
+                colHeader("Cost", key: .cost, width: 65, align: .trailing)
             }
         } row: { i in
-            let r = rows[i]
+            let r = sorted[i]
             HStack {
                 Text(Fmt.shortId(r.sessionId))
                     .font(.callout.monospaced())
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .help(r.sessionId)
-                Text(shortDate(r.startedAt)).font(.callout).monospacedDigit().frame(width: 92, alignment: .leading)
+                Text(shortDate(r.startedAt)).font(.callout).monospacedDigit().frame(width: 88, alignment: .leading)
+                Text(shortDate(r.lastActiveAt)).font(.callout).monospacedDigit().frame(width: 88, alignment: .leading)
                 Text(Fmt.int(r.calls)).numCol(42)
                 Text(Fmt.credits(r.credits)).numCol(78)
-                Text(Fmt.int(r.inputTokens)).numCol(70)
-                Text(Fmt.int(r.outputTokens)).numCol(62)
+                Text(store.costString(credits: r.credits)).numCol(65)
             }
         } footer: {
             totalFooter(total, store)

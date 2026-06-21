@@ -6,6 +6,17 @@ All notable changes to BarPilot are documented here.
 
 ---
 
+## [0.4.5] — 2026-06-21
+
+### Improved
+- **Sessions tab:** added "Last active" column showing the most recent call
+  timestamp for each session — makes it easy to see which sessions are still
+  ongoing. In/Out token columns replaced with Last active and Cost. Sessions
+  now sortable by Started, Last active, Calls, and Cost (defaults to Last
+  active descending).
+
+---
+
 ## [0.4.4] — 2026-06-21
 
 ### Improved

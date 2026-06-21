@@ -67,6 +67,7 @@ struct SessionRow: Identifiable {
     let sessionId: String
     let model: String
     let startedAt: Int64
+    let lastActiveAt: Int64
     let calls: Int
     let credits: Double
     let inputTokens: Int
