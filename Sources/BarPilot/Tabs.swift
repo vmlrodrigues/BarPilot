@@ -113,24 +113,56 @@ struct ModelsTab: View {
     @EnvironmentObject var store: UsageStore
     let rows: [ModelRow]
     let total: Double
+    @State private var showingRateInfo = false
 
     var body: some View {
         TableScaffold(count: rows.count) {
             HStack {
                 Text("Model").headCol(nil, .leading).frame(maxWidth: .infinity, alignment: .leading)
-                Text("Calls").headCol(50)
-                Text("Credits").headCol(90)
-                Text("Input tok").headCol(95)
-                Text("Output tok").headCol(95)
+                Text("Calls").headCol(40)
+                Text("Credits").headCol(64)
+                Text("In tok").headCol(50)
+                Text("Out tok").headCol(52)
+                Text("in $/Mtok").headCol(58)
+                Text("out $/Mtok").headCol(60)
+                HStack(spacing: 3) {
+                    Text("Fit")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Button { showingRateInfo.toggle() } label: {
+                        Image(systemName: "info.circle")
+                            .font(.caption2)
+                            .foregroundStyle(.blue)
+                    }
+                    .buttonStyle(.borderless)
+                    .popover(isPresented: $showingRateInfo) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Effective per-token cost")
+                                .font(.caption.weight(.semibold))
+                            Text("**in / out $/Mtok** — what you actually paid per million input and output tokens through this model, cache discounts included. Input is usually far cheaper because most of it is cache hits; output bills at the full rate.")
+                                .foregroundStyle(.secondary)
+                            Text("**Fit** — how well a single input + output rate explains your real credits (100% = perfect). Lower means the mix varied, typically from cache tiers this view can't separate.")
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.caption)
+                        .padding()
+                        .frame(width: 300)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .frame(width: 54, alignment: .trailing)
             }
         } row: { i in
             let r = rows[i]
             HStack {
                 Text(r.model).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
-                Text(Fmt.int(r.calls)).numCol(50)
-                Text(Fmt.credits(r.credits)).numCol(90)
-                Text(Fmt.int(r.inputTokens)).numCol(95)
-                Text(Fmt.int(r.outputTokens)).numCol(95)
+                Text(Fmt.int(r.calls)).numCol(40)
+                Text(Fmt.credits(r.credits)).numCol(64)
+                Text(Fmt.tokens(r.inputTokens)).numCol(50)
+                Text(Fmt.tokens(r.outputTokens)).numCol(52)
+                Text(r.inRate.isNaN ? "—" : store.costString(credits: r.inRate * 1_000_000)).numCol(58)
+                Text(r.outRate.isNaN ? "—" : store.costString(credits: r.outRate * 1_000_000)).numCol(60)
+                Text(r.fit.isNaN ? "—" : String(format: "%.0f%%", r.fit * 100)).numCol(54)
             }
         } footer: {
             totalFooter(total, store)

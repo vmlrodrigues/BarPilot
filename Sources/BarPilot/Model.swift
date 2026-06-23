@@ -50,6 +50,13 @@ struct ModelRow: Identifiable {
     let credits: Double
     let inputTokens: Int
     let outputTokens: Int
+    /// Effective per-token rates (AIU credits per token) from a least-squares
+    /// fit of `credits = inRate·input + outRate·output` over this model's spans.
+    /// `.nan` when the fit is degenerate (too few/collinear calls).
+    let inRate: Double
+    let outRate: Double
+    /// Goodness-of-fit (uncentered R², 0…1); `.nan` when unsolvable.
+    let fit: Double
     var cost: Double { credits / 100.0 }
 }
 
@@ -221,6 +228,19 @@ enum Fmt {
     /// Thousands-separated integer, e.g. "14,641,544".
     static func int(_ n: Int) -> String {
         grouping.string(from: NSNumber(value: n)) ?? "\(n)"
+    }
+
+    /// Abbreviated token count: 1,397 → "1.4K", 86,264,060 → "86.3M",
+    /// 2,100,000,000 → "2.1B". One decimal below 100, none at/above.
+    static func tokens(_ n: Int) -> String {
+        func scaled(_ v: Double, _ suffix: String) -> String {
+            String(format: v >= 100 ? "%.0f" : "%.1f", v) + suffix
+        }
+        let a = abs(n)
+        if a >= 1_000_000_000 { return scaled(Double(n) / 1_000_000_000, "B") }
+        if a >= 1_000_000     { return scaled(Double(n) / 1_000_000, "M") }
+        if a >= 1_000         { return scaled(Double(n) / 1_000, "K") }
+        return "\(n)"
     }
 
     private static let dateFmt: DateFormatter = {

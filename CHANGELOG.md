@@ -6,6 +6,19 @@ All notable changes to BarPilot are documented here.
 
 ---
 
+## [0.4.6] — 2026-06-23
+
+### Added
+- **Models tab — effective per-token cost.** Each model now shows the input and
+  output rate you actually paid (`in $/Mtok` / `out $/Mtok`) over the selected
+  period, derived from a least-squares fit of credits against token counts — so
+  cache discounts are baked in and the figures sit well below list price. A
+  `Fit` column reports how well that two-rate split explains the real credits,
+  and a blue ⓘ explains all three. Token counts are now abbreviated (`86.3M`,
+  `661K`) to keep the full breakdown within the window.
+
+---
+
 ## [0.4.5] — 2026-06-21
 
 ### Improved

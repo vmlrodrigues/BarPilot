@@ -99,20 +99,47 @@ enum Aggregator {
     // Models — credits + token breakdown by model
     // -----------------------------------------------------------------------
     private static func buildModels(_ recs: [UsageRecord]) -> [ModelRow] {
-        struct Acc { var calls = 0; var credits = 0.0; var inTok = 0; var outTok = 0 }
+        // Plain totals + the cross-product sums needed for a per-model
+        // least-squares fit of credits against (input, output) tokens.
+        struct Acc {
+            var calls = 0; var credits = 0.0; var inTok = 0; var outTok = 0
+            var sii = 0.0, soo = 0.0, sio = 0.0, sic = 0.0, soc = 0.0, scc = 0.0
+        }
         var acc: [String: Acc] = [:]
         for r in recs {
             let m = displayModel(r.model)
-            acc[m, default: Acc()].calls += 1
-            acc[m, default: Acc()].credits += r.credits
-            acc[m, default: Acc()].inTok += r.inputTokens
-            acc[m, default: Acc()].outTok += r.outputTokens
+            let i = Double(r.inputTokens), o = Double(r.outputTokens), c = r.credits
+            var a = acc[m] ?? Acc()
+            a.calls += 1; a.credits += c; a.inTok += r.inputTokens; a.outTok += r.outputTokens
+            a.sii += i*i; a.soo += o*o; a.sio += i*o
+            a.sic += i*c; a.soc += o*c; a.scc += c*c
+            acc[m] = a
         }
-        return acc.map {
-            ModelRow(model: $0.key, calls: $0.value.calls, credits: $0.value.credits,
-                     inputTokens: $0.value.inTok, outputTokens: $0.value.outTok)
+        return acc.map { key, a -> ModelRow in
+            let f = fitRates(sii: a.sii, soo: a.soo, sio: a.sio, sic: a.sic, soc: a.soc, scc: a.scc)
+            return ModelRow(model: key, calls: a.calls, credits: a.credits,
+                            inputTokens: a.inTok, outputTokens: a.outTok,
+                            inRate: f.inRate, outRate: f.outRate, fit: f.fit)
         }
         .sorted { $0.credits > $1.credits }
+    }
+
+    /// Least-squares fit (no intercept) of `credits = inRate·in + outRate·out`,
+    /// returning credits-per-token rates and the uncentered R². Returns `.nan`
+    /// when the system is degenerate or yields a negative rate (collinear or
+    /// too-few spans to separate input from output cost).
+    private static func fitRates(sii: Double, soo: Double, sio: Double,
+                                 sic: Double, soc: Double, scc: Double)
+        -> (inRate: Double, outRate: Double, fit: Double) {
+        let det = sii*soo - sio*sio
+        guard det != 0 else { return (.nan, .nan, .nan) }
+        let inRate = (sic*soo - soc*sio) / det
+        let outRate = (sii*soc - sio*sic) / det
+        guard inRate >= 0, outRate >= 0 else { return (.nan, .nan, .nan) }
+        let ssRes = scc - 2*inRate*sic - 2*outRate*soc +
+            inRate*inRate*sii + 2*inRate*outRate*sio + outRate*outRate*soo
+        let fit = scc > 0 ? 1 - ssRes/scc : .nan
+        return (inRate, outRate, fit)
     }
 
     // -----------------------------------------------------------------------
