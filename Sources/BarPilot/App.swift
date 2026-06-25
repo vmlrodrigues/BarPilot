@@ -46,6 +46,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     private var cancellables = Set<AnyCancellable>()
+    // Backup outside-click monitor: NSPopover(.transient) breaks after a native
+    // NSMenu (the period Picker) runs its modal event loop. This global monitor
+    // ensures clicks in other apps still close the popover in that case.
+    private var outsideClickMonitor: Any?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(CommandLine.arguments.contains("--regular") ? .regular : .accessory)
@@ -66,6 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         popover.behavior = .transient
         popover.animates = false
+        popover.delegate = self
         popover.contentViewController = NSHostingController(
             rootView: DetailView().environmentObject(store)
         )
@@ -179,7 +184,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
             NSApp.activate(ignoringOtherApps: true)
             popover.contentViewController?.view.window?.makeKey()
+            installOutsideClickMonitor()
             Task { await store.reload() }   // freshen on open
+        }
+    }
+
+    private func installOutsideClickMonitor() {
+        removeOutsideClickMonitor()
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown]
+        ) { [weak self] _ in
+            guard let self, self.popover.isShown else { return }
+            self.popover.performClose(nil)
+        }
+    }
+
+    private func removeOutsideClickMonitor() {
+        if let m = outsideClickMonitor {
+            NSEvent.removeMonitor(m)
+            outsideClickMonitor = nil
         }
     }
 
@@ -188,5 +211,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let screen = statusItem.button?.window?.screen ?? NSScreen.main
         let available = (screen?.visibleFrame.height ?? 800) - 8
         return NSSize(width: 600, height: min(700, max(480, available)))
+    }
+}
+
+// MARK: - NSPopoverDelegate
+
+extension AppDelegate: NSPopoverDelegate {
+    /// Called whenever the popover closes (transient auto-close, our backup
+    /// monitor, or the status-bar button toggle). Always clean up the monitor.
+    func popoverDidClose(_ notification: Notification) {
+        removeOutsideClickMonitor()
     }
 }

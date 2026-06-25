@@ -6,6 +6,18 @@ All notable changes to BarPilot are documented here.
 
 ---
 
+## [0.4.7] — 2026-06-26
+
+### Fixed
+- **Popover stays visible (translucent) after changing the period dropdown.**
+  Interacting with the period picker opens a native `NSMenu` that runs a modal
+  event loop, which disrupts `NSPopover`'s built-in `.transient` outside-click
+  monitor. A supplemental `NSEvent` global monitor now acts as a reliable backup
+  so that any click outside BarPilot closes the window, even after the picker
+  has been used. Fixes [#1](https://github.com/vmlrodrigues/BarPilot/issues/1).
+
+---
+
 ## [0.4.6] — 2026-06-23
 
 ### Added
