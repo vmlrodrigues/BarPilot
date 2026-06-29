@@ -14,6 +14,10 @@ private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.sel
 
 enum SpanCache {
     static var path: String {
+        // Override for sandboxed testing (point at a copy; real cache untouched).
+        if let override = ProcessInfo.processInfo.environment["BARPILOT_CACHE_PATH"], !override.isEmpty {
+            return override
+        }
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         return home + "/Library/Application Support/com.victorrodrigues.barpilot/spans-cache.db"
     }
@@ -43,6 +47,7 @@ enum SpanCache {
             op_name       TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_start_ms ON spans(start_ms);
+        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
         """, nil, nil, nil)
         return db
     }
@@ -123,5 +128,95 @@ enum SpanCache {
                    - Int64(months) * 30 * 24 * 60 * 60 * 1000
         sqlite3_exec(db, "DELETE FROM spans WHERE start_ms < \(cutoff)", nil, nil, nil)
         sqlite3_exec(db, "VACUUM", nil, nil, nil)
+    }
+
+    // -----------------------------------------------------------------------
+    // Backfill support (see ChatBackfill)
+    // -----------------------------------------------------------------------
+
+    /// Read a value from the meta table (nil if absent).
+    static func getMeta(_ key: String) -> String? {
+        guard let db = open() else { return nil }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT value FROM meta WHERE key=?", -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
+        if sqlite3_step(stmt) == SQLITE_ROW, let c = sqlite3_column_text(stmt, 0) {
+            return String(cString: c)
+        }
+        return nil
+    }
+
+    /// Earliest `start_ms` among live OTel-sourced spans (nil if none). The
+    /// boundary for date-partitioned backfill: fill only dates strictly before it.
+    static func earliestOTelMs() -> Int64? {
+        guard let db = open() else { return nil }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        let sql = "SELECT MIN(start_ms) FROM spans WHERE source IN (?,?)"
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, SourceKind.vscode.rawValue, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, SourceKind.macApp.rawValue, -1, SQLITE_TRANSIENT)
+        if sqlite3_step(stmt) == SQLITE_ROW, sqlite3_column_type(stmt, 0) != SQLITE_NULL {
+            return sqlite3_column_int64(stmt, 0)
+        }
+        return nil
+    }
+
+    /// One-time on-disk backup of the cache before a migration (no-op if it exists).
+    static func backupOnce(tag: String) {
+        let p = path
+        let bk = (p as NSString).deletingPathExtension + ".backup-\(tag).db"
+        guard !FileManager.default.fileExists(atPath: bk) else { return }
+        guard let db = open() else { return }
+        sqlite3_exec(db, "PRAGMA wal_checkpoint(TRUNCATE)", nil, nil, nil)   // flush WAL so the .db file is self-contained
+        sqlite3_close(db)
+        try? FileManager.default.copyItem(atPath: p, toPath: bk)
+    }
+
+    /// Insert backfill records AND set `backfill_version` in one transaction —
+    /// atomic (a crash before commit re-runs cleanly) and idempotent
+    /// (INSERT OR IGNORE). The version is set even when `records` is empty, so a
+    /// machine with no gap is still marked done and never re-scans.
+    static func mergeBackfill(_ records: [UsageRecord], version: Int) {
+        guard let db = open() else { return }
+        defer { sqlite3_close(db) }
+        sqlite3_exec(db, "BEGIN", nil, nil, nil)
+        // Clean replace of our OWN tagged rows only (never OTel data): makes a
+        // version-bump re-run apply value fixes cleanly. No-op on first run.
+        sqlite3_exec(db, "DELETE FROM spans WHERE source = '\(SourceKind.chatBackfill.rawValue)'", nil, nil, nil)
+        let sql = """
+        INSERT OR IGNORE INTO spans
+            (span_id, source, model, start_ms, credits, input_tokens,
+             output_tokens, conv_id, session_id, op_name)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+        """
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK {
+            for r in records {
+                sqlite3_bind_text(stmt, 1, r.spanId, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(stmt, 2, r.source.rawValue, -1, SQLITE_TRANSIENT)
+                if let m = r.model { sqlite3_bind_text(stmt, 3, m, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 3) }
+                sqlite3_bind_int64(stmt, 4, r.startMs)
+                sqlite3_bind_double(stmt, 5, r.credits)
+                sqlite3_bind_int64(stmt, 6, Int64(r.inputTokens))
+                sqlite3_bind_int64(stmt, 7, Int64(r.outputTokens))
+                if let c = r.conversationId { sqlite3_bind_text(stmt, 8, c, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 8) }
+                if let s = r.chatSessionId { sqlite3_bind_text(stmt, 9, s, -1, SQLITE_TRANSIENT) } else { sqlite3_bind_null(stmt, 9) }
+                sqlite3_bind_text(stmt, 10, r.operationName, -1, SQLITE_TRANSIENT)
+                sqlite3_step(stmt)
+                sqlite3_reset(stmt)
+            }
+            sqlite3_finalize(stmt)
+        }
+        var mstmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO meta(key,value) VALUES('backfill_version',?)", -1, &mstmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(mstmt, 1, "\(version)", -1, SQLITE_TRANSIENT)
+            sqlite3_step(mstmt)
+            sqlite3_finalize(mstmt)
+        }
+        sqlite3_exec(db, "COMMIT", nil, nil, nil)
     }
 }

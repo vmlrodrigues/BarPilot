@@ -11,6 +11,9 @@ import Foundation
 enum SourceKind: String {
     case vscode = "VS Code Copilot Chat"
     case macApp = "GitHub Copilot Mac App"
+    /// One-time historical backfill from VS Code chat session files (recorded
+    /// credits only, ≥ 2026-06-01). Tagged so it stays reversible. See ChatBackfill.
+    case chatBackfill = "VS Code Chat (backfill)"
 }
 
 /// One billed LLM call (one OTel span carrying a `*_aiu` usage attribute).

@@ -51,6 +51,7 @@ enum DataSources {
         status.macAppConfigured = isMacAppTelemetryConfigured()
 
         SpanCache.merge(liveRecords)
+        ChatBackfill.run()   // one-time, gated: recover pre-OTel June history from chat files
         return (SpanCache.load(), status)
     }
 

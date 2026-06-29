@@ -4,6 +4,18 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+### Added
+- **One-time chat-history backfill.** On first launch, BarPilot reads the VS Code
+  Copilot chat session files and backfills *exact* recorded-credit usage for the
+  window between the usage-based-billing start (2026-06-01 UTC) and the earliest
+  OTel span it has — recovering history that the ~7-day `agent-traces.db`
+  retention drops, which is otherwise invisible to new installs. Recorded credits
+  only (no estimation); models normalise to the same form as live data so they
+  merge into existing per-model rows. Runs at most once (gated by an in-DB
+  `backfill_version`), is additive and reversible (rows tagged
+  `source = chatBackfill`; a re-run cleanly replaces only its own rows), and takes
+  a one-time cache backup before its first run.
+
 ---
 
 ## [0.4.7] — 2026-06-26
