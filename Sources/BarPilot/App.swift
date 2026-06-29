@@ -61,7 +61,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.image?.isTemplate = true
             button.imagePosition = .imageLeading
             button.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
-            button.title = " " + store.menuBarTitle
+            button.title = (Updater.isDevBuild ? " (D) " : " ") + store.menuBarTitle
             button.target = self
             button.action = #selector(statusButtonClicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -80,7 +80,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.$menuBarTitle
             .receive(on: RunLoop.main)
             .sink { [weak self] title in
-                self?.statusItem.button?.title = " " + title
+                self?.statusItem.button?.title = (Updater.isDevBuild ? " (D) " : " ") + title
             }
             .store(in: &cancellables)
 

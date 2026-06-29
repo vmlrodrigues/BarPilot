@@ -41,6 +41,15 @@ struct DetailView: View {
                     .foregroundStyle(.tint)
                 Text("Copilot Usage")
                     .font(.headline)
+                if Updater.isDevBuild {
+                    Text("DEV")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.orange, in: Capsule())
+                        .help("Local development build (not the released app).")
+                }
                 Spacer()
                 if store.isLoading {
                     ProgressView().controlSize(.small)
@@ -163,9 +172,9 @@ struct DetailView: View {
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
-                Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")")
+                Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")\(Updater.isDevBuild ? "-dev" : "")")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(Updater.isDevBuild ? Color.orange : Color.secondary)
                 Button("Quit") { NSApp.terminate(nil) }
                     .buttonStyle(.borderless)
                     .font(.caption)

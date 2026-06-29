@@ -24,7 +24,7 @@ final class Updater {
 
     @MainActor
     func start() {
-        guard Self.isDeveloperIDSigned() else {
+        guard !Self.isDevBuild else {
             NSLog("BarPilot: auto-update disabled (not a Developer ID build)")
             return
         }
@@ -203,4 +203,9 @@ final class Updater {
         let out = runTool("/usr/bin/codesign", ["-dvv", Bundle.main.bundlePath]).output
         return out.contains("TeamIdentifier=\(teamID)") && out.contains("Authority=Developer ID Application")
     }
+
+    /// Cached once: true for ad-hoc / local (`build-app.sh`) builds that are NOT
+    /// Developer ID-signed. Drives the in-app "DEV" markers so a local build is
+    /// always identifiable. Computed lazily on first access (one `codesign` call).
+    static let isDevBuild: Bool = !isDeveloperIDSigned()
 }
