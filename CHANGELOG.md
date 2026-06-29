@@ -4,6 +4,10 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+---
+
+## [0.5.0] — 2026-06-29
+
 ### Added
 - **One-time chat-history backfill.** On first launch, BarPilot reads the VS Code
   Copilot chat session files and backfills *exact* recorded-credit usage for the
