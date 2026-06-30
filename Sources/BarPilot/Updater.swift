@@ -115,10 +115,20 @@ final class Updater {
     }
 
     private static func verify(app: URL) -> Bool {
-        guard runTool("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path]).status == 0 else { return false }
+        guard runTool("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path]).status == 0 else {
+            NSLog("BarPilot: update verify failed — codesign --verify (corrupt/invalid download)")
+            return false
+        }
         let info = runTool("/usr/bin/codesign", ["-dvv", app.path]).output
-        guard info.contains("TeamIdentifier=\(teamID)") else { return false }
-        return runTool("/usr/sbin/spctl", ["--assess", "--type", "execute", app.path]).status == 0
+        guard info.contains("TeamIdentifier=\(teamID)") else {
+            NSLog("BarPilot: update verify failed — TeamIdentifier mismatch")
+            return false
+        }
+        guard runTool("/usr/sbin/spctl", ["--assess", "--type", "execute", app.path]).status == 0 else {
+            NSLog("BarPilot: update verify failed — spctl/Gatekeeper assessment (notarization not verifiable; e.g. app not stapled + Apple unreachable)")
+            return false
+        }
+        return true
     }
 
     private static func hdiutilAttach(_ dmg: URL) -> String? {

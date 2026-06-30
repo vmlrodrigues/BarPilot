@@ -6,6 +6,19 @@ All notable changes to BarPilot are documented here.
 
 ---
 
+## [0.5.2] — 2026-06-30
+
+### Fixed
+- **Self-update failed on networks that block Apple's notarization service.** The
+  in-app updater verifies the downloaded app with Gatekeeper, but only the DMG was
+  stapled — not the app bundle — so verifying the *extracted* app required a live
+  call to Apple, which fails behind some corporate firewalls/VPNs (the update was
+  silently rejected). The release now staples the notarization ticket to the **app**
+  itself, so the updater verifies it **offline**. The updater also now logs which
+  verification check fails, to make any future issue self-diagnosing.
+
+---
+
 ## [0.5.1] — 2026-06-29
 
 ### Fixed

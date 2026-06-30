@@ -61,6 +61,13 @@ release: check
 	@echo "-> Verifying signature..."
 	@codesign --verify --deep --strict --verbose=2 "$(APP)"
 	@codesign -dvv "$(APP)" 2>&1 | grep -E "Authority=Developer ID|TeamIdentifier|runtime" || true
+	@echo "-> Notarising + stapling the APP (so self-update verifies offline, not via a live Apple call)..."
+	@rm -f "$(CURDIR)/.notarize-app.zip"
+	@ditto -c -k --keepParent "$(APP)" "$(CURDIR)/.notarize-app.zip"
+	xcrun notarytool submit "$(CURDIR)/.notarize-app.zip" --keychain-profile "$(NOTARIZE_PROFILE)" --wait
+	xcrun stapler staple "$(APP)"
+	@rm -f "$(CURDIR)/.notarize-app.zip"
+	@xcrun stapler validate "$(APP)" && echo "   app stapled: OK" || { echo "x app stapling failed - aborting"; exit 1; }
 	@echo "-> Staging app + building DMG..."
 	@ditto "$(APP)" "$(STAGING)/$(APP)"
 	create-dmg --volname "BarPilot $(VERSION)" --window-pos 200 120 --window-size 540 380 --icon-size 128 --icon "$(APP)" 150 185 --hide-extension "$(APP)" --app-drop-link 390 185 "$(DMG_NAME)" "$(STAGING)/"
