@@ -104,12 +104,24 @@ struct DetailView: View {
             }
 
             HStack(alignment: .lastTextBaseline, spacing: 10) {
-                Text(store.costString(credits: store.report.totalCredits))
-                    .font(.system(size: 34, weight: .bold, design: .rounded))
-                    .monospacedDigit()
-                Text("\(Fmt.credits(store.report.totalCredits)) credits")
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
+                if store.lastUpdated == nil {
+                    // First load hasn't completed yet — show a loading placeholder
+                    // rather than a misleading "$0.00" from the empty initial report.
+                    Text("—")
+                        .font(.system(size: 34, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                    Text("loading…")
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(store.costString(credits: store.report.totalCredits))
+                        .font(.system(size: 34, weight: .bold, design: .rounded))
+                        .monospacedDigit()
+                    Text("\(Fmt.credits(store.report.totalCredits)) credits")
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 Sparkline(totals: store.report.dailyTotals)
                     .frame(width: 150, height: 38)

@@ -4,6 +4,13 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **First-run flash of `$0`.** On a cold cache (fresh install, before the first
+  read completes — now slightly longer because of the history backfill), the
+  window briefly showed a misleading `$0.00` total. It now shows a "loading…"
+  placeholder until the first load finishes, so a fresh install never flashes a
+  fake zero.
+
 ---
 
 ## [0.5.0] — 2026-06-29
