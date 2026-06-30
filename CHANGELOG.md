@@ -4,6 +4,10 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+---
+
+## [0.5.1] — 2026-06-29
+
 ### Fixed
 - **First-run flash of `$0`.** On a cold cache (fresh install, before the first
   read completes — now slightly longer because of the history backfill), the
