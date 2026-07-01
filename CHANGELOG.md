@@ -4,6 +4,10 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+---
+
+## [0.5.3] — 2026-07-01
+
 ### Fixed
 - **"This Month" budget bar measured against a single day.** On the 1st of the
   month the pro-rated budget collapsed to one day (days-elapsed = 1), so the bar
