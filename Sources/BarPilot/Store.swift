@@ -163,8 +163,14 @@ final class UsageStore: ObservableObject {
     // -----------------------------------------------------------------------
 
     /// Budget for the selected span, in credits (100 credits = $1).
-    /// Monthly budget → per-day rate → × days in the selected range.
+    /// "This Month" compares against the FULL monthly budget so the bar shows
+    /// progress through the month (matching the "This month's budget" label),
+    /// rather than a per-day pro-ration that collapses to a single day on the 1st.
+    /// Every other period pro-rates the daily rate across the days in its range.
     var periodBudgetCredits: Double {
+        if periodKind == .thisMonth {
+            return monthlyBudget * 100.0
+        }
         let perDayCredits = (monthlyBudget * 100.0) / Self.avgDaysPerMonth
         return perDayCredits * Double(max(report.daysInRange, 1))
     }

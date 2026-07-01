@@ -4,6 +4,14 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **"This Month" budget bar measured against a single day.** On the 1st of the
+  month the pro-rated budget collapsed to one day (days-elapsed = 1), so the bar
+  compared spend against ~one day's budget (identical to "Today") instead of the
+  month — e.g. showing 64% when only 2% of the monthly budget was used. "This
+  Month" now compares against the **full monthly budget**, so the bar reflects
+  progress through the month. Other periods are unchanged.
+
 ---
 
 ## [0.5.2] — 2026-06-30
