@@ -6,6 +6,18 @@ All notable changes to BarPilot are documented here.
 
 ---
 
+## [0.6.1] — 2026-07-02
+
+### Fixed
+- **Models tab: single-level rows wrapped their text.** A model that ran at only
+  one reasoning level renders as a single row with the model name and an inline
+  level chip in the same column; on the narrow Models layout the name and the
+  level word ("medium" → "medi-/um") could wrap character-by-character. The name
+  is now kept to one line (truncating with a full-name tooltip) and the level chip
+  never wraps. Grouped (multi-level) models were unaffected.
+
+---
+
 ## [0.6.0] — 2026-07-02
 
 ### Fixed
