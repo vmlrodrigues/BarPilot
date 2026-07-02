@@ -35,5 +35,17 @@ enum Dump {
         print("[" + items.joined(separator: ",") + "]")
         FileHandle.standardError.write(Data(
             "total: \(Fmt.credits4(report.totalCredits)) credits (\(Fmt.cost(report.totalCredits)))\n".utf8))
+
+        // Reasoning-level breakdown (stderr — the stdout JSON summary is unchanged).
+        // Per-level credits sum to the model total, so it doubles as a check.
+        let leveled = report.models.filter { m in m.levels.contains { $0.level != nil } }
+        if !leveled.isEmpty {
+            FileHandle.standardError.write(Data("reasoning levels:\n".utf8))
+            for m in leveled {
+                let parts = m.levels.map { "\($0.level ?? "—") \(Fmt.credits4($0.credits)) (\($0.calls))" }
+                FileHandle.standardError.write(Data(
+                    "  \(m.model): total \(Fmt.credits4(m.credits)) cr | \(parts.joined(separator: ", "))\n".utf8))
+            }
+        }
     }
 }

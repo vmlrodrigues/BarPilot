@@ -51,6 +51,7 @@ enum DataSources {
         status.macAppConfigured = isMacAppTelemetryConfigured()
 
         SpanCache.merge(liveRecords)
+        ReasoningLevelBackfill.run(liveRecords: liveRecords)  // one-time, gated: fill levels on already-cached spans
         ChatBackfill.run()   // one-time, gated: recover pre-OTel June history from chat files
         return (SpanCache.load(), status)
     }
@@ -105,7 +106,9 @@ private func loadSQLite(path: String) -> [UsageRecord] {
     let sql = """
     SELECT s.span_id, s.response_model, s.start_time_ms,
            s.input_tokens, s.output_tokens, s.conversation_id, s.chat_session_id,
-           s.operation_name, sa.value
+           s.operation_name, sa.value,
+           (SELECT value FROM span_attributes o
+             WHERE o.span_id = s.span_id AND o.key = 'copilot_chat.request.options')
     FROM spans s
     JOIN span_attributes sa ON s.span_id = sa.span_id
     WHERE sa.key = 'copilot_chat.copilot_usage_nano_aiu'
@@ -136,10 +139,23 @@ private func loadSQLite(path: String) -> [UsageRecord] {
             outputTokens: Int(sqlite3_column_int64(stmt, 4)),
             conversationId: text(5),
             chatSessionId: text(6),
-            operationName: text(7) ?? ""
+            operationName: text(7) ?? "",
+            reasoningLevel: reasoningEffort(fromOptionsJSON: text(9))
         ))
     }
     return out
+}
+
+/// Pull the reasoning-effort level out of VS Code's `copilot_chat.request.options`
+/// JSON blob (shape: `{"reasoning":{"effort":"medium",…}}`). Tolerates a flat
+/// `reasoning_effort` too. Returns nil when absent or unparseable — purely
+/// additive, so a shape change never disturbs the cost/token data.
+private func reasoningEffort(fromOptionsJSON json: String?) -> String? {
+    guard let json, let data = json.data(using: .utf8),
+          let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+    if let reasoning = obj["reasoning"] as? [String: Any], let e = reasoning["effort"] as? String { return e }
+    if let e = obj["reasoning_effort"] as? String { return e }
+    return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -207,10 +223,15 @@ private func parseJSONLLine(
                               "copilot_chat.copilot_usage_nano_aiu")
         if nano == 0 { continue }
 
-        // Skip orchestration/agent spans that aggregate child LLM costs — they
-        // have no model and their AIU value duplicates the child span's value.
+        // Skip orchestration/agent spans that aggregate child LLM costs — their
+        // AIU duplicates the child span's value, so counting them double-counts.
+        // Two shapes: (1) no model attribute at all, and (2) `invoke_agent` rollup
+        // spans that DO carry a model but whose AIU is the sum of the child chat
+        // calls. Both must be excluded.
         guard let model = attrString(attrs, "gen_ai.response.model", "gen_ai.request.model",
                                      "copilot_chat.model") else { continue }
+        let op = (span["name"] as? String) ?? attrString(attrs, "gen_ai.operation.name") ?? ""
+        if op.hasPrefix("invoke_agent") { continue }
 
         if seen.contains(spanId) { continue }   // mirrors INSERT OR IGNORE
         seen.insert(spanId)
@@ -222,7 +243,7 @@ private func parseJSONLLine(
                                    "gen_ai.usage.prompt_tokens"))
         let outTok = Int(attrNumber(attrs, "gen_ai.usage.output_tokens", "llm.usage.completion_tokens",
                                     "gen_ai.usage.completion_tokens"))
-        let op = (span["name"] as? String) ?? attrString(attrs, "gen_ai.operation.name") ?? ""
+        let level = attrString(attrs, "gen_ai.request.reasoning.level", "gen_ai.request.reasoning_effort")
 
         out.append(UsageRecord(
             source: .macApp,
@@ -234,7 +255,8 @@ private func parseJSONLLine(
             outputTokens: outTok,
             conversationId: conv,
             chatSessionId: sess,
-            operationName: op
+            operationName: op,
+            reasoningLevel: level
         ))
     }
 }

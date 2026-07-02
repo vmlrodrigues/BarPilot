@@ -55,8 +55,12 @@ totals with `--dump` against a known-good capture. The rules:
   trailing `-<digit>` → `.<digit>` (so `claude-sonnet-4-6` ≡ `claude-sonnet-4.6`,
   but `...-2024-07-18` is untouched). See `Aggregator.normaliseModel`.
 - **Dedup** by `spanId` (first occurrence wins; later duplicates ignored).
-- Orchestration/agent spans (no model attribute) are **skipped** — their AIU
-  duplicates the child LLM span's value.
+- Orchestration/agent spans are **skipped** — their AIU duplicates the child LLM
+  span's value, so counting them double-counts. Two shapes: spans with **no model
+  attribute**, and **`invoke_agent` rollup spans** (which *do* carry a model, but
+  whose AIU is the sum of the child chat calls). Both are excluded — at parse time
+  (`Sources.parseJSONLLine`) and again at cache-load (`SpanCache.load` filters out
+  `op_name LIKE 'invoke_agent%'`), so historical cached rollups stop counting too.
 
 ## Data sources (read-only, both off the main actor)
 

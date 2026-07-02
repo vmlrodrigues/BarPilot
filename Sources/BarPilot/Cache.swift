@@ -44,12 +44,28 @@ enum SpanCache {
             output_tokens INTEGER NOT NULL,
             conv_id       TEXT,
             session_id    TEXT,
-            op_name       TEXT NOT NULL
+            op_name       TEXT NOT NULL,
+            reasoning_level TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_start_ms ON spans(start_ms);
         CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
         """, nil, nil, nil)
+        // Migration: add reasoning_level to caches created before it existed.
+        if !columnExists(db, table: "spans", column: "reasoning_level") {
+            sqlite3_exec(db, "ALTER TABLE spans ADD COLUMN reasoning_level TEXT", nil, nil, nil)
+        }
         return db
+    }
+
+    /// True if `column` exists on `table` (via PRAGMA table_info).
+    private static func columnExists(_ db: OpaquePointer?, table: String, column: String) -> Bool {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA table_info(\(table))", -1, &stmt, nil) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(stmt) }
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let c = sqlite3_column_text(stmt, 1), String(cString: c) == column { return true }
+        }
+        return false
     }
 
     /// Persist new records (existing span_ids are left unchanged).
@@ -59,8 +75,8 @@ enum SpanCache {
         let sql = """
         INSERT OR IGNORE INTO spans
             (span_id, source, model, start_ms, credits, input_tokens,
-             output_tokens, conv_id, session_id, op_name)
-        VALUES (?,?,?,?,?,?,?,?,?,?)
+             output_tokens, conv_id, session_id, op_name, reasoning_level)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
@@ -80,6 +96,8 @@ enum SpanCache {
             if let s = r.chatSessionId { sqlite3_bind_text(stmt, 9, s, -1, SQLITE_TRANSIENT) }
             else { sqlite3_bind_null(stmt, 9) }
             sqlite3_bind_text(stmt, 10, r.operationName, -1, SQLITE_TRANSIENT)
+            if let lv = r.reasoningLevel { sqlite3_bind_text(stmt, 11, lv, -1, SQLITE_TRANSIENT) }
+            else { sqlite3_bind_null(stmt, 11) }
             sqlite3_step(stmt)
             sqlite3_reset(stmt)
         }
@@ -90,10 +108,15 @@ enum SpanCache {
     static func load() -> [UsageRecord] {
         guard let db = open() else { return [] }
         defer { sqlite3_close(db) }
+        // Exclude `invoke_agent` orchestration rollups: their AIU duplicates the
+        // child chat spans (see Sources.parseJSONLLine). Filtering here — the one
+        // read every view derives from — retroactively corrects all cached history
+        // without deleting anything (the rows stay, just uncounted; reversible).
         let sql = """
         SELECT span_id, source, model, start_ms, credits,
-               input_tokens, output_tokens, conv_id, session_id, op_name
+               input_tokens, output_tokens, conv_id, session_id, op_name, reasoning_level
         FROM spans
+        WHERE op_name NOT LIKE 'invoke_agent%'
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return [] }
@@ -114,7 +137,8 @@ enum SpanCache {
                 outputTokens: Int(sqlite3_column_int64(stmt, 6)),
                 conversationId: text(7),
                 chatSessionId: text(8),
-                operationName: text(9) ?? ""
+                operationName: text(9) ?? "",
+                reasoningLevel: text(10)
             ))
         }
         return out
@@ -213,6 +237,36 @@ enum SpanCache {
         }
         var mstmt: OpaquePointer?
         if sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO meta(key,value) VALUES('backfill_version',?)", -1, &mstmt, nil) == SQLITE_OK {
+            sqlite3_bind_text(mstmt, 1, "\(version)", -1, SQLITE_TRANSIENT)
+            sqlite3_step(mstmt)
+            sqlite3_finalize(mstmt)
+        }
+        sqlite3_exec(db, "COMMIT", nil, nil, nil)
+    }
+
+    /// One-time fill of `reasoning_level` on already-cached spans, from a fresh
+    /// source read whose records now carry the level. Updates only rows still
+    /// NULL (going-forward inserts already set it via `merge`), and stamps
+    /// `reasoning_backfill_version` in the same transaction so it never re-runs.
+    /// Mac App history fills fully (its JSONL is re-scanned every launch); VS Code
+    /// fills only what's still in its ~7-day source window.
+    static func backfillReasoningLevels(from records: [UsageRecord], version: Int) {
+        guard let db = open() else { return }
+        defer { sqlite3_close(db) }
+        sqlite3_exec(db, "BEGIN", nil, nil, nil)
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "UPDATE spans SET reasoning_level=? WHERE span_id=? AND reasoning_level IS NULL", -1, &stmt, nil) == SQLITE_OK {
+            for r in records {
+                guard let lv = r.reasoningLevel else { continue }
+                sqlite3_bind_text(stmt, 1, lv, -1, SQLITE_TRANSIENT)
+                sqlite3_bind_text(stmt, 2, r.spanId, -1, SQLITE_TRANSIENT)
+                sqlite3_step(stmt)
+                sqlite3_reset(stmt)
+            }
+            sqlite3_finalize(stmt)
+        }
+        var mstmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO meta(key,value) VALUES('reasoning_backfill_version',?)", -1, &mstmt, nil) == SQLITE_OK {
             sqlite3_bind_text(mstmt, 1, "\(version)", -1, SQLITE_TRANSIENT)
             sqlite3_step(mstmt)
             sqlite3_finalize(mstmt)

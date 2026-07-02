@@ -79,7 +79,8 @@ enum ChatBackfill {
                 source: .chatBackfill, spanId: rid,
                 model: Aggregator.normaliseModel(a.model ?? "unknown"), startMs: ts,
                 credits: a.credit, inputTokens: a.inTok, outputTokens: a.outTok,
-                conversationId: nil, chatSessionId: a.session, operationName: "chat"))
+                conversationId: nil, chatSessionId: a.session, operationName: "chat",
+                reasoningLevel: nil))
         }
         return out
     }
@@ -198,5 +199,29 @@ enum ChatBackfill {
             }
         }
         w(o); return found
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReasoningLevelBackfill — one-time fill of `reasoning_level` on spans that were
+// cached before the column existed. Reads nothing new: it fills from the sources
+// already loaded this launch, so it's cheap and self-contained. Gated by its own
+// in-DB version key (never re-runs), with a one-time backup first — the same
+// mechanism ChatBackfill uses.
+//
+// Coverage: Mac App history fills fully (its JSONL is re-scanned every launch, so
+// this launch's records already cover it); VS Code fills only what's still in its
+// ~7-day source window — older VS Code spans predate any capture and stay unknown.
+// ---------------------------------------------------------------------------
+
+enum ReasoningLevelBackfill {
+    /// Bump to force a one-time re-fill for everyone.
+    static let version = 1
+
+    static func run(liveRecords: [UsageRecord]) {
+        let stored = Int(SpanCache.getMeta("reasoning_backfill_version") ?? "0") ?? 0
+        guard stored < version else { return }   // already done — never re-runs
+        SpanCache.backupOnce(tag: "pre-reasoning-v\(version)")
+        SpanCache.backfillReasoningLevels(from: liveRecords, version: version)
     }
 }

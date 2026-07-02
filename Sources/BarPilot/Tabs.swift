@@ -109,14 +109,102 @@ struct SummaryTab: View {
 // Models — credits + token breakdown by model
 // ---------------------------------------------------------------------------
 
+/// Label for the "no reasoning level" bucket — a hollow dot (vs the filled effort
+/// dots, so absence reads at a glance), the words "no level", and an ⓘ that says
+/// what those calls are. Its own view so each row owns its popover state.
+private struct NoLevelLabel: View {
+    @State private var showing = false
+    var body: some View {
+        HStack(spacing: 5) {
+            Circle().strokeBorder(Color.secondary.opacity(0.55), lineWidth: 1)
+                .frame(width: 7, height: 7)
+            Text("no level").font(.callout)
+            Button { showing.toggle() } label: {
+                Image(systemName: "info.circle").font(.caption2).foregroundStyle(.blue)
+            }
+            .buttonStyle(.borderless)
+            .popover(isPresented: $showing) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("No reasoning level").font(.caption.weight(.semibold))
+                    Text("These calls didn't set a reasoning-effort level — non-reasoning models, or steps run without one. They're grouped here so the model's totals still add up.")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.caption).padding().frame(width: 260)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
 struct ModelsTab: View {
     @EnvironmentObject var store: UsageStore
     let rows: [ModelRow]
     let total: Double
     @State private var showingRateInfo = false
 
+    // A model run at >1 reasoning level expands into a bold total row + one row
+    // per level; a single-level or no-level model stays a single flat row.
+    private enum Item: Identifiable {
+        case flat(ModelRow)
+        case group(ModelRow)
+        case level(ModelLevelRow)
+        var id: String {
+            switch self {
+            case .flat(let r):  return "flat-\(r.id)"
+            case .group(let r): return "grp-\(r.id)"
+            case .level(let l): return "lvl-\(l.id)"
+            }
+        }
+    }
+
+    private var items: [Item] {
+        var out: [Item] = []
+        for m in rows {
+            if m.levels.count <= 1 {
+                out.append(.flat(m))
+            } else {
+                out.append(.group(m))
+                for l in m.levels { out.append(.level(l)) }
+            }
+        }
+        return out
+    }
+
+    /// Effort → dot colour (cool → warm as effort rises); nil/unknown = neutral.
+    private func levelColor(_ level: String?) -> Color {
+        switch level {
+        case "minimal", "low": return Color(red: 0.53, green: 0.53, blue: 0.50)
+        case "medium":         return Color(red: 0.22, green: 0.54, blue: 0.87)
+        case "high":           return Color(red: 0.94, green: 0.62, blue: 0.15)
+        case "xhigh":          return Color(red: 0.85, green: 0.35, blue: 0.19)
+        case "max":            return Color(red: 0.89, green: 0.29, blue: 0.29)
+        default:               return .secondary
+        }
+    }
+
+    @ViewBuilder
+    private func levelChip(_ level: String) -> some View {
+        HStack(spacing: 5) {
+            Circle().fill(levelColor(level)).frame(width: 7, height: 7)
+            Text(level).font(.callout)
+        }
+    }
+
+    @ViewBuilder
+    private func numericCells(calls: Int, credits: Double, inTok: Int, outTok: Int,
+                              inRate: Double, outRate: Double, fit: Double,
+                              weight: Font.Weight? = nil) -> some View {
+        Text(Fmt.int(calls)).numCol(40).fontWeight(weight)
+        Text(Fmt.credits(credits)).numCol(64).fontWeight(weight)
+        Text(Fmt.tokens(inTok)).numCol(50).fontWeight(weight)
+        Text(Fmt.tokens(outTok)).numCol(52).fontWeight(weight)
+        Text(inRate.isNaN ? "—" : store.costString(credits: inRate * 1_000_000)).numCol(58).fontWeight(weight)
+        Text(outRate.isNaN ? "—" : store.costString(credits: outRate * 1_000_000)).numCol(60).fontWeight(weight)
+        Text(fit.isNaN ? "—" : String(format: "%.0f%%", fit * 100)).numCol(54).fontWeight(weight)
+    }
+
     var body: some View {
-        TableScaffold(count: rows.count) {
+        TableScaffold(count: items.count) {
             HStack {
                 Text("Model").headCol(nil, .leading).frame(maxWidth: .infinity, alignment: .leading)
                 Text("Calls").headCol(40)
@@ -143,6 +231,8 @@ struct ModelsTab: View {
                                 .foregroundStyle(.secondary)
                             Text("**Fit** — how well a single input + output rate explains your real credits (100% = perfect). Lower means the mix varied, typically from cache tiers this view can't separate.")
                                 .foregroundStyle(.secondary)
+                            Text("**Reasoning level** — a model run at more than one effort level is grouped: the bold row is the model total (rate and Fit use every call, so it's the most reliable), with a row per level beneath. A thin level shows “—” when it has too few calls to fit.")
+                                .foregroundStyle(.secondary)
                         }
                         .font(.caption)
                         .padding()
@@ -153,16 +243,39 @@ struct ModelsTab: View {
                 .frame(width: 54, alignment: .trailing)
             }
         } row: { i in
-            let r = rows[i]
-            HStack {
-                Text(r.model).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
-                Text(Fmt.int(r.calls)).numCol(40)
-                Text(Fmt.credits(r.credits)).numCol(64)
-                Text(Fmt.tokens(r.inputTokens)).numCol(50)
-                Text(Fmt.tokens(r.outputTokens)).numCol(52)
-                Text(r.inRate.isNaN ? "—" : store.costString(credits: r.inRate * 1_000_000)).numCol(58)
-                Text(r.outRate.isNaN ? "—" : store.costString(credits: r.outRate * 1_000_000)).numCol(60)
-                Text(r.fit.isNaN ? "—" : String(format: "%.0f%%", r.fit * 100)).numCol(54)
+            switch items[i] {
+            case .flat(let r):
+                HStack {
+                    HStack(spacing: 0) {
+                        Text(r.model).font(.callout)
+                        if let lvl = r.levels.first?.level {
+                            levelChip(lvl).padding(.leading, 8)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    numericCells(calls: r.calls, credits: r.credits, inTok: r.inputTokens,
+                                 outTok: r.outputTokens, inRate: r.inRate, outRate: r.outRate, fit: r.fit)
+                }
+            case .group(let r):
+                HStack {
+                    Text(r.model).font(.callout).fontWeight(.medium)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    numericCells(calls: r.calls, credits: r.credits, inTok: r.inputTokens,
+                                 outTok: r.outputTokens, inRate: r.inRate, outRate: r.outRate, fit: r.fit,
+                                 weight: .medium)
+                }
+            case .level(let l):
+                HStack {
+                    Group {
+                        if let lvl = l.level { levelChip(lvl) }
+                        else { NoLevelLabel() }
+                    }
+                    .padding(.leading, 18)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    numericCells(calls: l.calls, credits: l.credits, inTok: l.inputTokens,
+                                 outTok: l.outputTokens, inRate: l.inRate, outRate: l.outRate, fit: l.fit)
+                }
+                .foregroundStyle(.secondary)
             }
         } footer: {
             totalFooter(total, store)

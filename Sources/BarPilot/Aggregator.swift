@@ -46,6 +46,17 @@ enum Aggregator {
         normaliseModel(raw ?? "unknown")
     }
 
+    /// Canonical reasoning-effort label: trimmed + lowercased. Both sources use
+    /// the same words (low/medium/high/xhigh/max), so this only harmonises casing.
+    static func normaliseLevel(_ level: String?) -> String? {
+        guard let l = level?.trimmingCharacters(in: .whitespaces).lowercased(), !l.isEmpty else { return nil }
+        return l
+    }
+
+    /// Display order for reasoning levels (ascending effort). Unknown labels sort
+    /// after these; the no-level (`nil`) bucket sorts last of all.
+    static let levelOrder: [String: Int] = ["minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5]
+
     // -----------------------------------------------------------------------
     // Build the full report for a [fromStr, toStr] window (inclusive).
     // -----------------------------------------------------------------------
@@ -99,27 +110,48 @@ enum Aggregator {
     // Models — credits + token breakdown by model
     // -----------------------------------------------------------------------
     private static func buildModels(_ recs: [UsageRecord]) -> [ModelRow] {
-        // Plain totals + the cross-product sums needed for a per-model
-        // least-squares fit of credits against (input, output) tokens.
+        // Plain totals + the cross-product sums needed for a least-squares fit of
+        // credits against (input, output) tokens. Accumulated at BOTH the model
+        // level (the reliable, all-spans fit shown on the group row) and per
+        // (model, reasoning-level) so each level's own rate/fit can be shown.
         struct Acc {
             var calls = 0; var credits = 0.0; var inTok = 0; var outTok = 0
             var sii = 0.0, soo = 0.0, sio = 0.0, sic = 0.0, soc = 0.0, scc = 0.0
+            mutating func add(_ r: UsageRecord) {
+                let i = Double(r.inputTokens), o = Double(r.outputTokens), c = r.credits
+                calls += 1; credits += c; inTok += r.inputTokens; outTok += r.outputTokens
+                sii += i*i; soo += o*o; sio += i*o
+                sic += i*c; soc += o*c; scc += c*c
+            }
         }
-        var acc: [String: Acc] = [:]
+        var byModel: [String: Acc] = [:]
+        var byLevel: [String: [String: Acc]] = [:]   // model -> levelKey ("" = no level) -> Acc
         for r in recs {
             let m = displayModel(r.model)
-            let i = Double(r.inputTokens), o = Double(r.outputTokens), c = r.credits
-            var a = acc[m] ?? Acc()
-            a.calls += 1; a.credits += c; a.inTok += r.inputTokens; a.outTok += r.outputTokens
-            a.sii += i*i; a.soo += o*o; a.sio += i*o
-            a.sic += i*c; a.soc += o*c; a.scc += c*c
-            acc[m] = a
+            let lk = normaliseLevel(r.reasoningLevel) ?? ""
+            byModel[m, default: Acc()].add(r)
+            byLevel[m, default: [:]][lk, default: Acc()].add(r)
         }
-        return acc.map { key, a -> ModelRow in
-            let f = fitRates(sii: a.sii, soo: a.soo, sio: a.sio, sic: a.sic, soc: a.soc, scc: a.scc)
-            return ModelRow(model: key, calls: a.calls, credits: a.credits,
+        func levelSortOrder(_ level: String?) -> Int {
+            level == nil ? 99 : (levelOrder[level!] ?? 98)
+        }
+        return byModel.map { model, a -> ModelRow in
+            let mf = fitRates(sii: a.sii, soo: a.soo, sio: a.sio, sic: a.sic, soc: a.soc, scc: a.scc)
+            let levels: [ModelLevelRow] = (byLevel[model] ?? [:]).map { lk, la in
+                let lf = fitRates(sii: la.sii, soo: la.soo, sio: la.sio, sic: la.sic, soc: la.soc, scc: la.scc)
+                return ModelLevelRow(level: lk.isEmpty ? nil : lk,
+                                     calls: la.calls, credits: la.credits,
+                                     inputTokens: la.inTok, outputTokens: la.outTok,
+                                     inRate: lf.inRate, outRate: lf.outRate, fit: lf.fit)
+            }
+            .sorted { l1, l2 in
+                let o1 = levelSortOrder(l1.level), o2 = levelSortOrder(l2.level)
+                return o1 != o2 ? o1 < o2 : l1.credits > l2.credits
+            }
+            return ModelRow(model: model, calls: a.calls, credits: a.credits,
                             inputTokens: a.inTok, outputTokens: a.outTok,
-                            inRate: f.inRate, outRate: f.outRate, fit: f.fit)
+                            inRate: mf.inRate, outRate: mf.outRate, fit: mf.fit,
+                            levels: levels)
         }
         .sorted { $0.credits > $1.credits }
     }

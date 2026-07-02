@@ -32,6 +32,10 @@ struct UsageRecord {
     let conversationId: String?
     let chatSessionId: String?
     let operationName: String
+    /// Reasoning-effort level the call ran at, as recorded by the source
+    /// ("low"…"max"); `nil` for models/calls that don't set one. Raw value —
+    /// harmonised for display in `Aggregator.normaliseLevel`.
+    let reasoningLevel: String?
 }
 
 // ---------------------------------------------------------------------------
@@ -59,6 +63,25 @@ struct ModelRow: Identifiable {
     let inRate: Double
     let outRate: Double
     /// Goodness-of-fit (uncentered R², 0…1); `.nan` when unsolvable.
+    let fit: Double
+    /// Per-reasoning-level breakdown of this model's spans, sorted by ascending
+    /// effort. Always ≥ 1 element (one `nil`-level bucket for non-reasoning use);
+    /// > 1 means the model was run at multiple levels and the UI groups them.
+    let levels: [ModelLevelRow]
+    var cost: Double { credits / 100.0 }
+}
+
+/// One reasoning-level slice within a model (a child row in the Models tab).
+/// `level` is the normalised effort ("low"…"max"); `nil` = calls with no level.
+struct ModelLevelRow: Identifiable {
+    let id = UUID()
+    let level: String?
+    let calls: Int
+    let credits: Double
+    let inputTokens: Int
+    let outputTokens: Int
+    let inRate: Double
+    let outRate: Double
     let fit: Double
     var cost: Double { credits / 100.0 }
 }

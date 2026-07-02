@@ -123,7 +123,7 @@ struct DetailView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Sparkline(totals: store.report.dailyTotals)
+                Sparkline(totals: store.sparklineTotals)
                     .frame(width: 150, height: 38)
             }
         }
@@ -312,8 +312,9 @@ struct Sparkline: View {
 
     var body: some View {
         let maxVal = max(totals.map(\.credits).max() ?? 0, 0.0001)
+        let hasData = totals.contains { $0.credits > 0 }
         GeometryReader { geo in
-            if totals.isEmpty {
+            if !hasData {
                 Text("no data")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -322,16 +323,22 @@ struct Sparkline: View {
                 let count = totals.count
                 let spacing: CGFloat = count > 40 ? 1 : 2
                 let barW = max(1, (geo.size.width - CGFloat(count - 1) * spacing) / CGFloat(count))
+                // One slot per day across the period; days with usage get a bar,
+                // the rest are blank, so the strip fills up over the period.
                 HStack(alignment: .bottom, spacing: spacing) {
                     ForEach(totals) { t in
-                        RoundedRectangle(cornerRadius: 1)
-                            .fill(Color.accentColor.opacity(0.85))
-                            .frame(width: barW,
-                                   height: max(1, geo.size.height * CGFloat(t.credits / maxVal)))
-                            .help("\(t.day): \(store.costString(credits: t.credits))")
+                        if t.credits > 0 {
+                            RoundedRectangle(cornerRadius: 1)
+                                .fill(Color.accentColor.opacity(0.85))
+                                .frame(width: barW,
+                                       height: max(1, geo.size.height * CGFloat(t.credits / maxVal)))
+                                .help("\(t.day): \(store.costString(credits: t.credits))")
+                        } else {
+                            Color.clear.frame(width: barW, height: 1)
+                        }
                     }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
             }
         }
     }

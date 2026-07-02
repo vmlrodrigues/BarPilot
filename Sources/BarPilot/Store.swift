@@ -178,6 +178,64 @@ final class UsageStore: ObservableObject {
     var budgetTitle: String { periodKind.budgetTitle }
 
     // -----------------------------------------------------------------------
+    // Sparkline series
+    // -----------------------------------------------------------------------
+
+    /// Daily series for the header sparkline. For short periods it spans the
+    /// period's FULL calendar extent — so "This Month" shows the whole month with
+    /// only used days drawn and the rest blank, filling in as the month
+    /// progresses. This Year / All Time (and any range > 45 days) keep the raw
+    /// data-day series, since a bar-per-day won't fit the strip.
+    var sparklineTotals: [DayTotal] {
+        guard let (start, end) = sparklineExtent() else { return report.dailyTotals }
+        let cal = Calendar.current
+        let days = (cal.dateComponents([.day], from: start, to: end).day ?? 0) + 1
+        guard days >= 1, days <= 45 else { return report.dailyTotals }
+        var byDay: [String: Double] = [:]
+        for t in report.dailyTotals { byDay[t.day] = t.credits }
+        var out: [DayTotal] = []
+        var d = start
+        for _ in 0..<days {
+            let key = Self.dayString(d, cal)
+            out.append(DayTotal(day: key, credits: byDay[key] ?? 0))
+            guard let next = cal.date(byAdding: .day, value: 1, to: d) else { break }
+            d = next
+        }
+        return out
+    }
+
+    /// Full calendar extent (local calendar) to chart for the current period, or
+    /// nil for periods that keep the raw data-day series (This Year / All Time).
+    private func sparklineExtent() -> (start: Date, end: Date)? {
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: Date())
+        switch periodKind {
+        case .today:
+            return (today, today)
+        case .last7:
+            return (cal.date(byAdding: .day, value: -6, to: today) ?? today, today)
+        case .last30:
+            return (cal.date(byAdding: .day, value: -29, to: today) ?? today, today)
+        case .thisMonth:
+            let comps = cal.dateComponents([.year, .month], from: today)
+            guard let first = cal.date(from: comps),
+                  let range = cal.range(of: .day, in: .month, for: today) else { return nil }
+            return (first, cal.date(byAdding: .day, value: range.count - 1, to: first) ?? first)
+        case .custom:
+            let a = cal.startOfDay(for: customFrom), b = cal.startOfDay(for: customTo)
+            return a <= b ? (a, b) : (b, a)
+        case .thisYear, .allTime:
+            return nil
+        }
+    }
+
+    /// "YYYY-MM-DD" in the local calendar — matches `Aggregator.localDayStr` keys.
+    private static func dayString(_ d: Date, _ cal: Calendar) -> String {
+        let c = cal.dateComponents([.year, .month, .day], from: d)
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
+
+    // -----------------------------------------------------------------------
     // Telemetry setup (explicit, user-confirmed)
     // -----------------------------------------------------------------------
 
