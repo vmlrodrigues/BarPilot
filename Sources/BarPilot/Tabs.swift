@@ -186,7 +186,7 @@ struct ModelsTab: View {
     private func levelChip(_ level: String) -> some View {
         HStack(spacing: 5) {
             Circle().fill(levelColor(level)).frame(width: 7, height: 7)
-            Text(level).font(.callout)
+            Text(level).font(.callout).lineLimit(1).fixedSize()
         }
     }
 
@@ -247,9 +247,9 @@ struct ModelsTab: View {
             case .flat(let r):
                 HStack {
                     HStack(spacing: 0) {
-                        Text(r.model).font(.callout)
+                        Text(r.model).font(.callout).lineLimit(1).truncationMode(.tail).help(r.model)
                         if let lvl = r.levels.first?.level {
-                            levelChip(lvl).padding(.leading, 8)
+                            levelChip(lvl).padding(.leading, 6).layoutPriority(1)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -258,7 +258,7 @@ struct ModelsTab: View {
                 }
             case .group(let r):
                 HStack {
-                    Text(r.model).font(.callout).fontWeight(.medium)
+                    Text(r.model).font(.callout).fontWeight(.medium).lineLimit(1).help(r.model)
                         .frame(maxWidth: .infinity, alignment: .leading)
                     numericCells(calls: r.calls, credits: r.credits, inTok: r.inputTokens,
                                  outTok: r.outputTokens, inRate: r.inRate, outRate: r.outRate, fit: r.fit,
