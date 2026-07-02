@@ -6,6 +6,40 @@ All notable changes to BarPilot are documented here.
 
 ---
 
+## [0.6.0] — 2026-07-02
+
+### Fixed
+- **Totals were over-counted for agent-mode usage.** The GitHub Copilot Mac App
+  emits an `invoke_agent` orchestration span per agent task whose AIU equals the
+  sum of the child model calls it drove — so counting it alongside those calls
+  double-counted. It slipped past the existing "skip orchestration spans" guard
+  because, unlike other agent spans, it carries a model attribute. These rollups
+  are now excluded both when parsing and at cache-load, so **every past period
+  recomputes to the correct, lower figure** — non-destructively (the rows stay in
+  the cache, just uncounted). The over-count ranged from 0% (no agent use) up to
+  ~2× in an all-agent period.
+
+### Added
+- **Reasoning-effort breakdown in the Models tab.** Each model's spend is now
+  grouped by the reasoning level it ran at (`low`/`medium`/`high`/`xhigh`/`max`).
+  A model used at more than one level expands into a bold model-total row — whose
+  effective rate and Fit use every call, so it stays the reliable figure — with a
+  row per level beneath it, each marked by a coloured effort dot. Single-level and
+  non-reasoning models stay a single row; calls with no level set are collected
+  under a "no level" row with an ⓘ explaining what they are. The level is read
+  from both sources and normalised, and a one-time, reversible backfill fills it
+  onto already-cached history (Mac App fully; VS Code across its ~7-day retention).
+
+### Improved
+- **Header sparkline now spans the whole period.** For short periods (Today,
+  Last 7 / 30 Days, This Month, Custom) the mini bar chart shows one slot per day
+  across the period's full calendar span — so early in the month you see a couple
+  of small bars with the rest blank, filling in as the month progresses, instead
+  of two bars stretched across the whole strip. This Year / All Time keep the
+  compact data-day view.
+
+---
+
 ## [0.5.3] — 2026-07-01
 
 ### Fixed
