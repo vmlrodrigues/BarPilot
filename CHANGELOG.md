@@ -6,6 +6,25 @@ All notable changes to BarPilot are documented here.
 
 ---
 
+## [0.7.0] — 2026-07-04
+
+### Added
+- **Opt-in multi-machine usage aggregation.** If you run Copilot on more than one
+  Mac, BarPilot can now show a single combined total across all of them. Turn it on
+  from the menu-bar icon's right-click menu → **Multi-Machine Sync**: a one-time
+  GitHub device-flow sign-in (**gist scope only**), after which each machine keeps a
+  compact per-day, per-model usage **summary — numbers only, never code, prompts, or
+  content** — in a **private secret gist** in your own account, and pulls the other
+  machines'. The **Summary**, **Models**, **Daily**, the total, and the menu-bar
+  figure combine across machines; **Sessions** and **Top** stay per-machine. Off by
+  default — if you never enable it, nothing changes. The footer shows which GitHub
+  account you're synced as, and turns red with the reason if an upload fails.
+  Requires a GitHub account that can create gists (work/enterprise accounts with
+  gists disabled can't sync).
+- **What's New** in the right-click menu — opens the changelog.
+
+---
+
 ## [0.6.1] — 2026-07-02
 
 ### Fixed
