@@ -16,6 +16,16 @@ struct AppMain {
             Dump.run()
             exit(0)
         }
+        // Dev-only: prove the sync aggregate projection reproduces the raw fit.
+        if CommandLine.arguments.contains("--verify-sync") {
+            SyncAggregate.verifySelfConsistency()
+            exit(0)
+        }
+        // Dev-only: preview the combined view vs a simulated second machine.
+        if CommandLine.arguments.contains("--sync-preview") {
+            SyncAggregate.preview()
+            exit(0)
+        }
         // `--regular` runs as a normal foreground (Dock) app instead of a
         // menu-bar-only agent — used for UI verification, since automation tools
         // don't bind LSUIElement agent apps.
@@ -132,9 +142,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         login.target = self
         login.state = LoginItem.isEnabled ? .on : .off
         menu.addItem(login)
+        let sync = NSMenuItem(title: "Multi-Machine Sync", action: #selector(toggleSync), keyEquivalent: "")
+        sync.target = self
+        sync.state = store.syncEnabled ? .on : .off
+        menu.addItem(sync)
         let updates = NSMenuItem(title: "Check for Updates", action: #selector(checkForUpdates), keyEquivalent: "")
         updates.target = self
         menu.addItem(updates)
+        let whatsNew = NSMenuItem(title: "What’s New", action: #selector(showWhatsNew), keyEquivalent: "")
+        whatsNew.target = self
+        menu.addItem(whatsNew)
         menu.addItem(.separator())
 
         let quit = NSMenuItem(title: "Quit BarPilot", action: #selector(quit), keyEquivalent: "q")
@@ -165,8 +182,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         LoginItem.toggle()
     }
 
+    /// Multi-machine sync: enable via GitHub device flow, or confirm-disable.
+    @objc private func toggleSync() {
+        if store.syncEnabled {
+            let a = NSAlert()
+            a.messageText = "Turn off multi-machine sync?"
+            a.informativeText = "This machine will show only its own usage again. Your local data is untouched; the token is removed and cached remote data cleared. Your gist on GitHub is left in place."
+            a.addButton(withTitle: "Turn Off")
+            a.addButton(withTitle: "Cancel")
+            NSApp.activate(ignoringOtherApps: true)
+            if a.runModal() == .alertFirstButtonReturn { store.disableSync() }
+        } else {
+            Task { await runDeviceFlow() }
+        }
+    }
+
+    /// Device-flow enable: fetch a code, show it, open GitHub, poll, then enable.
+    private func runDeviceFlow() async {
+        let dc: DeviceCode
+        do { dc = try await GitHubBackend.requestDeviceCode() }
+        catch { showInfo("Couldn't start sync", "Couldn't reach GitHub to begin authorization."); return }
+
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(dc.userCode, forType: .string)
+        let a = NSAlert()
+        a.messageText = "Turn on multi-machine sync?"
+        a.informativeText = """
+        Turn this on only if both of these are true:
+
+        1.  You run Copilot on more than one Mac.
+        2.  Your GitHub account can create gists.
+
+        Most work or enterprise accounts have gists disabled, so sync won’t work with those — a gist is where the data is stored. What’s shared is a small per-day, per-model usage summary (credit and token counts) in a secret gist in your account: no code, no prompts, no content. Every Mac must use the same account.
+
+        Open GitHub and enter the code below (already copied to your clipboard). It finishes on its own once you approve.
+        """
+        a.accessoryView = deviceCodeView(dc.userCode)
+        a.addButton(withTitle: "Open GitHub")
+        a.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard a.runModal() == .alertFirstButtonReturn else { return }
+        if let u = URL(string: dc.verificationUri) { NSWorkspace.shared.open(u) }
+
+        do {
+            let token = try await GitHubBackend.pollForToken(deviceCode: dc.deviceCode, interval: dc.interval, expiresIn: dc.expiresIn)
+            let n = await store.enableSyncWith(token: token)
+            let who = store.syncLogin.map { "@\($0)" } ?? "your account"
+            if let err = store.syncError {
+                showInfo("Sync couldn’t start", "Authorized as \(who), but it isn’t working:\n\n\(err)")
+            } else {
+                showInfo("Sync enabled", "Authorized as \(who). \(n) machine\(n == 1 ? "" : "s") contributing so far. If that’s not the account you meant, turn sync off and re-enable.")
+            }
+        } catch {
+            showInfo("Sync not enabled", "Authorization didn't complete. You can try again from the menu.")
+        }
+    }
+
+    private func showInfo(_ title: String, _ body: String) {
+        let a = NSAlert()
+        a.messageText = title
+        a.informativeText = body
+        a.addButton(withTitle: "OK")
+        NSApp.activate(ignoringOtherApps: true)
+        a.runModal()
+    }
+
+    /// A prominent, selectable display of the device code for the enable dialog.
+    private func deviceCodeView(_ code: String) -> NSView {
+        let field = NSTextField(labelWithString: code)
+        field.font = NSFont.monospacedSystemFont(ofSize: 24, weight: .semibold)
+        field.alignment = .center
+        field.isSelectable = true
+        field.frame = NSRect(x: 0, y: 0, width: 300, height: 40)
+        return field
+    }
+
     @objc private func checkForUpdates() {
         Updater.checkNow()
+    }
+
+    @objc private func showWhatsNew() {
+        if let u = URL(string: "https://github.com/vmlrodrigues/BarPilot/blob/main/CHANGELOG.md") {
+            NSWorkspace.shared.open(u)
+        }
     }
 
     @objc private func quit() {

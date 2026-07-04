@@ -30,6 +30,19 @@ final class UsageStore: ObservableObject {
     /// Latest USD→AUD rate (nil until fetched/cached); published so the UI updates.
     @Published private(set) var usdToAUD: Double?
 
+    /// Multi-machine sync (opt-in, default OFF). When ON, the aggregate tabs show
+    /// this machine + remote machines combined; Sessions/Top stay local.
+    @Published var syncEnabled: Bool { didSet { UserDefaults.standard.set(syncEnabled, forKey: Self.syncKey); recompute() } }
+    /// Machines contributing to the combined view (this + remotes); 1 when OFF.
+    @Published private(set) var syncMachineCount: Int = 1
+    /// GitHub login this machine's sync is authorized as (for the status bubble).
+    @Published private(set) var syncLogin: String? { didSet { UserDefaults.standard.set(syncLogin, forKey: "syncLogin") } }
+    /// Last sync failure to surface in the footer (nil = healthy). Mainly catches
+    /// the "this account can't create gists" (enterprise) case.
+    @Published private(set) var syncError: String?
+    private var isSyncing = false        // reentrancy guard so overlapping syncNow calls don't interleave
+    private var syncPushBlocked = false  // set after a permanent (403/401) failure; cleared on re-enable
+
     /// Text shown in the menu bar (the selected period's total cost).
     @Published private(set) var menuBarTitle: String = "—"
 
@@ -42,6 +55,7 @@ final class UsageStore: ObservableObject {
     private static let currencyKey = "displayCurrency"
     private static let rateKey = "usdToAUDRate"
     private static let rateDateKey = "usdToAUDRateDate"
+    private static let syncKey = "multiMachineSyncEnabled"
     /// Average days per month (365.25 / 12) — used to convert the monthly
     /// budget into a stable per-day rate for any selected range.
     private static let avgDaysPerMonth = 30.4375
@@ -56,6 +70,9 @@ final class UsageStore: ObservableObject {
         displayCurrency = Currency(rawValue: UserDefaults.standard.string(forKey: Self.currencyKey) ?? "") ?? .usd
         let cachedRate = UserDefaults.standard.double(forKey: Self.rateKey)
         usdToAUD = cachedRate > 0 ? cachedRate : nil
+
+        syncEnabled = UserDefaults.standard.bool(forKey: Self.syncKey)   // default false
+        syncLogin = UserDefaults.standard.string(forKey: "syncLogin")
 
         let cal = Calendar.current
         let now = Date()
@@ -88,6 +105,10 @@ final class UsageStore: ObservableObject {
         lastUpdated = Date()
         isLoading = false
         recompute()
+        // Diagnostic for #13 (menu-bar total can get stuck): record what reload
+        // actually computed vs the menu title it set, to catch a display-vs-data drift.
+        NSLog("BarPilot reload: \(allRecords.count) records · period \(periodKind.rawValue) · total \(Fmt.credits(report.totalCredits)) credits · menu \"\(menuBarTitle)\"")
+        if syncEnabled { Task { await self.syncNow() } }   // background push/pull
     }
 
     // -----------------------------------------------------------------------
@@ -96,13 +117,109 @@ final class UsageStore: ObservableObject {
 
     private func recompute() {
         let range = PeriodResolver.range(kind: periodKind, customFrom: customFrom, customTo: customTo)
-        report = Aggregator.build(
-            records: allRecords,
-            fromStr: range.from,
-            toStr: range.to,
-            todayStr: PeriodResolver.todayStr()
-        )
+        let today = PeriodResolver.todayStr()
+        if syncEnabled {
+            let remotes = currentRemoteAggregates()
+            syncMachineCount = remotes.count + 1
+            report = Aggregator.buildCombined(
+                localRecords: allRecords, remoteAggregates: remotes,
+                fromStr: range.from, toStr: range.to, todayStr: today)
+        } else {
+            syncMachineCount = 1
+            report = Aggregator.build(
+                records: allRecords, fromStr: range.from, toStr: range.to, todayStr: today)
+        }
         menuBarTitle = costString(credits: report.totalCredits)
+    }
+
+    /// Other machines' aggregates to combine, from the local RemoteStore (last
+    /// pull). Excludes this machine's own id defensively.
+    private func currentRemoteAggregates() -> [MachineAggregate] {
+        RemoteStore.load().filter { $0.machineId != Self.machineId }
+    }
+
+    // -----------------------------------------------------------------------
+    // Multi-machine sync (GitHub gist backend)
+    // -----------------------------------------------------------------------
+
+    /// Stable per-machine id, generated once and kept in UserDefaults.
+    static var machineId: String {
+        if let id = UserDefaults.standard.string(forKey: "syncMachineId") { return id }
+        let id = UUID().uuidString
+        UserDefaults.standard.set(id, forKey: "syncMachineId")
+        return id
+    }
+    private static var machineLabel: String { Host.current().localizedName ?? ProcessInfo.processInfo.hostName }
+    private static func nowISO() -> String { ISO8601DateFormatter().string(from: Date()) }
+    private static let pushFPKey = "syncLastPushFingerprint"
+
+    /// Turn sync on with a freshly-obtained token: persist it, enable, and do an
+    /// initial push + pull. Returns the machine count now contributing.
+    func enableSyncWith(token: String) async -> Int {
+        Keychain.saveToken(token)
+        syncPushBlocked = false; syncError = nil   // fresh start (clears a prior permanent-error block)
+        syncLogin = await GitHubBackend(token: token).currentLogin()   // show which account
+        syncEnabled = true          // didSet persists + recomputes (local only until pull lands)
+        await syncNow(force: true)
+        return syncMachineCount
+    }
+
+    /// Turn sync off. Local raw cache untouched; remote data cache cleared and
+    /// the token removed. Does NOT delete the remote gist (offered separately).
+    func disableSync() {
+        syncEnabled = false         // didSet persists + recomputes (back to local-only)
+        Keychain.deleteToken()
+        RemoteStore.clear()
+        syncLogin = nil
+        syncError = nil
+        syncPushBlocked = false
+        UserDefaults.standard.removeObject(forKey: Self.pushFPKey)
+    }
+
+    /// Push this machine's aggregate (only if it changed) and pull the others
+    /// into the RemoteStore, then recompute. Safe no-op when off / no token.
+    func syncNow(force: Bool = false) async {
+        guard syncEnabled, !isSyncing, let token = Keychain.token() else { return }   // reentrancy guard
+        isSyncing = true
+        defer { isSyncing = false }
+        let backend = GitHubBackend(token: token)
+        if syncLogin == nil { syncLogin = await backend.currentLogin() }   // backfill for already-enabled installs
+        let mine = SyncAggregate.project(allRecords, machineId: Self.machineId,
+                                         label: Self.machineLabel, updatedAt: Self.nowISO())
+        let fp = "\(mine.rows.count):\(mine.rows.reduce(0.0) { $0 + $1.credits }):\(mine.rows.reduce(0) { $0 + $1.inTok + $1.outTok })"
+        if !syncPushBlocked && (force || fp != UserDefaults.standard.string(forKey: Self.pushFPKey) || syncError != nil) {
+            do {
+                try await backend.push(mine)
+                UserDefaults.standard.set(fp, forKey: Self.pushFPKey)
+                syncError = nil
+            } catch {
+                syncError = Self.syncErrorMessage(error)
+                if (error as? SyncError)?.isPermanent == true { syncPushBlocked = true }   // stop hammering GitHub on a permanent failure
+                NSLog("BarPilot sync: push failed (\(error))")
+            }
+        }
+        if syncPushBlocked { return }   // this account can't sync — don't pull either
+        // Replace the remote cache only on a NON-EMPTY pull, so a transient empty
+        // result (eventual consistency right after our own push) can't wipe it.
+        if let others = try? await backend.pullOthers(excluding: Self.machineId), !others.isEmpty {
+            RemoteStore.clear()
+            for o in others { RemoteStore.save(o) }
+            recompute()
+        }
+    }
+
+    /// Human-readable reason for a sync push failure (shown in the footer).
+    private static func syncErrorMessage(_ error: Error) -> String {
+        switch error as? SyncError {
+        case .forbidden:
+            return "This account can’t create gists — usually a work/enterprise account (gists are disabled there). Turn sync off and re-enable with a personal account."
+        case .unauthorized:
+            return "Sync authorization is no longer valid. Turn sync off and re-enable."
+        case .network:
+            return "Can’t reach GitHub right now — will keep retrying."
+        default:
+            return "Sync couldn’t upload — will retry."
+        }
     }
 
     private func onPeriodChanged() {
@@ -187,7 +304,9 @@ final class UsageStore: ObservableObject {
     /// progresses. This Year / All Time (and any range > 45 days) keep the raw
     /// data-day series, since a bar-per-day won't fit the strip.
     var sparklineTotals: [DayTotal] {
-        guard let (start, end) = sparklineExtent() else { return report.dailyTotals }
+        // In sync mode the combined dailyTotals are UTC-keyed; the full-extent grid
+        // keys by local day, so they wouldn't match — fall back to the raw series.
+        guard !syncEnabled, let (start, end) = sparklineExtent() else { return report.dailyTotals }
         let cal = Calendar.current
         let days = (cal.dateComponents([.day], from: start, to: end).day ?? 0) + 1
         guard days >= 1, days <= 45 else { return report.dailyTotals }

@@ -10,6 +10,7 @@ import AppKit
 struct DetailView: View {
     @EnvironmentObject var store: UsageStore
     @State private var showingUTCInfo = false
+    @State private var showingSyncInfo = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -178,11 +179,44 @@ struct DetailView: View {
                             configured: store.status.vscodeConfigured, count: store.status.vscodeCount)
                 sourceBadge("Mac App", found: store.status.macAppFound,
                             configured: store.status.macAppConfigured, count: store.status.macAppCount)
+                if store.syncEnabled {
+                    let hasError = store.syncError != nil
+                    HStack(spacing: 4) {
+                        Image(systemName: hasError ? "exclamationmark.triangle.fill" : "arrow.triangle.2.circlepath")
+                            .font(.caption2).foregroundStyle(hasError ? .red : .green)
+                        Text(hasError ? "sync error"
+                             : (store.syncMachineCount == 1 ? "sync on · 1 machine" : "sync on · \(store.syncMachineCount) machines"))
+                            .font(.caption2).foregroundStyle(hasError ? .red : .green).fixedSize()
+                        Button { showingSyncInfo.toggle() } label: {
+                            Image(systemName: "info.circle").font(.caption2).foregroundStyle(.blue)
+                        }
+                        .buttonStyle(.borderless)
+                        .popover(isPresented: $showingSyncInfo) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Multi-machine sync").font(.caption.weight(.semibold))
+                                if let err = store.syncError {
+                                    Text(err).foregroundStyle(.red)
+                                }
+                                if let login = store.syncLogin {
+                                    Text("Authorized as **@\(login)**")
+                                } else if !hasError {
+                                    Text("Authorized account: checking…").foregroundStyle(.secondary)
+                                }
+                                Text("Each machine stores a small per-day, per-model usage summary in a secret gist in that account — no code or content. Summary / Models / Daily / total combine across machines; Sessions & Top stay per-machine. All machines must use the **same** account.")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .font(.caption).padding().frame(width: 290)
+                            .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    .help(hasError ? (store.syncError ?? "") : "Multi-machine sync is ON.")
+                }
                 Spacer()
                 if let updated = store.lastUpdated {
                     Text("Updated \(Fmt.dateTime(Int64(updated.timeIntervalSince1970 * 1000)))")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
                 Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")\(Updater.isDevBuild ? "-dev" : "")")
                     .font(.caption2)

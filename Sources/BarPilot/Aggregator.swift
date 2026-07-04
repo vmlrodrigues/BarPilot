@@ -37,6 +37,16 @@ enum Aggregator {
         return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
     }
 
+    /// UTC calendar date string "YYYY-MM-DD" for an epoch-ms instant — the bucket
+    /// used by the cross-machine synced aggregate (unambiguous across timezones,
+    /// and matches GitHub's UTC billing cycle). Distinct from `localDayStr`, which
+    /// the single-machine Daily tab uses.
+    static func utcDayStr(_ ms: Int64) -> String {
+        let d = Date(timeIntervalSince1970: Double(ms) / 1000.0)
+        let c = utcCalendar.dateComponents([.year, .month, .day], from: d)
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
+    }
+
     /// Replace a single trailing "-<digit>" with ".<digit>".
     static func normaliseModel(_ m: String) -> String {
         m.replacingOccurrences(of: "-(\\d)$", with: ".$1", options: .regularExpression)
@@ -160,8 +170,8 @@ enum Aggregator {
     /// returning credits-per-token rates and the uncentered R². Returns `.nan`
     /// when the system is degenerate or yields a negative rate (collinear or
     /// too-few spans to separate input from output cost).
-    private static func fitRates(sii: Double, soo: Double, sio: Double,
-                                 sic: Double, soc: Double, scc: Double)
+    static func fitRates(sii: Double, soo: Double, sio: Double,
+                         sic: Double, soc: Double, scc: Double)
         -> (inRate: Double, outRate: Double, fit: Double) {
         let det = sii*soo - sio*sio
         guard det != 0 else { return (.nan, .nan, .nan) }
@@ -256,6 +266,101 @@ enum Aggregator {
                        startedAt: r.startMs, operationName: r.operationName,
                        credits: r.credits, inputTokens: r.inputTokens, outputTokens: r.outputTokens)
             }
+    }
+
+    // -----------------------------------------------------------------------
+    // Combined (multi-machine) build — Summary/Models/Daily/total/sparkline from
+    // pooled aggregate rows (this machine's projection + remote machines');
+    // Sessions/Top stay LOCAL. Daily buckets by UTC day (Design Decision 1).
+    // Sync-OFF never calls this — it uses build(...) — so OFF stays byte-identical.
+    // -----------------------------------------------------------------------
+    static func buildCombined(localRecords: [UsageRecord], remoteAggregates: [MachineAggregate],
+                              fromStr: String, toStr: String, todayStr: String) -> Report {
+        let localAgg = SyncAggregate.project(localRecords, machineId: "local", label: nil, updatedAt: "")
+        let allRows = localAgg.rows + remoteAggregates.flatMap { $0.rows }
+        let rows = allRows.filter { $0.utcDay >= fromStr && $0.utcDay <= toStr }
+
+        let fromMs = utcMidnightMs(fromStr)
+        let toMs = utcMidnightMs(toStr) + 86_399_999
+        let localInRange = localRecords.filter { $0.startMs >= fromMs && $0.startMs <= toMs }
+        let days = Int((utcMidnightMs(toStr) - fromMs) / 86_400_000) + 1
+        let todayCredits = allRows.filter { $0.utcDay == todayStr }.reduce(0.0) { $0 + $1.credits }
+
+        return Report(
+            fromStr: fromStr, toStr: toStr, daysInRange: max(days, 1),
+            summary: summaryFromRows(rows),
+            models: modelsFromRows(rows),
+            daily: dailyFromRows(rows),
+            dailyTotals: dailyTotalsFromRows(rows),
+            sessions: buildSessions(localInRange),   // local only — a session lives on one machine
+            top: buildTop(localInRange, n: 20),       // local only
+            totalCredits: rows.reduce(0.0) { $0 + $1.credits },
+            todayCredits: todayCredits
+        )
+    }
+
+    // Aggregate-row builders — parallel the record builders but sum pre-aggregated
+    // rows (which already carry the cross-products), so the Models fit reconstructs.
+    private struct RowAcc {
+        var calls = 0; var credits = 0.0; var inTok = 0; var outTok = 0
+        var sii = 0.0, soo = 0.0, sio = 0.0, sic = 0.0, soc = 0.0, scc = 0.0
+        mutating func add(_ r: AggregateRow) {
+            calls += r.calls; credits += r.credits; inTok += r.inTok; outTok += r.outTok
+            sii += r.sii; soo += r.soo; sio += r.sio; sic += r.sic; soc += r.soc; scc += r.scc
+        }
+    }
+
+    private static func summaryFromRows(_ rows: [AggregateRow]) -> [SummaryRow] {
+        var calls: [String: Int] = [:]; var credits: [String: Double] = [:]
+        for r in rows { calls[r.model, default: 0] += r.calls; credits[r.model, default: 0] += r.credits }
+        return credits.keys
+            .map { SummaryRow(model: $0, calls: calls[$0] ?? 0, credits: credits[$0] ?? 0) }
+            .sorted { $0.credits > $1.credits }
+    }
+
+    private static func modelsFromRows(_ rows: [AggregateRow]) -> [ModelRow] {
+        var byModel: [String: RowAcc] = [:]
+        var byLevel: [String: [String: RowAcc]] = [:]
+        for r in rows {
+            let lk = r.level ?? ""
+            byModel[r.model, default: RowAcc()].add(r)
+            byLevel[r.model, default: [:]][lk, default: RowAcc()].add(r)
+        }
+        func ord(_ level: String?) -> Int { level == nil ? 99 : (levelOrder[level!] ?? 98) }
+        return byModel.map { model, a -> ModelRow in
+            let mf = fitRates(sii: a.sii, soo: a.soo, sio: a.sio, sic: a.sic, soc: a.soc, scc: a.scc)
+            let levels: [ModelLevelRow] = (byLevel[model] ?? [:]).map { lk, la in
+                let lf = fitRates(sii: la.sii, soo: la.soo, sio: la.sio, sic: la.sic, soc: la.soc, scc: la.scc)
+                return ModelLevelRow(level: lk.isEmpty ? nil : lk, calls: la.calls, credits: la.credits,
+                                     inputTokens: la.inTok, outputTokens: la.outTok,
+                                     inRate: lf.inRate, outRate: lf.outRate, fit: lf.fit)
+            }
+            .sorted { l1, l2 in let o1 = ord(l1.level), o2 = ord(l2.level); return o1 != o2 ? o1 < o2 : l1.credits > l2.credits }
+            return ModelRow(model: model, calls: a.calls, credits: a.credits,
+                            inputTokens: a.inTok, outputTokens: a.outTok,
+                            inRate: mf.inRate, outRate: mf.outRate, fit: mf.fit, levels: levels)
+        }
+        .sorted { $0.credits > $1.credits }
+    }
+
+    private static func dailyFromRows(_ rows: [AggregateRow]) -> [DailyRow] {
+        struct Acc { var calls = 0; var credits = 0.0 }
+        var acc: [String: Acc] = [:]; var dayOf: [String: String] = [:]; var modelOf: [String: String] = [:]
+        for r in rows {
+            let key = "\(r.utcDay)|\(r.model)"
+            acc[key, default: Acc()].calls += r.calls
+            acc[key, default: Acc()].credits += r.credits
+            dayOf[key] = r.utcDay; modelOf[key] = r.model
+        }
+        return acc.map { DailyRow(day: dayOf[$0.key] ?? "", model: modelOf[$0.key] ?? "",
+                                  calls: $0.value.calls, credits: $0.value.credits) }
+            .sorted { a, b in a.day == b.day ? a.credits > b.credits : a.day < b.day }
+    }
+
+    private static func dailyTotalsFromRows(_ rows: [AggregateRow]) -> [DayTotal] {
+        var totals: [String: Double] = [:]
+        for r in rows { totals[r.utcDay, default: 0] += r.credits }
+        return totals.map { DayTotal(day: $0.key, credits: $0.value) }.sorted { $0.day < $1.day }
     }
 }
 
