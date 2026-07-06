@@ -181,6 +181,7 @@ enum PeriodKind: String, CaseIterable, Identifiable {
     case today
     case last7
     case thisMonth
+    case previousMonth
     case last30
     case thisYear
     case allTime
@@ -193,6 +194,7 @@ enum PeriodKind: String, CaseIterable, Identifiable {
         case .today: return "Today"
         case .last7: return "Last 7 Days"
         case .thisMonth: return "This Month"
+        case .previousMonth: return "Previous Month"
         case .last30: return "Last 30 Days"
         case .thisYear: return "This Year"
         case .allTime: return "All Time"
@@ -206,6 +208,7 @@ enum PeriodKind: String, CaseIterable, Identifiable {
         case .today: return "Today's budget"
         case .last7: return "Last 7 days' budget"
         case .thisMonth: return "This month's budget"
+        case .previousMonth: return "Previous month's budget"
         case .last30: return "Last 30 days' budget"
         case .thisYear: return "This year's budget"
         case .allTime: return "All-time budget"

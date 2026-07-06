@@ -409,6 +409,13 @@ enum PeriodResolver {
             let comps = utcCal.dateComponents([.year, .month], from: now)
             let first = utcCal.date(from: comps) ?? now
             return (utcDateStr(first), today)
+        case .previousMonth:
+            // First→last day of the prior calendar month (UTC). Calendar
+            // arithmetic handles the Jan→Dec year rollover for free.
+            let firstOfThis = utcCal.date(from: utcCal.dateComponents([.year, .month], from: now)) ?? now
+            let lastOfPrev  = utcCal.date(byAdding: .day, value: -1, to: firstOfThis) ?? now
+            let firstOfPrev = utcCal.date(from: utcCal.dateComponents([.year, .month], from: lastOfPrev)) ?? now
+            return (utcDateStr(firstOfPrev), utcDateStr(lastOfPrev))
         case .last30:
             let from = utcCal.date(byAdding: .day, value: -29, to: now) ?? now
             return (utcDateStr(from), today)

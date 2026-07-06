@@ -340,6 +340,13 @@ final class UsageStore: ObservableObject {
             guard let first = cal.date(from: comps),
                   let range = cal.range(of: .day, in: .month, for: today) else { return nil }
             return (first, cal.date(byAdding: .day, value: range.count - 1, to: first) ?? first)
+        case .previousMonth:
+            let comps = cal.dateComponents([.year, .month], from: today)
+            guard let firstOfThis = cal.date(from: comps),
+                  let lastOfPrev = cal.date(byAdding: .day, value: -1, to: firstOfThis),
+                  let firstOfPrev = cal.date(from: cal.dateComponents([.year, .month], from: lastOfPrev))
+                  else { return nil }
+            return (firstOfPrev, lastOfPrev)
         case .custom:
             let a = cal.startOfDay(for: customFrom), b = cal.startOfDay(for: customTo)
             return a <= b ? (a, b) : (b, a)
