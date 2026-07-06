@@ -10,6 +10,15 @@ It reads your local GitHub Copilot OTel telemetry directly off disk (**no
 external dependencies**); network use is limited to the GitHub auto-updater and
 the USD→AUD exchange-rate fetch.
 
+## Issue tracking
+
+**Every enhancement/feature and every bug gets a GitHub issue — always.** Even for
+a small change requested in chat, open an issue first (label `enhancement` or
+`bug`), reference it from the work, and close it when the fix ships, noting the
+version (e.g. "shipped in v0.7.1"). This keeps a complete, searchable trail from
+request → change → release. The repo is **public** — never put usernames, local
+paths, or emails in issues.
+
 ## Release checklist
 
 Before running `make release VERSION=x.y.z`:
