@@ -4,6 +4,10 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+---
+
+## [0.7.1] — 2026-07-06
+
 ### Added
 - **"Previous Month"** period option in the range dropdown — the full previous
   calendar month (e.g. all of June while you're in July).
