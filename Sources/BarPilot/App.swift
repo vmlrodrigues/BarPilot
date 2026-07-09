@@ -26,6 +26,11 @@ struct AppMain {
             SyncAggregate.preview()
             exit(0)
         }
+        // Dev-only: regression-check the spend projection math (#18).
+        if CommandLine.arguments.contains("--verify-projection") {
+            SpendProjection.verify()
+            exit(0)
+        }
         // `--regular` runs as a normal foreground (Dock) app instead of a
         // menu-bar-only agent — used for UI verification, since automation tools
         // don't bind LSUIElement agent apps.

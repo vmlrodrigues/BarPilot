@@ -256,6 +256,47 @@ struct SpendProjection {
             daysElapsed: elapsed, daysInPeriod: daysInPeriod,
             endLabel: endFormatter.string(from: endDate))
     }
+
+    // Headless regression check (--verify-projection): asserts compute() on
+    // synthetic reports with a fixed clock, so the run-rate math + guards can't
+    // silently drift. Mirrors the project's --dump / --verify-sync safety nets.
+    static func verify() {
+        let err = FileHandle.standardError
+        var pass = 0, fail = 0
+        func check(_ name: String, _ ok: Bool) {
+            if ok { pass += 1 } else { fail += 1 }
+            err.write(Data("  [\(ok ? "OK" : "XX")] \(name)\n".utf8))
+        }
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC") ?? cal.timeZone
+        let now = cal.date(from: DateComponents(year: 2025, month: 7, day: 15))!   // mid-July (31 days)
+        func report(days: Int, credits: Double) -> Report {
+            var r = Report.empty; r.daysInRange = days; r.totalCredits = credits; return r
+        }
+
+        // Under budget: 300cr over 10 days -> 300/10*31 = 930cr; budget $150 = 15000cr.
+        if let p = compute(periodKind: .thisMonth, report: report(days: 10, credits: 300), monthlyBudgetUSD: 150, now: now, calendar: cal) {
+            check("run-rate projected (930cr)", abs(p.projectedCredits - 930) < 1e-6)
+            check("days elapsed/period = 10/31", p.daysElapsed == 10 && p.daysInPeriod == 31)
+            check("under budget, budget = 15000cr", !p.overBudget && p.budgetCredits == 15000)
+        } else { check("mid-month returns a projection", false) }
+
+        // Over budget: 6000cr over 10 days -> 18600cr > 15000cr.
+        if let p = compute(periodKind: .thisMonth, report: report(days: 10, credits: 6000), monthlyBudgetUSD: 150, now: now, calendar: cal) {
+            check("over budget flagged", p.overBudget && p.projectedCredits > p.budgetCredits)
+        } else { check("over-budget returns a projection", false) }
+
+        // No budget set: still projects the amount; no over/percent.
+        if let p = compute(periodKind: .thisMonth, report: report(days: 10, credits: 300), monthlyBudgetUSD: 0, now: now, calendar: cal) {
+            check("no budget -> not over, pct 0", !p.hasBudget && !p.overBudget && p.pctOfBudget == 0)
+        } else { check("no-budget still projects", false) }
+
+        check("no usage -> nil", compute(periodKind: .thisMonth, report: report(days: 10, credits: 0), monthlyBudgetUSD: 150, now: now, calendar: cal) == nil)
+        check("last day of month -> nil", compute(periodKind: .thisMonth, report: report(days: 31, credits: 300), monthlyBudgetUSD: 150, now: now, calendar: cal) == nil)
+        check("non-thisMonth period -> nil", compute(periodKind: .previousMonth, report: report(days: 10, credits: 300), monthlyBudgetUSD: 150, now: now, calendar: cal) == nil)
+
+        err.write(Data("verify-projection: \(fail == 0 ? "PASS" : "FAIL") — \(pass) ok, \(fail) failed\n".utf8))
+    }
 }
 
 // ---------------------------------------------------------------------------
