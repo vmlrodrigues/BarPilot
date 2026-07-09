@@ -4,6 +4,17 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Month-end spend projection.** On "This Month", the budget bar now projects
+  your full-month spend from the run rate so far: a faint "ghost" fill extends to
+  where you're heading, and a caption reads e.g. "Projected $186 by Jul 31 · over
+  by $36". Turns red when you're on pace to exceed the budget. (#18)
+
+### Changed
+- **Budget-bar heading now says "spend", not "budget".** The figure under the
+  heading is what you've spent — the budget is the reference on the right — so it
+  now reads "This month's spend" instead of "This month's budget". (#17)
+
 ---
 
 ## [0.7.1] — 2026-07-06

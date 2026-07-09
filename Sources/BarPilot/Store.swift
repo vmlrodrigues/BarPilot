@@ -292,7 +292,14 @@ final class UsageStore: ObservableObject {
         return perDayCredits * Double(max(report.daysInRange, 1))
     }
 
-    var budgetTitle: String { periodKind.budgetTitle }
+    var spendTitle: String { periodKind.spendTitle }
+
+    /// Run-rate projection of full-month spend (nil unless viewing an in-progress
+    /// month with usage). Pure + derived from the current report — see #18.
+    var spendProjection: SpendProjection? {
+        SpendProjection.compute(periodKind: periodKind, report: report,
+                                monthlyBudgetUSD: monthlyBudget, now: Date())
+    }
 
     // -----------------------------------------------------------------------
     // Sparkline series

@@ -17,7 +17,7 @@ struct DetailView: View {
             header
             Divider()
             BudgetBar(
-                title: store.budgetTitle,
+                title: store.spendTitle,
                 spentCredits: store.report.totalCredits,
                 budgetCredits: store.periodBudgetCredits,
                 monthlyBudget: store.monthlyBudget
@@ -269,10 +269,11 @@ struct BudgetBar: View {
     let monthlyBudget: Double
 
     var body: some View {
+        let projection = store.spendProjection
         let hasBudget = budgetCredits > 0
         let over = hasBudget && spentCredits > budgetCredits
         let pct = hasBudget ? (spentCredits / budgetCredits) * 100 : 0
-        let maxCredits = max(budgetCredits * 1.25, spentCredits, 1)
+        let maxCredits = max(budgetCredits * 1.25, spentCredits, projection?.projectedCredits ?? 0, 1)
         let monthlyCredits = monthlyBudget * 100
         let wholePct = monthlyCredits > 0 ? (spentCredits / monthlyCredits) * 100 : 0
 
@@ -293,6 +294,11 @@ struct BudgetBar: View {
                 let limitFrac = budgetCredits / maxCredits
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.secondary.opacity(0.15))
+                    if let p = projection {
+                        Capsule()
+                            .fill((p.overBudget ? Color.red : Color.green).opacity(0.22))
+                            .frame(width: max(0, w * (min(p.projectedCredits, maxCredits) / maxCredits)))
+                    }
                     Capsule()
                         .fill(over ? Color.red : Color.green)
                         .frame(width: max(0, w * fillFrac))
@@ -332,6 +338,30 @@ struct BudgetBar: View {
                 }
             }
             .font(.caption)
+
+            if let p = projection {
+                HStack(spacing: 5) {
+                    Image(systemName: "chart.line.uptrend.xyaxis")
+                        .foregroundStyle(p.overBudget ? Color.red : Color.secondary)
+                    Text("Projected").foregroundStyle(.secondary)
+                    Text(store.costString(credits: p.projectedCredits))
+                        .monospacedDigit()
+                        .foregroundStyle(p.overBudget ? Color.red : Color.primary)
+                    Text("by \(p.endLabel)").foregroundStyle(.secondary)
+                    if p.hasBudget {
+                        Text(p.overBudget
+                             ? "· over by \(store.costString(credits: p.projectedCredits - p.budgetCredits)) (\(String(format: "%.0f", p.pctOfBudget))%)"
+                             : "· \(String(format: "%.0f", p.pctOfBudget))% of budget")
+                            .foregroundStyle(p.overBudget ? Color.red : Color.secondary)
+                            .monospacedDigit()
+                    }
+                    if p.daysElapsed < 3 {
+                        Text("(early)").foregroundStyle(.tertiary)
+                    }
+                    Spacer()
+                }
+                .font(.caption)
+            }
         }
     }
 }

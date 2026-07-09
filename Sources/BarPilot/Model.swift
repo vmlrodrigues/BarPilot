@@ -202,18 +202,59 @@ enum PeriodKind: String, CaseIterable, Identifiable {
         }
     }
 
-    /// Title for the budget bar, matching the selected span.
-    var budgetTitle: String {
+    /// Heading for the budget-bar section — labels the SPEND figure it sits over
+    /// (the budget is shown separately, on the right). See #17.
+    var spendTitle: String {
         switch self {
-        case .today: return "Today's budget"
-        case .last7: return "Last 7 days' budget"
-        case .thisMonth: return "This month's budget"
-        case .previousMonth: return "Previous month's budget"
-        case .last30: return "Last 30 days' budget"
-        case .thisYear: return "This year's budget"
-        case .allTime: return "All-time budget"
-        case .custom: return "Selected range budget"
+        case .today: return "Today's spend"
+        case .last7: return "Last 7 days' spend"
+        case .thisMonth: return "This month's spend"
+        case .previousMonth: return "Previous month's spend"
+        case .last30: return "Last 30 days' spend"
+        case .thisYear: return "This year's spend"
+        case .allTime: return "All-time spend"
+        case .custom: return "Selected range spend"
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spend projection (#18) — run-rate estimate of full-month spend, shown on the
+// budget bar. Pure + derived from the current report; no aggregation impact.
+// ---------------------------------------------------------------------------
+
+struct SpendProjection {
+    let projectedCredits: Double
+    let budgetCredits: Double
+    let daysElapsed: Int
+    let daysInPeriod: Int
+    let endLabel: String            // "Jul 31"
+
+    var hasBudget: Bool  { budgetCredits > 0 }
+    var overBudget: Bool { hasBudget && projectedCredits > budgetCredits }
+    var pctOfBudget: Double { hasBudget ? projectedCredits / budgetCredits * 100 : 0 }
+
+    private static let endFormatter: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "MMM d"; return f
+    }()
+
+    /// Only projects an in-progress calendar month that has usage; nil otherwise.
+    static func compute(periodKind: PeriodKind, report: Report,
+                        monthlyBudgetUSD: Double, now: Date,
+                        calendar: Calendar = .current) -> SpendProjection? {
+        guard periodKind == .thisMonth,
+              let dayRange = calendar.range(of: .day, in: .month, for: now),
+              let month = calendar.dateInterval(of: .month, for: now) else { return nil }
+        let daysInPeriod = dayRange.count
+        let elapsed = max(report.daysInRange, 1)
+        guard report.totalCredits > 0, elapsed < daysInPeriod else { return nil }
+        let projected = report.totalCredits / Double(elapsed) * Double(daysInPeriod)
+        let endDate = calendar.date(byAdding: .day, value: -1, to: month.end) ?? month.end
+        return SpendProjection(
+            projectedCredits: projected,
+            budgetCredits: monthlyBudgetUSD * 100,
+            daysElapsed: elapsed, daysInPeriod: daysInPeriod,
+            endLabel: endFormatter.string(from: endDate))
     }
 }
 
