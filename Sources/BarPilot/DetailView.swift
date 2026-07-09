@@ -257,8 +257,8 @@ struct DetailView: View {
     /// because the app needs a relaunch to pick up the exporter (#16).
     private var restartHint: String? {
         var who: [String] = []
-        if store.status.vscodeConfigured && store.status.vscodeCount == 0 { who.append("VS Code") }
-        if store.status.macAppConfigured && store.status.macAppCount == 0 { who.append("the Copilot app") }
+        if store.status.vscodeConfigured && store.status.vscodeCount == 0 && !store.status.vscodeEverCaptured { who.append("VS Code") }
+        if store.status.macAppConfigured && store.status.macAppCount == 0 && !store.status.macAppEverCaptured { who.append("the Copilot app") }
         guard !who.isEmpty else { return nil }
         let obj = who.count == 1 ? "it" : "them"
         return "Telemetry is on for \(who.joined(separator: " & ")) but no usage captured yet — quit & reopen \(obj), then use Copilot. It only starts on relaunch."

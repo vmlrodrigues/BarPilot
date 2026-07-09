@@ -116,6 +116,12 @@ final class UsageStore: ObservableObject {
     // -----------------------------------------------------------------------
 
     private func recompute() {
+        // Don't paint the menu bar before the first load lands: init() kicks off
+        // reload() and refreshRate() concurrently, and if the rate fetch wins the
+        // race it would recompute with allRecords still empty — showing a
+        // remote-only (sync) or $0 total until reload finishes. reload() sets
+        // lastUpdated just before its own recompute, so this holds "—" until then. (#20)
+        guard lastUpdated != nil else { return }
         let range = PeriodResolver.range(kind: periodKind, customFrom: customFrom, customTo: customTo)
         let today = PeriodResolver.todayStr()
         if syncEnabled {

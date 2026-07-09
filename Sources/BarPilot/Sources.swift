@@ -53,7 +53,16 @@ enum DataSources {
         SpanCache.merge(liveRecords)
         ReasoningLevelBackfill.run(liveRecords: liveRecords)  // one-time, gated: fill levels on already-cached spans
         ChatBackfill.run()   // one-time, gated: recover pre-OTel June history from chat files
-        return (SpanCache.load(), status)
+
+        let cached = SpanCache.load()
+        // Has each source EVER captured usage? The cache survives extension wipes,
+        // so this is the reliable signal — not the live count. VS Code includes its
+        // chat backfill. Used to suppress the restart nudge for a working source
+        // whose live DB is momentarily empty (#21).
+        let present = Set(cached.map(\.source))
+        status.vscodeEverCaptured = present.contains(.vscode) || present.contains(.chatBackfill)
+        status.macAppEverCaptured = present.contains(.macApp)
+        return (cached, status)
     }
 
     // -----------------------------------------------------------------------

@@ -4,6 +4,17 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Menu bar no longer flashes a low total on launch.** With multi-machine sync
+  on it could briefly show the other machine's total alone before this machine's
+  data finished loading; it now stays on "—" until the real combined total is
+  ready. (#20)
+- **The "restart to start capturing" telemetry nudge no longer nags existing
+  users.** It was firing whenever a source's live DB was momentarily empty (which
+  extension updates cause routinely), even for sources with captured history. It
+  now appears only for a source that has never captured anything — the fresh-setup
+  case it was meant for. (#21)
+
 ---
 
 ## [0.8.0] — 2026-07-09

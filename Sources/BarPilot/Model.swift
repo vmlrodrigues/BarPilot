@@ -169,6 +169,11 @@ struct SourcesStatus {
     var vscodeConfigured = false
     /// The Mac App OTel LaunchAgent + helper script are installed.
     var macAppConfigured = false
+    /// The source has EVER captured usage (present in the cache, which survives
+    /// live-DB wipes). Distinguishes a fresh setup from a working source whose
+    /// live DB is momentarily empty — gates the restart nudge (#21).
+    var vscodeEverCaptured = false
+    var macAppEverCaptured = false
 
     var allConfigured: Bool { vscodeConfigured && macAppConfigured }
 }
