@@ -174,6 +174,21 @@ struct DetailView: View {
                 .padding(.top, 6)
             }
 
+            if let hint = restartHint {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.clockwise")
+                        .foregroundStyle(.blue)
+                        .font(.caption2)
+                    Text(hint)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 6)
+            }
+
             HStack(spacing: 12) {
                 sourceBadge("VS Code", found: store.status.vscodeFound,
                             configured: store.status.vscodeConfigured, count: store.status.vscodeCount)
@@ -236,6 +251,17 @@ struct DetailView: View {
         if !store.status.macAppConfigured { missing.append("Mac App") }
         let who = missing.joined(separator: " & ")
         return "Telemetry not enabled for \(who)."
+    }
+
+    /// Configured sources that aren't producing any usage yet — almost always
+    /// because the app needs a relaunch to pick up the exporter (#16).
+    private var restartHint: String? {
+        var who: [String] = []
+        if store.status.vscodeConfigured && store.status.vscodeCount == 0 { who.append("VS Code") }
+        if store.status.macAppConfigured && store.status.macAppCount == 0 { who.append("the Copilot app") }
+        guard !who.isEmpty else { return nil }
+        let obj = who.count == 1 ? "it" : "them"
+        return "Telemetry is on for \(who.joined(separator: " & ")) but no usage captured yet — quit & reopen \(obj), then use Copilot. It only starts on relaunch."
     }
 
     /// Status dot: green = data flowing, orange = configured but no traces yet,

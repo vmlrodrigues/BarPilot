@@ -14,6 +14,10 @@ All notable changes to BarPilot are documented here.
 - **Budget-bar heading now says "spend", not "budget".** The figure under the
   heading is what you've spent — the budget is the reference on the right — so it
   now reads "This month's spend" instead of "This month's budget". (#17)
+- **Footer nudges you to restart a configured source that isn't capturing.** If
+  telemetry is on for VS Code or the Copilot app but BarPilot sees no usage yet,
+  the footer now says to quit and reopen it — the exporter only starts on
+  relaunch. Previously this hint lived only in a hover tooltip. (#16)
 
 ---
 
