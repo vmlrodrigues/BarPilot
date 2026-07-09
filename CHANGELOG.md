@@ -4,6 +4,10 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+---
+
+## [0.8.1] — 2026-07-09
+
 ### Fixed
 - **Menu bar no longer flashes a low total on launch.** With multi-machine sync
   on it could briefly show the other machine's total alone before this machine's
