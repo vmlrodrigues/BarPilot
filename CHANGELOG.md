@@ -4,6 +4,10 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+---
+
+## [0.8.0] — 2026-07-09
+
 ### Added
 - **Month-end spend projection.** On "This Month", the budget bar now projects
   your full-month spend from the run rate so far: a faint "ghost" fill extends to
