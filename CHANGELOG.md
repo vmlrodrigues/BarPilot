@@ -6,6 +6,15 @@ All notable changes to BarPilot are documented here.
 
 ---
 
+## [0.8.2] — 2026-07-23
+
+### Fixed
+- **High CPU and memory after waking the Mac.** Overlapping refreshes could each
+  re-scan your full usage log at the same time — pegging CPU and memory, and
+  getting worse the larger your history. Refreshes now run one at a time. (#23)
+
+---
+
 ## [0.8.1] — 2026-07-09
 
 ### Fixed
