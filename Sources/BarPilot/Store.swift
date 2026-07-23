@@ -96,6 +96,11 @@ final class UsageStore: ObservableObject {
 
     /// Re-read both data sources from disk, then re-aggregate.
     func reload() async {
+        // Single-flight: reload() is triggered from six places (60s timer, launch,
+        // refresh, popover-open, telemetry setup, budget/currency change). Without
+        // this, two triggers close together (typically on wake) each run a full
+        // loadAll() — concurrent whole-file JSONL scans that peg CPU + memory. (#23)
+        guard !isLoading else { return }
         isLoading = true
         let loaded = await Task.detached(priority: .utility) {
             DataSources.loadAll()
