@@ -4,6 +4,23 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Idle CPU usage is essentially gone.** BarPilot was re-reading your entire
+  usage log — often over a gigabyte — every single refresh, which burned seconds
+  of CPU a minute and got worse the longer you'd used it. It now reads only what's
+  been added since the last check: a refresh went from ~7s to ~0.05s here, and no
+  longer scales with your history. (#24)
+
+### Added
+- **`--diagnose` support report.** If something looks wrong, run
+  `/Applications/BarPilot.app/Contents/MacOS/BarPilot --diagnose` in Terminal and
+  send us the output — it lists versions, file sizes, load timings and recent
+  refresh history. Counts and timings only (never your prompts or code), with your
+  username stripped from paths so it's safe to paste into a public issue.
+- A size-capped log at `~/Library/Logs/BarPilot/barpilot.log` recording one line
+  per refresh. Rotates at 256 KB and keeps two files, so it can never grow
+  unbounded.
+
 ---
 
 ## [0.8.2] — 2026-07-23

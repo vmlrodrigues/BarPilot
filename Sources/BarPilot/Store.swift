@@ -102,17 +102,19 @@ final class UsageStore: ObservableObject {
         // loadAll() — concurrent whole-file JSONL scans that peg CPU + memory. (#23)
         guard !isLoading else { return }
         isLoading = true
+        let t0 = Date()
         let loaded = await Task.detached(priority: .utility) {
             DataSources.loadAll()
         }.value
+        let loadMs = Int(Date().timeIntervalSince(t0) * 1000)
         allRecords = loaded.records
         status = loaded.status
         lastUpdated = Date()
         isLoading = false
         recompute()
-        // Diagnostic for #13 (menu-bar total can get stuck): record what reload
-        // actually computed vs the menu title it set, to catch a display-vs-data drift.
-        NSLog("BarPilot reload: \(allRecords.count) records · period \(periodKind.rawValue) · total \(Fmt.credits(report.totalCredits)) credits · menu \"\(menuBarTitle)\"")
+        // Rotating support log (#24): load cost + what the reload actually computed
+        // vs the menu title it set — also the #13 display-vs-data drift diagnostic.
+        DiagLog.write("reload: \(loadMs)ms · scanned \(DiagLog.humanBytes(status.jsonlBytesScanned)) · +\(status.newRecords) new · \(allRecords.count) cached · period \(periodKind.rawValue) · total \(Fmt.credits(report.totalCredits)) cr · menu \"\(menuBarTitle)\"")
         if syncEnabled { Task { await self.syncNow() } }   // background push/pull
     }
 

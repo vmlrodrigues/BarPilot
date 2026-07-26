@@ -172,6 +172,40 @@ enum SpanCache {
         return nil
     }
 
+    /// Write a value to the meta table.
+    static func setMeta(_ key: String, _ value: String) {
+        guard let db = open() else { return }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT)
+        sqlite3_bind_text(stmt, 2, value, -1, SQLITE_TRANSIENT)
+        sqlite3_step(stmt)
+    }
+
+    /// Cached span count per source. Used for the footer badges once incremental
+    /// loading means a reload only sees newly-appended records (#24).
+    static func countsBySource() -> [String: Int] {
+        guard let db = open() else { return [:] }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT source, COUNT(*) FROM spans GROUP BY source", -1, &stmt, nil) == SQLITE_OK else { return [:] }
+        defer { sqlite3_finalize(stmt) }
+        var out: [String: Int] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let c = sqlite3_column_text(stmt, 0) {
+                out[String(cString: c)] = Int(sqlite3_column_int64(stmt, 1))
+            }
+        }
+        return out
+    }
+
+    /// On-disk size of the cache DB in bytes (for --diagnose).
+    static func fileSize() -> Int64 {
+        (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64).flatMap { $0 } ?? 0
+    }
+
     /// Earliest `start_ms` among live OTel-sourced spans (nil if none). The
     /// boundary for date-partitioned backfill: fill only dates strictly before it.
     static func earliestOTelMs() -> Int64? {

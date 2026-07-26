@@ -47,6 +47,28 @@ or aggregation, run it and sanity-check the totals against a known-good capture:
 `--dump` uses `Fmt.credits4` (4 dp) for exact parity; the UI shows 2 dp.
 `--regular` runs as a normal foreground (Dock) app instead of a menu-bar agent.
 
+Other headless modes — run the relevant ones after touching their area:
+
+| Flag | Checks |
+|---|---|
+| `--verify-incremental` | incremental JSONL reads never lose/duplicate a record (#24) |
+| `--verify-projection` | spend-projection run-rate math + guards (#18) |
+| `--verify-sync` | sync aggregate reproduces the raw Models fit (#3) |
+| `--sync-preview` | combined multi-machine view vs a simulated second machine |
+| `--diagnose` | support report: state, a timed load, recent reload log |
+
+`--diagnose` is the one to ask a **user** to run (from the installed bundle, so it
+reads the right Info.plist and preferences):
+
+```sh
+/Applications/BarPilot.app/Contents/MacOS/BarPilot --diagnose
+```
+
+It prints counts/sizes/durations only — no usage content — with home-relative
+paths, so output is safe to paste into the public repo. Runtime history comes from
+`DiagLog` (`~/Library/Logs/BarPilot/barpilot.log`, one line per reload, rotated at
+256 KB × 2 files so it can never grow unbounded).
+
 Requires the Swift toolchain only (Command Line Tools is enough).
 
 ## The core invariant
@@ -78,11 +100,28 @@ totals with `--dump` against a known-good capture. The rules:
 | VS Code Copilot Chat | SQLite (`import SQLite3`, read-only) | `~/Library/Application Support/Code/User/globalStorage/github.copilot-chat/agent-traces.db` |
 | GitHub Copilot Mac App | JSONL | `~/Library/Application Support/com.github.githubapp/agent-traces.jsonl` |
 
-A missing source file is silently skipped. The JSONL is 100 MB+, so it's
-**memory-mapped** (`.mappedIfSafe`) and scanned in a single byte pass; only lines
-containing the substring `aiu` are JSON-parsed. JSONL parsing handles both the
-flat Mac-App span shape and the nested OTLP `resourceSpans` envelope. Full load
-of both sources is well under a second.
+A missing source file is silently skipped. Only lines containing the substring
+`aiu` are JSON-parsed; parsing handles both the flat Mac-App span shape and the
+nested OTLP `resourceSpans` envelope.
+
+**The JSONL is read INCREMENTALLY — don't regress this.** It's append-only and
+grows without bound (multi-GB in practice), so re-scanning it on every 60s reload
+cost seconds of CPU and pegged machines (#23/#24). `loadJSONL(path:from:)` resumes
+from a byte offset persisted in the cache's `meta` table
+(`DataSources.jsonlOffsetKey`), scanning only the appended tail — ~1.8 GB/7s
+becomes ~KB/50ms. Rules:
+
+- The offset only ever advances to the **last complete newline**; a partially
+  written trailing line is left for the next read (consuming it would drop that
+  record permanently).
+- A file smaller than the stored offset means rotation/truncation → full re-scan
+  from 0. The first run after upgrading also does one full scan.
+- Full scans still **memory-map** (`.mappedIfSafe`); incremental tail reads use a
+  plain `FileHandle`.
+- Verify with `--verify-incremental` after touching any of it.
+
+Badge counts in `SourcesStatus` come from the **cache** (`SpanCache.countsBySource`),
+not the live read — a reload normally sees 0 new records.
 
 ## Architecture
 
@@ -102,6 +141,8 @@ Sources/BarPilot/
   Updater.swift      Silent GitHub-Releases auto-updater (Developer ID-gated).
   LoginItem.swift    "Start at Login" via SMAppService (macOS 13+).
   Currency.swift     USD/AUD display currency + live USD→AUD rate (open.er-api.com).
+  DiagLog.swift      Size-capped rotating support log (one line per reload).
+  Diagnose.swift     Diagnose.run() — the --diagnose support report.
 Info.plist           LSUIElement (menu-bar-only) agent bundle.
 build-app.sh         Build + assemble + ad-hoc codesign the .app.
 ```

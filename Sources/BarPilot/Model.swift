@@ -174,6 +174,10 @@ struct SourcesStatus {
     /// live DB is momentarily empty — gates the restart nudge (#21).
     var vscodeEverCaptured = false
     var macAppEverCaptured = false
+    /// Last-load telemetry, for the rotating log + `--diagnose` (#24).
+    var newRecords = 0
+    var jsonlBytesScanned: Int64 = 0
+    var jsonlOffset: Int64 = 0
 
     var allConfigured: Bool { vscodeConfigured && macAppConfigured }
 }

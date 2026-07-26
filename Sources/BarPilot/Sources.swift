@@ -40,11 +40,16 @@ enum DataSources {
         }
 
         let jsonlPath = macAppJSONLPath()
+        var jsonlBytesScanned: Int64 = 0
         if FileManager.default.fileExists(atPath: jsonlPath) {
-            let recs = loadJSONL(path: jsonlPath)
+            // Incremental: resume from the stored byte offset instead of re-reading
+            // the whole (multi-GB) file on every reload. (#24)
+            let stored = Int64(SpanCache.getMeta(Self.jsonlOffsetKey) ?? "") ?? 0
+            let r = loadJSONL(path: jsonlPath, from: stored)
+            if r.newOffset != stored { SpanCache.setMeta(Self.jsonlOffsetKey, "\(r.newOffset)") }
+            jsonlBytesScanned = r.bytesScanned
             status.macAppFound = true
-            status.macAppCount = recs.count
-            liveRecords.append(contentsOf: recs)
+            liveRecords.append(contentsOf: r.records)
         }
 
         status.vscodeConfigured = isVSCodeTelemetryConfigured()
@@ -62,7 +67,91 @@ enum DataSources {
         let present = Set(cached.map(\.source))
         status.vscodeEverCaptured = present.contains(.vscode) || present.contains(.chatBackfill)
         status.macAppEverCaptured = present.contains(.macApp)
+
+        // Badge counts come from the CACHE, not this reload's live read: with
+        // incremental loading a reload normally sees 0 new records, and the cache
+        // is what actually backs the totals. Also makes both badges consistent —
+        // previously a wiped live DB showed "VS Code · 0" despite cached history.
+        let counts = SpanCache.countsBySource()
+        status.vscodeCount = (counts[SourceKind.vscode.rawValue] ?? 0) + (counts[SourceKind.chatBackfill.rawValue] ?? 0)
+        status.macAppCount = counts[SourceKind.macApp.rawValue] ?? 0
+
+        status.newRecords = liveRecords.count
+        status.jsonlBytesScanned = jsonlBytesScanned
+        status.jsonlOffset = Int64(SpanCache.getMeta(Self.jsonlOffsetKey) ?? "") ?? 0
         return (cached, status)
+    }
+
+    /// Meta key for the JSONL read offset (#24).
+    static let jsonlOffsetKey = "macAppJSONLOffset"
+
+    // -----------------------------------------------------------------------
+    // Incremental-read verifier (--verify-incremental).
+    //
+    // The offset logic is the one risky part of #24: advancing past a partially
+    // written line would drop that usage record permanently. This builds a
+    // synthetic JSONL in a temp dir and proves, on a fixed fixture, that
+    // incremental reads never lose or double-count a record and that a truncated
+    // file falls back to a full re-scan.
+    // -----------------------------------------------------------------------
+    static func verifyIncremental() {
+        let err = FileHandle.standardError
+        var pass = 0, fail = 0
+        func check(_ name: String, _ ok: Bool, _ detail: String = "") {
+            if ok { pass += 1 } else { fail += 1 }
+            err.write(Data("  [\(ok ? "OK" : "XX")] \(name)\(detail.isEmpty ? "" : " — \(detail)")\n".utf8))
+        }
+        func span(_ id: String, aiu: Double) -> String {
+            """
+            {"spanId":"\(id)","name":"chat","attributes":{"github.copilot.aiu":\(aiu),\
+            "gen_ai.response.model":"claude-sonnet-4-6","gen_ai.usage.input_tokens":10,\
+            "gen_ai.usage.output_tokens":5},"startTimeUnixNano":1750000000000000000}
+            """
+        }
+        let dir = NSTemporaryDirectory() + "barpilot-verify-\(ProcessInfo.processInfo.processIdentifier)"
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let path = dir + "/t.jsonl"
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        func write(_ s: String) { try? s.write(toFile: path, atomically: false, encoding: .utf8) }
+
+        // 1. Full scan of two complete lines + an unrelated (no-aiu) line.
+        let first = span("a", aiu: 1e9) + "\n" + #"{"spanId":"noise","name":"x"}"# + "\n" + span("b", aiu: 2e9) + "\n"
+        write(first)
+        let r1 = loadJSONL(path: path, from: 0)
+        check("full scan finds both usage spans", r1.records.count == 2, "got \(r1.records.count)")
+        check("offset lands at EOF on a newline-terminated file", r1.newOffset == Int64(first.utf8.count))
+
+        // 2. Nothing appended → no work, no records, offset unchanged.
+        let r2 = loadJSONL(path: path, from: r1.newOffset)
+        check("no-op when nothing appended", r2.records.isEmpty && r2.newOffset == r1.newOffset)
+
+        // 3. Append one complete line + a PARTIAL line (mid-write flush).
+        let partial = span("c", aiu: 3e9) + "\n" + String(span("d", aiu: 4e9).prefix(40))
+        write(first + partial)
+        let r3 = loadJSONL(path: path, from: r2.newOffset)
+        check("incremental picks up the complete appended span", r3.records.count == 1 && r3.records.first?.spanId == "c")
+        check("offset stops BEFORE the partial line (no data loss)",
+              r3.newOffset == Int64((first + span("c", aiu: 3e9) + "\n").utf8.count))
+
+        // 4. The partial line is completed → its record is still found.
+        write(first + span("c", aiu: 3e9) + "\n" + span("d", aiu: 4e9) + "\n")
+        let r4 = loadJSONL(path: path, from: r3.newOffset)
+        check("completed line is recovered on the next read", r4.records.count == 1 && r4.records.first?.spanId == "d")
+
+        // 5. Totals match a single full scan of the final file — no loss, no dupes.
+        let full = loadJSONL(path: path, from: 0)
+        let incrementalIds = Set((r1.records + r3.records + r4.records).map(\.spanId))
+        check("incremental union == full scan", incrementalIds == Set(full.records.map(\.spanId)),
+              "\(incrementalIds.count) vs \(full.records.count)")
+        let incCredits = (r1.records + r3.records + r4.records).reduce(0.0) { $0 + $1.credits }
+        check("credits match full scan", abs(incCredits - full.records.reduce(0.0) { $0 + $1.credits }) < 1e-9)
+
+        // 6. Rotation / truncation: stored offset beyond EOF → full re-scan.
+        write(span("z", aiu: 5e9) + "\n")
+        let rot = loadJSONL(path: path, from: 999_999)
+        check("truncated file re-scans from 0", rot.records.count == 1 && rot.records.first?.spanId == "z")
+
+        err.write(Data("verify-incremental: \(fail == 0 ? "PASS" : "FAIL") — \(pass) ok, \(fail) failed\n".utf8))
     }
 
     // -----------------------------------------------------------------------
@@ -175,42 +264,72 @@ private func reasoningEffort(fromOptionsJSON json: String?) -> String? {
 // "aiu" (present in every usage key), JSON-parsing only those.
 // ---------------------------------------------------------------------------
 
-private func loadJSONL(path: String) -> [UsageRecord] {
-    guard let data = try? Data(contentsOf: URL(fileURLWithPath: path), options: .mappedIfSafe) else {
-        return []
+/// Scan a byte buffer of whole-or-partial JSONL, parsing only `aiu` lines.
+/// Returns the records plus how many bytes were CONSUMED — always ending on a
+/// newline boundary, so a partially-written trailing line is left for next time
+/// (parsing half a line would drop that record permanently). (#24)
+private func scanJSONLBuffer(_ base: UnsafePointer<UInt8>, _ n: Int,
+                             into out: inout [UsageRecord], seen: inout Set<String>) -> Int {
+    let NL: UInt8 = 0x0A   // \n
+    let A: UInt8 = 0x61, I: UInt8 = 0x69, U: UInt8 = 0x75   // "aiu"
+
+    var lineStart = 0
+    var consumed = 0
+    var hasAiu = false
+    var i = 0
+    while i < n {
+        let b = base[i]
+        if b == NL {
+            if hasAiu && i > lineStart {
+                parseJSONLLine(base + lineStart, i - lineStart, into: &out, seen: &seen)
+            }
+            lineStart = i + 1
+            consumed = lineStart      // only advance past complete lines
+            hasAiu = false
+        } else if b == U && i >= lineStart + 2 && base[i - 1] == I && base[i - 2] == A {
+            hasAiu = true
+        }
+        i += 1
     }
+    return consumed
+}
+
+/// Read new usage records from the append-only JSONL, starting at `from`.
+///
+/// The cache already holds every span ever seen, so re-reading history is pure
+/// waste: at 1.8 GB a full scan cost ~4.5s of CPU on every 60s reload. Scanning
+/// only the appended tail makes it ~O(bytes added). Returns the new offset to
+/// store; a shrunken file means rotation/truncation → caller re-scans from 0.
+private func loadJSONL(path: String, from offset: Int64) -> (records: [UsageRecord], newOffset: Int64, bytesScanned: Int64) {
+    let url = URL(fileURLWithPath: path)
+    let size = (try? FileManager.default.attributesOfItem(atPath: path)[.size] as? Int64).flatMap { $0 } ?? 0
+    var start = offset
+    if start > size { start = 0 }             // rotated / truncated → full re-scan
+    guard size > start else { return ([], size, 0) }
 
     var out: [UsageRecord] = []
     var seen = Set<String>()
+    var consumed = 0
 
-    data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
-        guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
-        let n = raw.count
-
-        let NL: UInt8 = 0x0A   // \n
-        let A: UInt8 = 0x61, I: UInt8 = 0x69, U: UInt8 = 0x75   // "aiu"
-
-        var lineStart = 0
-        var hasAiu = false
-        var i = 0
-        while i < n {
-            let b = base[i]
-            if b == NL {
-                if hasAiu && i > lineStart {
-                    parseJSONLLine(base + lineStart, i - lineStart, into: &out, seen: &seen)
-                }
-                lineStart = i + 1
-                hasAiu = false
-            } else if b == U && i >= lineStart + 2 && base[i - 1] == I && base[i - 2] == A {
-                hasAiu = true
-            }
-            i += 1
+    if start == 0 {
+        // Full scan: memory-map so a multi-GB file isn't read into the heap.
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return ([], offset, 0) }
+        data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+            consumed = scanJSONLBuffer(base, raw.count, into: &out, seen: &seen)
         }
-        if hasAiu && lineStart < n {
-            parseJSONLLine(base + lineStart, n - lineStart, into: &out, seen: &seen)
+    } else {
+        // Incremental: read just the tail — normally a few KB.
+        guard let fh = try? FileHandle(forReadingFrom: url) else { return ([], offset, 0) }
+        defer { try? fh.close() }
+        guard (try? fh.seek(toOffset: UInt64(start))) != nil,
+              let tail = try? fh.readToEnd(), !tail.isEmpty else { return ([], start, 0) }
+        tail.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+            consumed = scanJSONLBuffer(base, raw.count, into: &out, seen: &seen)
         }
     }
-    return out
+    return (out, start + Int64(consumed), size - start)
 }
 
 private func parseJSONLLine(
