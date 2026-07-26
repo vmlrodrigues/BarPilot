@@ -4,6 +4,10 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+---
+
+## [0.8.3] — 2026-07-26
+
 ### Fixed
 - **Idle CPU usage is essentially gone.** BarPilot was re-reading your entire
   usage log — often over a gigabyte — every single refresh, which burned seconds
