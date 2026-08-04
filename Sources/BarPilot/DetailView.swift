@@ -174,7 +174,7 @@ struct DetailView: View {
                 .padding(.top, 6)
             }
 
-            if let hint = restartHint {
+            if let hint = restartHint ?? stalenessHint {
                 HStack(spacing: 6) {
                     Image(systemName: "arrow.clockwise")
                         .foregroundStyle(.blue)
@@ -262,6 +262,36 @@ struct DetailView: View {
         guard !who.isEmpty else { return nil }
         let obj = who.count == 1 ? "it" : "them"
         return "Telemetry is on for \(who.joined(separator: " & ")) but no usage captured yet — quit & reopen \(obj), then use Copilot. It only starts on relaunch."
+    }
+
+    /// A source that HAS captured before but has gone quiet — the shape of "the
+    /// app stopped exporting". Distinct from the never-captured case above:
+    /// #21 rightly suppressed that nudge for existing users, which left this
+    /// failure completely silent (#27). Worded conditionally because a user who
+    /// simply hasn't used Copilot lately is indistinguishable from here.
+    /// Warn on the TRANSITION from recently-active to silent, not on silence
+    /// itself. A source you simply don't use (quiet for months) would otherwise
+    /// nag forever; one that was working last week and has gone quiet is the
+    /// real signal. Outside the window we stay silent and let `--diagnose`
+    /// report it instead.
+    private static let staleAfterDays = 7
+    private static let staleUntilDays = 30
+
+    private func goneQuiet(_ days: Int?) -> Bool {
+        guard let days else { return false }
+        return days >= Self.staleAfterDays && days <= Self.staleUntilDays
+    }
+
+    private var stalenessHint: String? {
+        var who: [String] = []
+        if store.status.macAppConfigured, goneQuiet(store.status.macAppStaleDays()) {
+            who.append("the Copilot app (\(store.status.macAppStaleDays() ?? 0)d)")
+        }
+        if store.status.vscodeConfigured, goneQuiet(store.status.vscodeStaleDays()) {
+            who.append("VS Code (\(store.status.vscodeStaleDays() ?? 0)d)")
+        }
+        guard !who.isEmpty else { return nil }
+        return "No usage recorded from \(who.joined(separator: " & ")). If you have been using Copilot, quit and reopen it — telemetry only starts on relaunch."
     }
 
     /// Status dot: green = data flowing, orange = configured but no traces yet,

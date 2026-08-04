@@ -41,12 +41,13 @@ enum DataSources {
 
         let jsonlPath = macAppJSONLPath()
         var jsonlBytesScanned: Int64 = 0
+        var pendingOffset: (stored: Int64, new: Int64)?
         if FileManager.default.fileExists(atPath: jsonlPath) {
             // Incremental: resume from the stored byte offset instead of re-reading
             // the whole (multi-GB) file on every reload. (#24)
             let stored = Int64(SpanCache.getMeta(Self.jsonlOffsetKey) ?? "") ?? 0
             let r = loadJSONL(path: jsonlPath, from: stored)
-            if r.newOffset != stored { SpanCache.setMeta(Self.jsonlOffsetKey, "\(r.newOffset)") }
+            pendingOffset = (stored, r.newOffset)   // persisted only after a successful merge (#28)
             jsonlBytesScanned = r.bytesScanned
             status.macAppFound = true
             liveRecords.append(contentsOf: r.records)
@@ -55,7 +56,17 @@ enum DataSources {
         status.vscodeConfigured = isVSCodeTelemetryConfigured()
         status.macAppConfigured = isMacAppTelemetryConfigured()
 
-        SpanCache.merge(liveRecords)
+        // Advance the JSONL offset ONLY once the records are committed. A failed
+        // merge leaves the offset put, so the same bytes are re-read next time
+        // (harmless — dedup is INSERT OR IGNORE) instead of being skipped
+        // forever. Ordering matters here; don't move this back above. (#28)
+        if SpanCache.merge(liveRecords) {
+            if let (stored, new) = pendingOffset, new != stored {
+                SpanCache.setMeta(Self.jsonlOffsetKey, "\(new)")
+            }
+        } else {
+            DiagLog.write("WARNING: cache merge failed — keeping JSONL offset so \(liveRecords.count) record(s) are re-read next reload")
+        }
         ReasoningLevelBackfill.run(liveRecords: liveRecords)  // one-time, gated: fill levels on already-cached spans
         ChatBackfill.run()   // one-time, gated: recover pre-OTel June history from chat files
 
@@ -75,6 +86,19 @@ enum DataSources {
         let counts = SpanCache.countsBySource()
         status.vscodeCount = (counts[SourceKind.vscode.rawValue] ?? 0) + (counts[SourceKind.chatBackfill.rawValue] ?? 0)
         status.macAppCount = counts[SourceKind.macApp.rawValue] ?? 0
+
+        // Staleness inputs (#27): newest usage per source + when each source file
+        // last changed. A source that has captured before but has gone quiet is
+        // the shape of "the app stopped exporting".
+        let newest = SpanCache.newestBySource()
+        status.vscodeNewestMs = [newest[SourceKind.vscode.rawValue], newest[SourceKind.chatBackfill.rawValue]]
+            .compactMap { $0 }.max()
+        status.macAppNewestMs = newest[SourceKind.macApp.rawValue]
+        func modified(_ p: String) -> Date? {
+            (try? FileManager.default.attributesOfItem(atPath: p)[.modificationDate] as? Date).flatMap { $0 }
+        }
+        status.vscodeFileModified = modified(dbPath)
+        status.macAppFileModified = modified(jsonlPath)
 
         status.newRecords = liveRecords.count
         status.jsonlBytesScanned = jsonlBytesScanned

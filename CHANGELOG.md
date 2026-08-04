@@ -4,6 +4,23 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+### Added
+- **BarPilot now tells you when a source stops reporting.** If Copilot telemetry
+  was working and then goes quiet for a week, the footer says so and suggests
+  quitting and reopening the app — previously this failed completely silently and
+  looked identical to a healthy setup. It stays quiet for a source you simply
+  don't use. (#27)
+- **"Save Diagnostics…" in the menu.** Produces the support report without using
+  Terminal, then reveals it in Finder so you can send it on. Timings, counts and
+  file sizes only — no code, prompts, or account details. (#31)
+
+### Fixed
+- **A failed cache write could silently skip usage records.** The read position
+  advanced before the data was safely stored, so records could be lost for good.
+  It now only advances after a successful write. (#28)
+- **Source record counts now match the totals they sit beside** — they were
+  including orchestration rollups that every total excludes. (#29)
+
 ---
 
 ## [0.8.3] — 2026-07-26

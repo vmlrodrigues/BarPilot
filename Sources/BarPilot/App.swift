@@ -1,6 +1,7 @@
 import AppKit
 import SwiftUI
 import Combine
+import UniformTypeIdentifiers
 
 // ---------------------------------------------------------------------------
 // Entry point. `@MainActor static main()` (the same shape SwiftUI's App uses)
@@ -29,6 +30,11 @@ struct AppMain {
         // Dev-only: regression-check the spend projection math (#18).
         if CommandLine.arguments.contains("--verify-projection") {
             SpendProjection.verify()
+            exit(0)
+        }
+        // Dev-only: staleness warning fires on the active->silent transition (#27).
+        if CommandLine.arguments.contains("--verify-staleness") {
+            SourcesStatus.verifyStaleness()
             exit(0)
         }
         // Dev-only: prove incremental JSONL reads never lose/duplicate a record (#24).
@@ -167,6 +173,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let whatsNew = NSMenuItem(title: "What’s New", action: #selector(showWhatsNew), keyEquivalent: "")
         whatsNew.target = self
         menu.addItem(whatsNew)
+        let diagnostics = NSMenuItem(title: "Save Diagnostics…", action: #selector(saveDiagnostics), keyEquivalent: "")
+        diagnostics.target = self
+        diagnostics.toolTip = "Save a support report (timings and counts only — no code or prompts)."
+        menu.addItem(diagnostics)
         menu.addItem(.separator())
 
         let quit = NSMenuItem(title: "Quit BarPilot", action: #selector(quit), keyEquivalent: "q")
@@ -279,6 +289,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showWhatsNew() {
         if let u = URL(string: "https://github.com/vmlrodrigues/BarPilot/blob/main/CHANGELOG.md") {
             NSWorkspace.shared.open(u)
+        }
+    }
+
+    /// Save the same report as `--diagnose` to a file the user can send. Building
+    /// it runs a load, so do that off the main actor and keep the UI responsive.
+    /// The save panel states what's inside so sharing is an informed choice (#31).
+    @objc private func saveDiagnostics() {
+        NSApp.activate(ignoringOtherApps: true)
+        let panel = NSSavePanel()
+        panel.title = "Save BarPilot Diagnostics"
+        panel.message = "Contains timings, counts and file sizes only — no code, prompts, or account details. Safe to share."
+        panel.nameFieldStringValue = "barpilot-diagnose-\(Fmt.fileStamp(Date())).txt"
+        panel.allowedContentTypes = [.plainText]
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        Task { @MainActor in
+            let text = await Task.detached(priority: .userInitiated) { Diagnose.report() }.value
+            do {
+                try text.write(to: url, atomically: true, encoding: .utf8)
+                NSWorkspace.shared.activateFileViewerSelecting([url])   // reveal in Finder
+            } catch {
+                let a = NSAlert()
+                a.alertStyle = .warning
+                a.messageText = "Couldn’t save diagnostics"
+                a.informativeText = error.localizedDescription
+                a.runModal()
+            }
         }
     }
 

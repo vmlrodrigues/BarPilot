@@ -69,8 +69,14 @@ enum SpanCache {
     }
 
     /// Persist new records (existing span_ids are left unchanged).
-    static func merge(_ records: [UsageRecord]) {
-        guard !records.isEmpty, let db = open() else { return }
+    /// Returns true if the records are safely committed (or there were none).
+    /// The JSONL read offset must only advance on a `true` result — otherwise a
+    /// failed merge would skip those bytes forever. Re-reading is harmless
+    /// (`INSERT OR IGNORE` dedups), so bias toward re-reading. (#28)
+    @discardableResult
+    static func merge(_ records: [UsageRecord]) -> Bool {
+        guard !records.isEmpty else { return true }
+        guard let db = open() else { return false }
         defer { sqlite3_close(db) }
         let sql = """
         INSERT OR IGNORE INTO spans
@@ -79,9 +85,10 @@ enum SpanCache {
         VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(stmt) }
         sqlite3_exec(db, "BEGIN", nil, nil, nil)
+        var ok = true
         for r in records {
             sqlite3_bind_text(stmt, 1, r.spanId, -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(stmt, 2, r.source.rawValue, -1, SQLITE_TRANSIENT)
@@ -98,10 +105,15 @@ enum SpanCache {
             sqlite3_bind_text(stmt, 10, r.operationName, -1, SQLITE_TRANSIENT)
             if let lv = r.reasoningLevel { sqlite3_bind_text(stmt, 11, lv, -1, SQLITE_TRANSIENT) }
             else { sqlite3_bind_null(stmt, 11) }
-            sqlite3_step(stmt)
+            let rc = sqlite3_step(stmt)
+            if rc != SQLITE_DONE && rc != SQLITE_ROW { ok = false }
             sqlite3_reset(stmt)
         }
-        sqlite3_exec(db, "COMMIT", nil, nil, nil)
+        if !ok {
+            sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            return false
+        }
+        return sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK
     }
 
     /// Load all cached records.
@@ -190,12 +202,31 @@ enum SpanCache {
         guard let db = open() else { return [:] }
         defer { sqlite3_close(db) }
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, "SELECT source, COUNT(*) FROM spans GROUP BY source", -1, &stmt, nil) == SQLITE_OK else { return [:] }
+        // Exclude invoke_agent rollups, exactly as load() does, so badge/diagnose
+        // counts agree with the totals they sit next to. (#29)
+        guard sqlite3_prepare_v2(db, "SELECT source, COUNT(*) FROM spans WHERE op_name NOT LIKE 'invoke_agent%' GROUP BY source", -1, &stmt, nil) == SQLITE_OK else { return [:] }
         defer { sqlite3_finalize(stmt) }
         var out: [String: Int] = [:]
         while sqlite3_step(stmt) == SQLITE_ROW {
             if let c = sqlite3_column_text(stmt, 0) {
                 out[String(cString: c)] = Int(sqlite3_column_int64(stmt, 1))
+            }
+        }
+        return out
+    }
+
+    /// Newest span timestamp per source — the "is this source still alive?"
+    /// signal behind the staleness warning (#27).
+    static func newestBySource() -> [String: Int64] {
+        guard let db = open() else { return [:] }
+        defer { sqlite3_close(db) }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT source, MAX(start_ms) FROM spans GROUP BY source", -1, &stmt, nil) == SQLITE_OK else { return [:] }
+        defer { sqlite3_finalize(stmt) }
+        var out: [String: Int64] = [:]
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            if let c = sqlite3_column_text(stmt, 0), sqlite3_column_type(stmt, 1) != SQLITE_NULL {
+                out[String(cString: c)] = sqlite3_column_int64(stmt, 1)
             }
         }
         return out

@@ -13,8 +13,18 @@ import Foundation
 // ---------------------------------------------------------------------------
 
 enum Diagnose {
-    static func run() {
-        func line(_ s: String = "") { print(s) }
+    /// CLI path: print the report.
+    static func run() { print(report()) }
+
+    /// Build the report as text (shared by `--diagnose` and "Save Diagnostics…").
+    ///
+    /// SAFETY: counts, sizes, durations and configuration booleans only. Never
+    /// usage content, never the sync account name, never a token, never process
+    /// environment contents (#30) — users hand this file to other people and
+    /// paste it into a PUBLIC repo. Paths are home-relative. (#31)
+    static func report() -> String {
+        var out: [String] = []
+        func line(_ s: String = "") { out.append(s) }
         let fm = FileManager.default
         func fileInfo(_ path: String) -> String {
             guard let attrs = try? fm.attributesOfItem(atPath: path) else { return "absent" }
@@ -56,6 +66,18 @@ enum Diagnose {
         line("  LOAD TIME:               \(ms) ms")
         line("")
 
+        // Staleness — the quickest read on "has a source stopped exporting?" (#27)
+        line("source activity")
+        func lastSeen(_ name: String, _ ms: Int64?, _ days: Int?) {
+            guard let ms, ms > 0 else { line("  \(name): no usage ever recorded"); return }
+            let d = Date(timeIntervalSince1970: Double(ms) / 1000)
+            let flag = (days ?? 0) >= 7 ? "   <-- STALE" : ""
+            line("  \(name): last usage \(ISO8601DateFormatter().string(from: d))\(days.map { " (\($0)d ago)" } ?? "")\(flag)")
+        }
+        lastSeen("VS Code ", status.vscodeNewestMs, status.vscodeStaleDays())
+        lastSeen("Mac App ", status.macAppNewestMs, status.macAppStaleDays())
+        line("")
+
         line("cache")
         line("  db:      \(DiagLog.tildify(SpanCache.path)) · \(DiagLog.humanBytes(SpanCache.fileSize()))")
         line("  records: \(records.count) total")
@@ -82,5 +104,6 @@ enum Diagnose {
         } else {
             for l in tail { line("  \(l)") }
         }
+        return out.joined(separator: "\n") + "\n"
     }
 }

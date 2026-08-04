@@ -52,6 +52,7 @@ Other headless modes — run the relevant ones after touching their area:
 | Flag | Checks |
 |---|---|
 | `--verify-incremental` | incremental JSONL reads never lose/duplicate a record (#24) |
+| `--verify-staleness` | the "source went quiet" warning fires on the transition only (#27) |
 | `--verify-projection` | spend-projection run-rate math + guards (#18) |
 | `--verify-sync` | sync aggregate reproduces the raw Models fit (#3) |
 | `--sync-preview` | combined multi-machine view vs a simulated second machine |
