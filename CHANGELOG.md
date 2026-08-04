@@ -5,11 +5,14 @@ All notable changes to BarPilot are documented here.
 ## [Unreleased]
 
 ### Added
-- **BarPilot now tells you when a source stops reporting.** If Copilot telemetry
-  was working and then goes quiet for a week, the footer says so and suggests
-  quitting and reopening the app — previously this failed completely silently and
-  looked identical to a healthy setup. It stays quiet for a source you simply
-  don't use. (#27)
+- **BarPilot now tells you when Copilot stops recording usage.** Previously, if
+  the Copilot app's telemetry silently died, your total just quietly stopped
+  moving and looked completely normal — one user lost days of data before
+  noticing. BarPilot now watches whether the Copilot app is actually writing, and
+  within minutes shows a warning on the menu-bar figure and a banner in the
+  window: "Copilot is running but isn't recording telemetry — quit and reopen
+  it." It clears itself as soon as data flows again, and stays silent when you're
+  simply not using Copilot. (#27)
 - **"Save Diagnostics…" in the menu.** Produces the support report without using
   Terminal, then reveals it in Finder so you can send it on. Timings, counts and
   file sizes only — no code, prompts, or account details. (#31)

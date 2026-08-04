@@ -32,9 +32,9 @@ struct AppMain {
             SpendProjection.verify()
             exit(0)
         }
-        // Dev-only: staleness warning fires on the active->silent transition (#27).
-        if CommandLine.arguments.contains("--verify-staleness") {
-            SourcesStatus.verifyStaleness()
+        // Dev-only: exporter-heartbeat watchdog decision rules (#27).
+        if CommandLine.arguments.contains("--verify-watchdog") {
+            ExporterHealth.verify()
             exit(0)
         }
         // Dev-only: prove incremental JSONL reads never lose/duplicate a record (#24).

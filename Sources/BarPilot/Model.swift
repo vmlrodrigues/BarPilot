@@ -179,13 +179,20 @@ struct SourcesStatus {
     var jsonlBytesScanned: Int64 = 0
     var jsonlOffset: Int64 = 0
     /// Newest usage timestamp per source, and when each source file last changed
-    /// — the inputs to the staleness warning (#27). nil = never/unknown.
+    /// — reported by `--diagnose`. nil = never/unknown.
     var vscodeNewestMs: Int64?
     var macAppNewestMs: Int64?
     var vscodeFileModified: Date?
     var macAppFileModified: Date?
+    /// Exporter-watchdog inputs (#27): how long the Copilot app's JSONL has gone
+    /// without growing, and how long since we last observed it at all.
+    var macAppSecondsSinceGrowth: TimeInterval?
+    var gapSinceLastCheck: TimeInterval?
 
     /// Days since a source last produced usage, or nil if it never has.
+    /// Reported by `--diagnose`; NOT used to warn — absence of usage can't
+    /// distinguish a broken exporter from a user who simply isn't working. The
+    /// warning uses the heartbeat watchdog in `ExporterHealth` instead. (#27)
     private static func staleDays(_ ms: Int64?, now: Date) -> Int? {
         guard let ms, ms > 0 else { return nil }
         let secs = now.timeIntervalSince1970 - Double(ms) / 1000
@@ -193,37 +200,6 @@ struct SourcesStatus {
     }
     func vscodeStaleDays(now: Date = Date()) -> Int? { Self.staleDays(vscodeNewestMs, now: now) }
     func macAppStaleDays(now: Date = Date()) -> Int? { Self.staleDays(macAppNewestMs, now: now) }
-
-    // Headless check (--verify-staleness): the warning must fire on the
-    // active→silent transition and stay quiet for a source that's simply unused.
-    static func verifyStaleness() {
-        let err = FileHandle.standardError
-        var pass = 0, fail = 0
-        func check(_ name: String, _ ok: Bool) {
-            if ok { pass += 1 } else { fail += 1 }
-            err.write(Data("  [\(ok ? "OK" : "XX")] \(name)\n".utf8))
-        }
-        let now = Date(timeIntervalSince1970: 1_800_000_000)
-        func daysAgo(_ d: Int) -> Int64 { Int64((now.timeIntervalSince1970 - Double(d) * 86_400) * 1000) }
-        func stale(_ d: Int) -> Int? {
-            var s = SourcesStatus(); s.macAppNewestMs = daysAgo(d)
-            return s.macAppStaleDays(now: now)
-        }
-        // The window the UI applies (kept in sync with DetailView).
-        func fires(_ d: Int) -> Bool { let x = stale(d) ?? -1; return x >= 7 && x <= 30 }
-
-        check("day counting is accurate (10d ago -> 10)", stale(10) == 10)
-        check("active source (0d) does NOT warn", !fires(0))
-        check("brief gap (6d, e.g. a holiday) does NOT warn", !fires(6))
-        check("just gone quiet (7d) WARNS", fires(7))
-        check("still quiet (20d) WARNS", fires(20))
-        check("long-unused source (60d) does NOT warn", !fires(60))
-        var never = SourcesStatus()
-        never.macAppNewestMs = nil
-        check("never-captured source has no stale age (handled by the #16 nudge)", never.macAppStaleDays(now: now) == nil)
-
-        err.write(Data("verify-staleness: \(fail == 0 ? "PASS" : "FAIL") — \(pass) ok, \(fail) failed\n".utf8))
-    }
 
     var allConfigured: Bool { vscodeConfigured && macAppConfigured }
 }

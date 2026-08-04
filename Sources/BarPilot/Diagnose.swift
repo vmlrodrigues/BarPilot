@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 // ---------------------------------------------------------------------------
 // Diagnose — the `--diagnose` support report.
@@ -76,6 +77,21 @@ enum Diagnose {
         }
         lastSeen("VS Code ", status.vscodeNewestMs, status.vscodeStaleDays())
         lastSeen("Mac App ", status.macAppNewestMs, status.macAppStaleDays())
+
+        // Exporter watchdog — the decisive signal for "is telemetry recording
+        // right now", independent of whether anyone is using Copilot. (#27)
+        let copilot = NSWorkspace.shared.runningApplications
+            .first { $0.bundleIdentifier == ExporterHealth.copilotBundleId }
+        let verdict = ExporterHealth.evaluate(
+            appRunning: copilot != nil,
+            appUptime: copilot?.launchDate.map { Date().timeIntervalSince($0) },
+            secondsSinceGrowth: status.macAppSecondsSinceGrowth,
+            gapSinceLastCheck: status.gapSinceLastCheck)
+        line("  Copilot app running: \(copilot != nil)")
+        if let s = status.macAppSecondsSinceGrowth {
+            line("  telemetry file last grew: \(Int(s))s ago (heartbeat is ~10s)")
+        }
+        line("  exporter verdict: \(verdict)\(verdict.isWarning ? "   <-- NOT RECORDING" : "")")
         line("")
 
         line("cache")

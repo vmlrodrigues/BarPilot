@@ -52,7 +52,7 @@ Other headless modes — run the relevant ones after touching their area:
 | Flag | Checks |
 |---|---|
 | `--verify-incremental` | incremental JSONL reads never lose/duplicate a record (#24) |
-| `--verify-staleness` | the "source went quiet" warning fires on the transition only (#27) |
+| `--verify-watchdog` | exporter-heartbeat rules: warn only when running-but-not-writing (#27) |
 | `--verify-projection` | spend-projection run-rate math + guards (#18) |
 | `--verify-sync` | sync aggregate reproduces the raw Models fit (#3) |
 | `--sync-preview` | combined multi-machine view vs a simulated second machine |
@@ -142,6 +142,9 @@ Sources/BarPilot/
   Updater.swift      Silent GitHub-Releases auto-updater (Developer ID-gated).
   LoginItem.swift    "Start at Login" via SMAppService (macOS 13+).
   Currency.swift     USD/AUD display currency + live USD→AUD rate (open.er-api.com).
+  ExporterHealth.swift  Watchdog: Copilot app running but its JSONL not growing
+                     ⇒ its exporter is dead (the app heartbeats ~1.5 KB/10s even
+                     when idle, so this needs no guess about user activity).
   DiagLog.swift      Size-capped rotating support log (one line per reload).
   Diagnose.swift     Diagnose.run() — the --diagnose support report.
 Info.plist           LSUIElement (menu-bar-only) agent bundle.

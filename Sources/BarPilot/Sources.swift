@@ -100,6 +100,28 @@ enum DataSources {
         status.vscodeFileModified = modified(dbPath)
         status.macAppFileModified = modified(jsonlPath)
 
+        // Exporter watchdog inputs (#27): has the JSONL grown since we last
+        // looked? The Copilot app heartbeats into it every ~10s regardless of
+        // user activity, so "running but not growing" means the exporter is dead.
+        // Persisted in meta so restarting BarPilot doesn't erase the evidence.
+        let now = Date().timeIntervalSince1970
+        if status.macAppFound {
+            let size = (try? FileManager.default.attributesOfItem(atPath: jsonlPath)[.size] as? Int64).flatMap { $0 } ?? 0
+            let lastSize = Int64(SpanCache.getMeta(Self.jsonlSizeKey) ?? "") ?? -1
+            let lastGrowth = Double(SpanCache.getMeta(Self.jsonlGrowthAtKey) ?? "") ?? now
+            if size != lastSize {
+                SpanCache.setMeta(Self.jsonlSizeKey, "\(size)")
+                SpanCache.setMeta(Self.jsonlGrowthAtKey, "\(now)")
+                status.macAppSecondsSinceGrowth = 0
+            } else {
+                status.macAppSecondsSinceGrowth = max(0, now - lastGrowth)
+            }
+        }
+        if let last = Double(SpanCache.getMeta(Self.lastCheckAtKey) ?? "") {
+            status.gapSinceLastCheck = max(0, now - last)
+        }
+        SpanCache.setMeta(Self.lastCheckAtKey, "\(now)")
+
         status.newRecords = liveRecords.count
         status.jsonlBytesScanned = jsonlBytesScanned
         status.jsonlOffset = Int64(SpanCache.getMeta(Self.jsonlOffsetKey) ?? "") ?? 0
@@ -108,6 +130,10 @@ enum DataSources {
 
     /// Meta key for the JSONL read offset (#24).
     static let jsonlOffsetKey = "macAppJSONLOffset"
+    /// Exporter-watchdog bookkeeping (#27).
+    static let jsonlSizeKey = "macAppJSONLLastSize"
+    static let jsonlGrowthAtKey = "macAppJSONLLastGrowthAt"
+    static let lastCheckAtKey = "lastSourceCheckAt"
 
     // -----------------------------------------------------------------------
     // Incremental-read verifier (--verify-incremental).

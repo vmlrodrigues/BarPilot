@@ -14,6 +14,7 @@ struct DetailView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            exporterBanner
             header
             Divider()
             BudgetBar(
@@ -174,7 +175,7 @@ struct DetailView: View {
                 .padding(.top, 6)
             }
 
-            if let hint = restartHint ?? stalenessHint {
+            if let hint = restartHint {
                 HStack(spacing: 6) {
                     Image(systemName: "arrow.clockwise")
                         .foregroundStyle(.blue)
@@ -269,29 +270,24 @@ struct DetailView: View {
     /// #21 rightly suppressed that nudge for existing users, which left this
     /// failure completely silent (#27). Worded conditionally because a user who
     /// simply hasn't used Copilot lately is indistinguishable from here.
-    /// Warn on the TRANSITION from recently-active to silent, not on silence
-    /// itself. A source you simply don't use (quiet for months) would otherwise
-    /// nag forever; one that was working last week and has gone quiet is the
-    /// real signal. Outside the window we stay silent and let `--diagnose`
-    /// report it instead.
-    private static let staleAfterDays = 7
-    private static let staleUntilDays = 30
-
-    private func goneQuiet(_ days: Int?) -> Bool {
-        guard let days else { return false }
-        return days >= Self.staleAfterDays && days <= Self.staleUntilDays
-    }
-
-    private var stalenessHint: String? {
-        var who: [String] = []
-        if store.status.macAppConfigured, goneQuiet(store.status.macAppStaleDays()) {
-            who.append("the Copilot app (\(store.status.macAppStaleDays() ?? 0)d)")
+    /// Banner shown when the Copilot app is running but has stopped writing
+    /// telemetry — the total on screen is frozen and can't be trusted. Sits at
+    /// the top, above the figure it's casting doubt on, and clears itself as
+    /// soon as data flows again. (#27)
+    @ViewBuilder private var exporterBanner: some View {
+        if store.exporterVerdict.isWarning {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                Text(ExporterHealth.warningText)
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .background(Color.orange.opacity(0.12))
         }
-        if store.status.vscodeConfigured, goneQuiet(store.status.vscodeStaleDays()) {
-            who.append("VS Code (\(store.status.vscodeStaleDays() ?? 0)d)")
-        }
-        guard !who.isEmpty else { return nil }
-        return "No usage recorded from \(who.joined(separator: " & ")). If you have been using Copilot, quit and reopen it — telemetry only starts on relaunch."
     }
 
     /// Status dot: green = data flowing, orange = configured but no traces yet,

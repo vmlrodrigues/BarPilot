@@ -45,6 +45,9 @@ final class UsageStore: ObservableObject {
 
     /// Text shown in the menu bar (the selected period's total cost).
     @Published private(set) var menuBarTitle: String = "—"
+    /// Is the Copilot app recording telemetry right now? Drives the menu-bar
+    /// warning glyph and the window banner (#27).
+    @Published private(set) var exporterVerdict: ExporterHealth.Verdict = .healthy
 
     private var allRecords: [UsageRecord] = []
     private var timer: Timer?
@@ -111,6 +114,18 @@ final class UsageStore: ObservableObject {
         status = loaded.status
         lastUpdated = Date()
         isLoading = false
+
+        // Watchdog: the Copilot app heartbeats into its JSONL every ~10s, so if
+        // it's running and the file isn't growing, its exporter is dead. Checked
+        // here (main actor) because NSWorkspace is a UI-layer API. (#27)
+        let copilot = NSWorkspace.shared.runningApplications
+            .first { $0.bundleIdentifier == ExporterHealth.copilotBundleId }
+        exporterVerdict = ExporterHealth.evaluate(
+            appRunning: copilot != nil,
+            appUptime: copilot?.launchDate.map { Date().timeIntervalSince($0) },
+            secondsSinceGrowth: status.macAppSecondsSinceGrowth,
+            gapSinceLastCheck: status.gapSinceLastCheck)
+
         recompute()
         // Rotating support log (#24): load cost + what the reload actually computed
         // vs the menu title it set — also the #13 display-vs-data drift diagnostic.
@@ -142,7 +157,10 @@ final class UsageStore: ObservableObject {
             report = Aggregator.build(
                 records: allRecords, fromStr: range.from, toStr: range.to, todayStr: today)
         }
-        menuBarTitle = costString(credits: report.totalCredits)
+        // Prefix a warning glyph when telemetry has stopped: the menu-bar figure
+        // is where the stale number is shown, so it's where the doubt belongs.
+        let cost = costString(credits: report.totalCredits)
+        menuBarTitle = exporterVerdict.isWarning ? "⚠︎ " + cost : cost
     }
 
     /// Other machines' aggregates to combine, from the local RemoteStore (last
