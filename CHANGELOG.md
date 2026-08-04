@@ -4,6 +4,10 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+---
+
+## [0.9.0] — 2026-08-04
+
 ### Added
 - **BarPilot now tells you when Copilot stops recording usage.** Previously, if
   the Copilot app's telemetry silently died, your total just quietly stopped
