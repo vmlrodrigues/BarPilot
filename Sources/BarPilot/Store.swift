@@ -125,6 +125,12 @@ final class UsageStore: ObservableObject {
             appUptime: copilot?.launchDate.map { Date().timeIntervalSince($0) },
             secondsSinceGrowth: status.macAppSecondsSinceGrowth,
             gapSinceLastCheck: status.gapSinceLastCheck)
+        // Dev-only: force the warning state to eyeball the UI without having to
+        // break a real exporter. Gated to dev builds so a release can never be
+        // coaxed into showing a false alarm.
+        if Updater.isDevBuild, ProcessInfo.processInfo.environment["BARPILOT_SIMULATE_EXPORTER_DOWN"] != nil {
+            exporterVerdict = .silent(minutes: 14)
+        }
 
         recompute()
         // Rotating support log (#24): load cost + what the reload actually computed
