@@ -6,6 +6,18 @@ All notable changes to BarPilot are documented here.
 
 ---
 
+## [0.9.1] — 2026-08-07
+
+### Fixed
+- **The "Copilot isn't recording telemetry" warning no longer appears.** It was
+  firing for people who simply weren't using Copilot at the time. The check
+  relied on the Copilot app writing a steady background heartbeat, which version
+  1.1.4 no longer does — so silence stopped being evidence of a problem. The
+  warning is off until it can be made reliable; nothing else changes, and
+  `--diagnose` still reports the underlying state for support. (#32)
+
+---
+
 ## [0.9.0] — 2026-08-04
 
 ### Added

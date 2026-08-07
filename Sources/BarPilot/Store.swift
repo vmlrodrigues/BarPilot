@@ -48,6 +48,14 @@ final class UsageStore: ObservableObject {
     /// Is the Copilot app recording telemetry right now? Drives the menu-bar
     /// warning glyph and the window banner (#27).
     @Published private(set) var exporterVerdict: ExporterHealth.Verdict = .healthy
+    private var simulatingExporterDown = false
+
+    /// Whether to actually SHOW the exporter warning. Off by default while the
+    /// detection is unreliable (#32) — the dev simulation flag still forces it so
+    /// the UI can be worked on.
+    var showExporterWarning: Bool {
+        (ExporterHealth.warningsEnabled || simulatingExporterDown) && exporterVerdict.isWarning
+    }
 
     private var allRecords: [UsageRecord] = []
     private var timer: Timer?
@@ -128,9 +136,9 @@ final class UsageStore: ObservableObject {
         // Dev-only: force the warning state to eyeball the UI without having to
         // break a real exporter. Gated to dev builds so a release can never be
         // coaxed into showing a false alarm.
-        if Updater.isDevBuild, ProcessInfo.processInfo.environment["BARPILOT_SIMULATE_EXPORTER_DOWN"] != nil {
-            exporterVerdict = .silent(minutes: 14)
-        }
+        simulatingExporterDown = Updater.isDevBuild
+            && ProcessInfo.processInfo.environment["BARPILOT_SIMULATE_EXPORTER_DOWN"] != nil
+        if simulatingExporterDown { exporterVerdict = .silent(minutes: 14) }
 
         recompute()
         // Rotating support log (#24): load cost + what the reload actually computed
@@ -166,7 +174,7 @@ final class UsageStore: ObservableObject {
         // Prefix a warning glyph when telemetry has stopped: the menu-bar figure
         // is where the stale number is shown, so it's where the doubt belongs.
         let cost = costString(credits: report.totalCredits)
-        menuBarTitle = exporterVerdict.isWarning ? "⚠︎ " + cost : cost
+        menuBarTitle = showExporterWarning ? "⚠︎ " + cost : cost
     }
 
     /// Other machines' aggregates to combine, from the local RemoteStore (last

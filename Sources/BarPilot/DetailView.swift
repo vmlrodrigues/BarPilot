@@ -275,7 +275,7 @@ struct DetailView: View {
     /// the top, above the figure it's casting doubt on, and clears itself as
     /// soon as data flows again. (#27)
     @ViewBuilder private var exporterBanner: some View {
-        if store.exporterVerdict.isWarning {
+        if store.showExporterWarning {
             HStack(spacing: 8) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)

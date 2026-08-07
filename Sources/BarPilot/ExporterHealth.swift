@@ -23,6 +23,20 @@ enum ExporterHealth {
     /// The GitHub Copilot Mac app — watched to tell "exporter dead" from "idle".
     static let copilotBundleId = "com.github.githubapp"
 
+    /// USER-FACING WARNING IS OFF. (#32)
+    ///
+    /// The whole approach rests on the Copilot app heartbeating into its JSONL
+    /// while idle — measured at ~1.5 KB/10s when this shipped. Copilot 1.1.4
+    /// writes NOTHING while idle, so "not growing" no longer distinguishes a dead
+    /// exporter from a user who simply isn't using Copilot, and the warning fired
+    /// at idle users. Crying wolf is worse than staying quiet.
+    ///
+    /// The verdict is still computed and reported by `--diagnose`, so it stays
+    /// useful for support. Re-enabling this needs a detection that calibrates on
+    /// each install's OBSERVED write cadence rather than assuming a heartbeat
+    /// that a third-party app can remove in a point release.
+    static let warningsEnabled = false
+
     /// 10 minutes against a ~10s heartbeat: a 60x margin, so scheduling jitter,
     /// a slow flush or a brief stall can never trip it.
     static let quietThreshold: TimeInterval = 600

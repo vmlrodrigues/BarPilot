@@ -92,6 +92,9 @@ enum Diagnose {
             line("  telemetry file last grew: \(Int(s))s ago (heartbeat is ~10s)")
         }
         line("  exporter verdict: \(verdict)\(verdict.isWarning ? "   <-- NOT RECORDING" : "")")
+        if verdict.isWarning && !ExporterHealth.warningsEnabled {
+            line("  (user-facing warning suppressed — detection unreliable since Copilot 1.1.4, see #32)")
+        }
         line("")
 
         line("cache")
