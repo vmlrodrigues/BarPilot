@@ -92,7 +92,7 @@ private struct UnclassifiedLabel: View {
             .popover(isPresented: $showingInfo) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Unclassified credits").font(.caption.weight(.semibold))
-                    Text("GitHub’s account total is higher than the usage BarPilot can attribute from local telemetry. The difference can come from omitted local spans, other clients or devices, server-only Copilot surfaces, or reporting lag.")
+                    Text("GitHub’s account total is higher than the usage BarPilot can attribute from local telemetry. The difference can come from omitted local spans, server-only Copilot surfaces, or reporting lag.")
                         .foregroundStyle(.secondary)
                     Text("BarPilot keeps the difference separate rather than guessing which model, session, or call used it.")
                         .foregroundStyle(.secondary)
@@ -132,6 +132,11 @@ struct SummaryTab: View {
                 Text(r.model == CreditReconciliation.unclassifiedLabel ? "—" : Fmt.int(r.calls)).numCol(60)
                 Text(Fmt.credits(r.credits)).numCol(95)
                 Text(store.costString(credits: r.credits)).numCol(70)
+            }
+            .overlay(alignment: .top) {
+                if r.model == CreditReconciliation.unclassifiedLabel {
+                    Divider().offset(y: -5)
+                }
             }
         } footer: {
             totalFooter(total, store, label: store.reconciled.isCurrentCycle ? "Total (GitHub)" : "Total")
@@ -295,6 +300,11 @@ struct ModelsTab: View {
                                  outTok: r.outputTokens, inRate: r.inRate, outRate: r.outRate, fit: r.fit,
                                  unclassified: r.model == CreditReconciliation.unclassifiedLabel)
                 }
+                .overlay(alignment: .top) {
+                    if r.model == CreditReconciliation.unclassifiedLabel {
+                        Divider().offset(y: -5)
+                    }
+                }
             case .group(let r):
                 HStack {
                     Text(r.model).font(.callout).fontWeight(.medium).lineLimit(1).help(r.model)
@@ -330,7 +340,6 @@ struct DailyTab: View {
     @EnvironmentObject var store: UsageStore
     let rows: [DailyRow]
     let total: Double
-    let unallocatedCredits: Double
     @State private var sortAscending = false
 
     private enum DailyItem: Identifiable {
@@ -390,12 +399,8 @@ struct DailyTab: View {
             case .detail(let r):
                 HStack {
                     Text(r.day).font(.callout).monospacedDigit().frame(width: 95, alignment: .leading)
-                    Group {
-                        if r.model == CreditReconciliation.unclassifiedLabel { UnclassifiedLabel() }
-                        else { Text(r.model) }
-                    }
-                    .font(.callout).frame(maxWidth: .infinity, alignment: .leading)
-                    Text(r.model == CreditReconciliation.unclassifiedLabel ? "—" : Fmt.int(r.calls)).numCol(55)
+                    Text(r.model).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
+                    Text(Fmt.int(r.calls)).numCol(55)
                     Text(Fmt.credits(r.credits)).numCol(80)
                     Text(store.costString(credits: r.credits)).numCol(70)
                 }
@@ -410,12 +415,10 @@ struct DailyTab: View {
             }
         } footer: {
             VStack(spacing: 4) {
-                if unallocatedCredits > 0 {
-                    Text("\(Fmt.credits(unallocatedCredits)) unclassified credits predate daily server tracking and can’t be assigned to a day.")
-                        .font(.caption2).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                totalFooter(total, store, label: store.reconciled.isCurrentCycle ? "Total (GitHub)" : "Total")
+                Text("Local classified usage only; unclassified credits can’t be assigned to a day.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                totalFooter(total, store, label: "Classified total")
             }
         }
     }

@@ -143,8 +143,7 @@ struct DetailView: View {
                 .tabItem { Text("Summary") }
             ModelsTab(rows: store.modelRows, total: store.displayTotalCredits)
                 .tabItem { Text("Models") }
-            DailyTab(rows: store.dailyRows, total: store.displayTotalCredits,
-                     unallocatedCredits: store.dailyUnallocatedCredits)
+            DailyTab(rows: store.dailyRows, total: store.classifiedTotalCredits)
                 .tabItem { Text("Daily") }
             SessionsTab(rows: store.report.sessions, total: store.sessionClassifiedTotalCredits)
                 .tabItem { Text("Sessions") }

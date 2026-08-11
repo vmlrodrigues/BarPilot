@@ -195,11 +195,8 @@ final class UsageStore: ObservableObject {
         }
         reconciled = CreditReconciliation.build(
             report: report,
-            records: allRecords,
             periodKind: periodKind,
             snapshot: serverUsageEnabled ? serverUsageSample : nil,
-            samples: creditSamples,
-            syncEnabled: syncEnabled
         )
         // Prefix a warning glyph when telemetry has stopped: the menu-bar figure
         // is where the stale number is shown, so it's where the doubt belongs.
@@ -403,7 +400,6 @@ final class UsageStore: ObservableObject {
     var summaryRows: [SummaryRow] { reconciled.summary }
     var modelRows: [ModelRow] { reconciled.models }
     var dailyRows: [DailyRow] { reconciled.daily }
-    var dailyUnallocatedCredits: Double { reconciled.unallocatedDailyCredits }
 
     var serverUsageIsStale: Bool {
         guard let sample = serverUsageSample else { return false }

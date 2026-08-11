@@ -33,8 +33,9 @@ the USD→AUD exchange-rate fetch.
     **Sessions**, **Top** (most expensive calls).
   - Optional **GitHub Credit Total** (right-click menu): uses GitHub's current
     billing-cycle counter as the headline total, keeps local telemetry for the
-    detailed breakdown, and shows any difference as **Unclassified** rather than
-    guessing which model or session used it.
+    detailed breakdown, and shows any difference as a separated **Unclassified**
+    row in Summary and Models rather than guessing which model, day, session, or
+    call used it.
   - Footer shows each data source's status — **green** = data flowing,
     **orange** = telemetry enabled but no traces yet, **grey** = telemetry not
     enabled. If either source's OTel telemetry isn't configured, a warning with

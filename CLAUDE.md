@@ -19,6 +19,17 @@ version (e.g. "shipped in v0.7.1"). This keeps a complete, searchable trail from
 request → change → release. The repo is **public** — never put usernames, local
 paths, or emails in issues.
 
+### Public-repository privacy
+
+**Treat every GitHub issue, comment, commit message, PR, log excerpt, and checked-in
+file as public.** Never publish personal or account-identifying information,
+including names, usernames, emails, organisation names, local filesystem paths,
+hostnames, account identities, authentication sources, token details/scopes, or
+private usage figures. Describe authentication and testing generically, sanitize
+examples, and inspect the exact text before every GitHub write. If private context
+is accidentally published, edit or delete it immediately rather than explaining
+it in another public comment.
+
 ## Release checklist
 
 Before running `make release VERSION=x.y.z`:
@@ -55,7 +66,7 @@ Other headless modes — run the relevant ones after touching their area:
 | `--verify-watchdog` | exporter-heartbeat rules: warn only when running-but-not-writing (#27) |
 | `--verify-projection` | spend-projection run-rate math + guards (#18) |
 | `--verify-sync` | sync aggregate reproduces the raw Models fit (#3) |
-| `--verify-credits` | server-counter parsing, reset boundaries, baselines, and unclassified-gap math (#33) |
+| `--verify-credits` | server-counter parsing, current-cycle guards, and unclassified reconciliation (#33) |
 | `--sync-preview` | combined multi-machine view vs a simulated second machine |
 | `--diagnose` | support report: state, a timed load, recent reload log |
 
@@ -100,10 +111,12 @@ report for the current UTC billing cycle:
 
 - `headline total = max(GitHub cumulative counter, locally classified credits)`.
 - `unclassified = max(0, GitHub counter - locally classified credits)`.
-- Unclassified credits are never distributed across known models, sessions, or
-  calls. Summary / Models show an explicit bucket; Sessions / Top remain local.
-- Counter samples are diffed only within the same reset cycle and only when the
-  counter does not decrease. The opening sample is a baseline, not today's usage.
+- Unclassified credits are never distributed across known models, days, sessions,
+  or calls. Summary / Models show a separated final bucket; Daily / Sessions / Top
+  remain local and classified-only.
+- The opening sample establishes the persisted connection boundary. Cumulative
+  samples are not converted into daily rows because gaps cannot be assigned to a
+  day reliably.
 - Failed polls are not persisted as zero. The last good sample remains available,
   and ranges outside the provable current-cycle window retain local totals.
 - Run `--verify-credits` after changing any of this reconciliation behavior.
