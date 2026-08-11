@@ -16,6 +16,9 @@ final class UsageStore: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var status = SourcesStatus()
+    /// Server-authoritative overlay for the current billing cycle. The raw
+    /// `report` above always remains the local/classified report.
+    @Published private(set) var reconciled = ReconciledUsage.local(.empty)
 
     @Published var periodKind: PeriodKind { didSet { onPeriodChanged() } }
     @Published var customFrom: Date { didSet { if periodKind == .custom { recompute() } } }
@@ -43,6 +46,14 @@ final class UsageStore: ObservableObject {
     private var isSyncing = false        // reentrancy guard so overlapping syncNow calls don't interleave
     private var syncPushBlocked = false  // set after a permanent (403/401) failure; cleared on re-enable
 
+    /// Account-level credit counter (opt-in, independent from gist sync).
+    @Published private(set) var serverUsageEnabled = false
+    @Published private(set) var serverUsageSample: CreditSample?
+    @Published private(set) var serverUsageError: String?
+    private var creditSamples: [CreditSample] = []
+    private var serverUsageGeneration = 0
+    private var activeServerRefreshes: Set<Int> = []
+
     /// Text shown in the menu bar (the selected period's total cost).
     @Published private(set) var menuBarTitle: String = "—"
     /// Is the Copilot app recording telemetry right now? Drives the menu-bar
@@ -67,6 +78,8 @@ final class UsageStore: ObservableObject {
     private static let rateKey = "usdToAUDRate"
     private static let rateDateKey = "usdToAUDRateDate"
     private static let syncKey = "multiMachineSyncEnabled"
+    private static let serverUsageKey = "serverCreditUsageEnabled"
+    private static let serverUsageBaselineKey = "serverCreditUsageBaselineMs"
     /// Average days per month (365.25 / 12) — used to convert the monthly
     /// budget into a stable per-day rate for any selected range.
     private static let avgDaysPerMonth = 30.4375
@@ -89,6 +102,14 @@ final class UsageStore: ObservableObject {
         let now = Date()
         customTo = now
         customFrom = cal.date(from: cal.dateComponents([.year, .month], from: now)) ?? now
+
+        serverUsageEnabled = UserDefaults.standard.bool(forKey: Self.serverUsageKey)
+        if serverUsageEnabled,
+           let baseline = Int64(UserDefaults.standard.string(forKey: Self.serverUsageBaselineKey) ?? ""),
+           let latest = CreditSampleStore.latest(from: baseline) {
+            serverUsageSample = latest
+            creditSamples = CreditSampleStore.load(resetAtMs: latest.resetAtMs, from: baseline)
+        }
 
         Task { await reload() }
         Task { await refreshRate() }
@@ -143,8 +164,9 @@ final class UsageStore: ObservableObject {
         recompute()
         // Rotating support log (#24): load cost + what the reload actually computed
         // vs the menu title it set — also the #13 display-vs-data drift diagnostic.
-        DiagLog.write("reload: \(loadMs)ms · scanned \(DiagLog.humanBytes(status.jsonlBytesScanned)) · +\(status.newRecords) new · \(allRecords.count) cached · period \(periodKind.rawValue) · total \(Fmt.credits(report.totalCredits)) cr · menu \"\(menuBarTitle)\"")
+        DiagLog.write("reload: \(loadMs)ms · scanned \(DiagLog.humanBytes(status.jsonlBytesScanned)) · +\(status.newRecords) new · \(allRecords.count) cached · period \(periodKind.rawValue) · total \(Fmt.credits(reconciled.totalCredits)) cr · menu \"\(menuBarTitle)\"")
         if syncEnabled { Task { await self.syncNow() } }   // background push/pull
+        if serverUsageEnabled { Task { await self.refreshServerUsage() } }
     }
 
     // -----------------------------------------------------------------------
@@ -171,9 +193,17 @@ final class UsageStore: ObservableObject {
             report = Aggregator.build(
                 records: allRecords, fromStr: range.from, toStr: range.to, todayStr: today)
         }
+        reconciled = CreditReconciliation.build(
+            report: report,
+            records: allRecords,
+            periodKind: periodKind,
+            snapshot: serverUsageEnabled ? serverUsageSample : nil,
+            samples: creditSamples,
+            syncEnabled: syncEnabled
+        )
         // Prefix a warning glyph when telemetry has stopped: the menu-bar figure
         // is where the stale number is shown, so it's where the doubt belongs.
-        let cost = costString(credits: report.totalCredits)
+        let cost = costString(credits: reconciled.totalCredits)
         menuBarTitle = showExporterWarning ? "⚠︎ " + cost : cost
     }
 
@@ -267,6 +297,127 @@ final class UsageStore: ObservableObject {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Server-authoritative account usage (#33)
+    // -----------------------------------------------------------------------
+
+    /// Enable account usage with its own credential, then take the opening
+    /// baseline. Existing gist-sync authorization is deliberately unaffected.
+    func enableServerUsageWith(token: String) async -> Bool {
+        serverUsageGeneration += 1
+        CreditUsageKeychain.saveToken(token)
+        serverUsageSample = nil
+        creditSamples = []
+        UserDefaults.standard.removeObject(forKey: Self.serverUsageBaselineKey)
+        serverUsageEnabled = true
+        UserDefaults.standard.set(true, forKey: Self.serverUsageKey)
+        serverUsageError = nil
+        await refreshServerUsage()
+        guard serverUsageSample != nil && serverUsageError == nil else {
+            let error = serverUsageError
+            serverUsageGeneration += 1
+            serverUsageEnabled = false
+            UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
+            CreditUsageKeychain.deleteToken()
+            UserDefaults.standard.removeObject(forKey: Self.serverUsageBaselineKey)
+            creditSamples = []
+            serverUsageSample = nil
+            serverUsageError = error
+            recompute()
+            return false
+        }
+        return true
+    }
+
+    func disableServerUsage() {
+        serverUsageGeneration += 1
+        serverUsageEnabled = false
+        UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
+        CreditUsageKeychain.deleteToken()
+        serverUsageSample = nil
+        creditSamples = []
+        serverUsageError = nil
+        UserDefaults.standard.removeObject(forKey: Self.serverUsageBaselineKey)
+        recompute()
+    }
+
+    /// Fetch one cumulative counter observation. A failed request never writes a
+    /// zero or replaces the last good sample.
+    func refreshServerUsage() async {
+        let generation = serverUsageGeneration
+        guard serverUsageEnabled, !activeServerRefreshes.contains(generation) else { return }
+        guard let token = CreditUsageKeychain.token() else {
+            serverUsageError = "Authorization is missing. Reconnect GitHub Credit Total from the menu."
+            return
+        }
+        activeServerRefreshes.insert(generation)
+        defer { activeServerRefreshes.remove(generation) }
+        do {
+            let sample = try await CreditUsageAPI.fetch(token: token)
+            guard serverUsageEnabled, generation == serverUsageGeneration else { return }
+            if creditSamples.isEmpty {
+                UserDefaults.standard.set(String(sample.capturedAtMs), forKey: Self.serverUsageBaselineKey)
+            }
+            let saved = await Task.detached(priority: .utility) {
+                CreditSampleStore.save(sample)
+            }.value
+            guard serverUsageEnabled, generation == serverUsageGeneration else { return }
+            guard saved else {
+                serverUsageError = "The GitHub total was received but couldn’t be saved locally."
+                return
+            }
+            if serverUsageSample?.resetAtMs != sample.resetAtMs {
+                creditSamples = [sample]
+                UserDefaults.standard.set(String(sample.capturedAtMs), forKey: Self.serverUsageBaselineKey)
+            } else {
+                creditSamples.append(sample)
+            }
+            serverUsageSample = sample
+            serverUsageError = nil
+            recompute()
+        } catch {
+            guard serverUsageEnabled, generation == serverUsageGeneration else { return }
+            serverUsageError = Self.serverUsageErrorMessage(error)
+        }
+    }
+
+    private static func serverUsageErrorMessage(_ error: Error) -> String {
+        switch error as? CreditUsageError {
+        case .unauthorized:
+            return "GitHub authorization expired. Reconnect GitHub Credit Total from the menu."
+        case .forbidden:
+            return "This GitHub account can’t read its Copilot credit total."
+        case .invalidResponse:
+            return "GitHub returned an unsupported credit-total response."
+        default:
+            return "Can’t refresh the GitHub credit total right now; the last good sample is retained."
+        }
+    }
+
+    var displayTotalCredits: Double { reconciled.totalCredits }
+    var classifiedTotalCredits: Double { reconciled.classifiedCredits }
+    var sessionClassifiedTotalCredits: Double {
+        report.sessions.reduce(0) { $0 + $1.credits }
+    }
+    var unclassifiedCredits: Double { reconciled.unclassifiedCredits }
+    var summaryRows: [SummaryRow] { reconciled.summary }
+    var modelRows: [ModelRow] { reconciled.models }
+    var dailyRows: [DailyRow] { reconciled.daily }
+    var dailyUnallocatedCredits: Double { reconciled.unallocatedDailyCredits }
+
+    var serverUsageIsStale: Bool {
+        guard let sample = serverUsageSample else { return false }
+        return Date().timeIntervalSince(sample.capturedAt) > 5 * 60
+    }
+
+    var serverUsageStatusLabel: String {
+        guard serverUsageEnabled else { return "GitHub total · off" }
+        if serverUsageError != nil { return "GitHub total · error" }
+        if serverUsageSample == nil { return "GitHub total · connecting" }
+        if serverUsageIsStale { return "GitHub total · stale" }
+        return "GitHub total · live"
+    }
+
     private func onPeriodChanged() {
         UserDefaults.standard.set(periodKind.rawValue, forKey: Self.periodKey)
         recompute()
@@ -342,7 +493,10 @@ final class UsageStore: ObservableObject {
     /// Run-rate projection of full-month spend (nil unless viewing an in-progress
     /// month with usage). Pure + derived from the current report — see #18.
     var spendProjection: SpendProjection? {
-        SpendProjection.compute(periodKind: periodKind, report: report,
+        var displayReport = report
+        displayReport.totalCredits = reconciled.totalCredits
+        displayReport.todayCredits = reconciled.todayCredits
+        return SpendProjection.compute(periodKind: periodKind, report: displayReport,
                                 monthlyBudgetUSD: monthlyBudget, now: Date())
     }
 
@@ -358,12 +512,12 @@ final class UsageStore: ObservableObject {
     var sparklineTotals: [DayTotal] {
         // In sync mode the combined dailyTotals are UTC-keyed; the full-extent grid
         // keys by local day, so they wouldn't match — fall back to the raw series.
-        guard !syncEnabled, let (start, end) = sparklineExtent() else { return report.dailyTotals }
+        guard !syncEnabled, let (start, end) = sparklineExtent() else { return reconciled.dailyTotals }
         let cal = Calendar.current
         let days = (cal.dateComponents([.day], from: start, to: end).day ?? 0) + 1
-        guard days >= 1, days <= 45 else { return report.dailyTotals }
+        guard days >= 1, days <= 45 else { return reconciled.dailyTotals }
         var byDay: [String: Double] = [:]
-        for t in report.dailyTotals { byDay[t.day] = t.credits }
+        for t in reconciled.dailyTotals { byDay[t.day] = t.credits }
         var out: [DayTotal] = []
         var d = start
         for _ in 0..<days {

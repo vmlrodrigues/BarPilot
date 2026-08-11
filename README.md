@@ -12,8 +12,9 @@ full breakdown — summary, models, daily, sessions, and top calls.
 
 Written in **Swift / SwiftUI**, fully self-contained with **no external
 dependencies**: it reads your local GitHub Copilot OTel telemetry directly off
-disk — your usage data never leaves your machine. The only network access is
-checking GitHub for app updates and fetching the USD→AUD exchange rate.
+disk — your usage data never leaves your machine. Network access is limited to
+GitHub authentication and the optional account credit counter, app updates, and
+the USD→AUD exchange-rate fetch.
 
 ## What it shows
 
@@ -30,6 +31,10 @@ checking GitHub for app updates and fetching the USD→AUD exchange rate.
     displayed as "$150 / mo".
   - Tabs: **Summary** (by model), **Models** (with token breakdown), **Daily**,
     **Sessions**, **Top** (most expensive calls).
+  - Optional **GitHub Credit Total** (right-click menu): uses GitHub's current
+    billing-cycle counter as the headline total, keeps local telemetry for the
+    detailed breakdown, and shows any difference as **Unclassified** rather than
+    guessing which model or session used it.
   - Footer shows each data source's status — **green** = data flowing,
     **orange** = telemetry enabled but no traces yet, **grey** = telemetry not
     enabled. If either source's OTel telemetry isn't configured, a warning with
@@ -67,7 +72,7 @@ default, or AUD (100 credits = $1.00 USD).
 
 ## Data sources
 
-Both are read directly off disk, merged, and de-duplicated:
+The attribution sources are read directly off disk, merged, and de-duplicated:
 
 | Source | Format | Path |
 |---|---|---|
@@ -79,6 +84,12 @@ Both are read directly off disk, merged, and de-duplicated:
 A source is silently skipped if its file is absent. Credits = `nano_aiu / 1e9`;
 cost = `credits / 100` (100 credits = $1.00). Model names are normalised so
 `claude-sonnet-4-6` (VS Code) and `claude-sonnet-4.6` (Mac App) merge.
+
+When **GitHub Credit Total** is enabled, BarPilot also polls GitHub's authenticated
+account counter once a minute and stores cumulative samples locally. The endpoint
+is internal and unsupported, so failures retain the last good sample and local
+telemetry remains the fallback. The live counter is directly authoritative only
+for **This Month**; other selected ranges remain local.
 
 The JSONL file is large (100 MB+), so it's memory-mapped and scanned in a single
 pass — only the few hundred lines carrying a usage attribute are JSON-parsed.
@@ -123,6 +134,9 @@ Sources/BarPilot/
   Model.swift        Core types + formatting helpers
   Sources.swift      SQLite + memory-mapped JSONL loaders; telemetry detection
   Aggregator.swift   Date-range math, model normalisation, per-view rows
+  CreditUsage.swift  GitHub account-counter client + defensive response parser
+  CreditSamples.swift Persistent cumulative credit samples
+  CreditReconciliation.swift Server total + local attribution overlay
   DetailView.swift   Window UI: header, sparkline, budget bar, status footer
   Tabs.swift         Summary / Models / Daily / Sessions / Top tables
   Setup.swift        Native opt-in OTel telemetry enablement (the "Enable…" button)
@@ -158,8 +172,9 @@ If you truly see nothing, confirm it's running: `pgrep -lf BarPilot`.
   and rounded to a whole dollar when displaying AUD.
 - **Left-click** the menu-bar icon to open the usage window; **right-click** (or
   control-click) it for a menu with **Open Usage Window**, **Refresh Now**,
-  **Set Monthly Budget…**, **Currency**, **Start at Login**, **Check for Updates**,
-  and **Quit BarPilot**. (You can also quit from the button in the window footer.)
+  **Set Monthly Budget…**, **Currency**, **Start at Login**, **GitHub Credit
+  Total**, **Check for Updates**, and **Quit BarPilot**. (You can also quit from
+  the button in the window footer.)
 
 ## License
 

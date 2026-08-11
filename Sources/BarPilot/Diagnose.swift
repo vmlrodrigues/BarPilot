@@ -105,6 +105,16 @@ enum Diagnose {
         }
         line("")
 
+        line("GitHub credit total")
+        let creditOn = UserDefaults.standard.bool(forKey: "serverCreditUsageEnabled")
+        line("  enabled: \(creditOn)")
+        line("  saved samples: \(CreditSampleStore.count())")
+        if let sample = CreditSampleStore.latest() {
+            line("  latest sample: \(ISO8601DateFormatter().string(from: sample.capturedAt))")
+            line("  cycle reset:  \(ISO8601DateFormatter().string(from: sample.resetAt))")
+        }
+        line("")
+
         line("sync")
         let syncOn = UserDefaults.standard.bool(forKey: "multiMachineSyncEnabled")
         line("  enabled: \(syncOn)")

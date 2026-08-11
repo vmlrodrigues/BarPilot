@@ -1,0 +1,116 @@
+import Foundation
+
+// ---------------------------------------------------------------------------
+// CreditUsageAPI — account-level Copilot usage from GitHub's own counter.
+//
+// `/copilot_internal/user` is an internal endpoint used by GitHub clients. Its
+// schema is intentionally parsed defensively and every failure leaves the last
+// good local sample untouched.
+// ---------------------------------------------------------------------------
+
+enum CreditUsageError: Error {
+    case network
+    case unauthorized
+    case forbidden
+    case invalidResponse
+}
+
+struct CreditSample: Equatable {
+    let capturedAtMs: Int64
+    let serverAtMs: Int64?
+    let resetAtMs: Int64
+    let creditsUsed: Double
+
+    var capturedAt: Date { Date(timeIntervalSince1970: Double(capturedAtMs) / 1000) }
+    var resetAt: Date { Date(timeIntervalSince1970: Double(resetAtMs) / 1000) }
+}
+
+enum CreditUsageAPI {
+    static func fetch(token: String, now: Date = Date()) async throws -> CreditSample {
+        var req = URLRequest(url: URL(string: "https://api.github.com/copilot_internal/user")!)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+        req.setValue("BarPilot", forHTTPHeaderField: "User-Agent")
+        req.timeoutInterval = 30
+
+        let data: Data
+        let http: HTTPURLResponse
+        do {
+            let response = try await URLSession.shared.data(for: req)
+            data = response.0
+            guard let h = response.1 as? HTTPURLResponse else { throw CreditUsageError.network }
+            http = h
+        } catch let error as CreditUsageError {
+            throw error
+        } catch {
+            throw CreditUsageError.network
+        }
+
+        switch http.statusCode {
+        case 200: break
+        case 401: throw CreditUsageError.unauthorized
+        case 403: throw CreditUsageError.forbidden
+        default: throw CreditUsageError.network
+        }
+
+        return try parse(data: data, capturedAt: now)
+    }
+
+    static func parse(data: Data, capturedAt: Date) throws -> CreditSample {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let snapshots = root["quota_snapshots"] as? [String: Any],
+              let premium = snapshots["premium_interactions"] as? [String: Any],
+              let credits = number(premium["credits_used"]),
+              credits.isFinite, credits >= 0,
+              let reset = resetDate(root: root, premium: premium) else {
+            throw CreditUsageError.invalidResponse
+        }
+
+        let serverAt = (premium["timestamp_utc"] as? String).flatMap(parseISO)
+        return CreditSample(
+            capturedAtMs: Int64(capturedAt.timeIntervalSince1970 * 1000),
+            serverAtMs: serverAt.map { Int64($0.timeIntervalSince1970 * 1000) },
+            resetAtMs: Int64(reset.timeIntervalSince1970 * 1000),
+            creditsUsed: credits
+        )
+    }
+
+    private static func number(_ value: Any?) -> Double? {
+        if let n = value as? NSNumber { return n.doubleValue }
+        if let s = value as? String { return Double(s) }
+        return nil
+    }
+
+    private static func parseISO(_ value: String) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value) {
+            return date
+        }
+        let parts = value.split(separator: "-")
+        guard parts.count == 3,
+              let year = Int(parts[0]), let month = Int(parts[1]), let day = Int(parts[2]) else {
+            return nil
+        }
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        return utc.date(from: DateComponents(year: year, month: month, day: day))
+    }
+
+    private static func resetDate(root: [String: Any], premium: [String: Any]) -> Date? {
+        let values: [Any?] = [
+            root["quota_reset_date_utc"],
+            root["quota_reset_date"],
+            root["limited_user_reset_date"],
+            premium["quota_reset_at"]
+        ]
+        for value in values {
+            if let string = value as? String, let date = parseISO(string) { return date }
+            if let epoch = number(value), epoch > 0 {
+                return Date(timeIntervalSince1970: epoch > 10_000_000_000 ? epoch / 1000 : epoch)
+            }
+        }
+        return nil
+    }
+}

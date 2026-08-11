@@ -35,12 +35,17 @@ struct GitHubBackend: SyncBackend {
 
     // MARK: Device flow (no token yet)
 
-    static func requestDeviceCode() async throws -> DeviceCode {
+    static func requestDeviceCode(scope: String = "gist") async throws -> DeviceCode {
         var req = URLRequest(url: URL(string: "https://github.com/login/device/code")!)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Accept")
         req.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        req.httpBody = "client_id=\(clientId)&scope=gist".data(using: .utf8)
+        var form = URLComponents()
+        form.queryItems = [
+            URLQueryItem(name: "client_id", value: clientId),
+            URLQueryItem(name: "scope", value: scope)
+        ]
+        req.httpBody = form.percentEncodedQuery?.data(using: .utf8)
         guard let (data, resp) = try? await URLSession.shared.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

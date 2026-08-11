@@ -55,6 +55,7 @@ Other headless modes — run the relevant ones after touching their area:
 | `--verify-watchdog` | exporter-heartbeat rules: warn only when running-but-not-writing (#27) |
 | `--verify-projection` | spend-projection run-rate math + guards (#18) |
 | `--verify-sync` | sync aggregate reproduces the raw Models fit (#3) |
+| `--verify-credits` | server-counter parsing, reset boundaries, baselines, and unclassified-gap math (#33) |
 | `--sync-preview` | combined multi-machine view vs a simulated second machine |
 | `--diagnose` | support report: state, a timed load, recent reload log |
 
@@ -93,6 +94,19 @@ totals with `--dump` against a known-good capture. The rules:
   whose AIU is the sum of the child chat calls). Both are excluded — at parse time
   (`Sources.parseJSONLLine`) and again at cache-load (`SpanCache.load` filters out
   `op_name LIKE 'invoke_agent%'`), so historical cached rollups stop counting too.
+
+When **GitHub Credit Total** is enabled, a second invariant overlays this local
+report for the current UTC billing cycle:
+
+- `headline total = max(GitHub cumulative counter, locally classified credits)`.
+- `unclassified = max(0, GitHub counter - locally classified credits)`.
+- Unclassified credits are never distributed across known models, sessions, or
+  calls. Summary / Models show an explicit bucket; Sessions / Top remain local.
+- Counter samples are diffed only within the same reset cycle and only when the
+  counter does not decrease. The opening sample is a baseline, not today's usage.
+- Failed polls are not persisted as zero. The last good sample remains available,
+  and ranges outside the provable current-cycle window retain local totals.
+- Run `--verify-credits` after changing any of this reconciliation behavior.
 
 ## Data sources (read-only, both off the main actor)
 
@@ -135,6 +149,9 @@ Sources/BarPilot/
   Model.swift        Core types (UsageRecord, Report, *Row, PeriodKind) + Fmt.
   Sources.swift      DataSources — SQLite + mmap'd JSONL loaders; telemetry detect.
   Aggregator.swift   Aggregator + PeriodResolver — date-range & bucketing math.
+  CreditUsage.swift  Defensive `/copilot_internal/user` client + response model.
+  CreditSamples.swift  SQLite persistence for cumulative account-counter samples.
+  CreditReconciliation.swift  Pure server-total/local-attribution overlay.
   Dump.swift         Dump.run() — the --dump output path.
   DetailView.swift   Window UI: header, sparkline, budget bar.
   Tabs.swift         Summary / Models / Daily / Sessions / Top tables.
@@ -152,9 +169,10 @@ build-app.sh         Build + assemble + ad-hoc codesign the .app.
 ```
 
 Data flow: `DataSources.loadAll()` (off-actor) → `UsageStore.allRecords` (cached
-raw) → `Aggregator.build(...)` on every period change → `Report` → SwiftUI views.
-Changing the period only re-aggregates cached records (instant); only the timer /
-refresh / window-open re-reads disk.
+raw) → `Aggregator.build(...)` on every period change → local `Report` →
+`CreditReconciliation.build(...)` → SwiftUI views. The reconciliation overlay
+never mutates local aggregation. Changing the period only re-aggregates cached
+records (instant); only the timer / refresh / window-open re-reads disk.
 
 ## Design decisions — don't casually revert these (all user-chosen)
 
@@ -164,6 +182,10 @@ refresh / window-open re-reads disk.
   `visibleFrame` on each open so it never spills over the top.
 - **Left-click** opens the window; **right-click / control-click** shows the menu
   (Open / Refresh / Set Monthly Budget… / Quit).
+- **GitHub Credit Total is opt-in and separately authorized from gist sync.**
+  It polls GitHub's internal account endpoint every 60 seconds and stores samples
+  in the local span-cache database. The credentials use separate Keychain entries,
+  so disabling one feature cannot silently disable the other. (#33)
 - **Budget = one editable monthly USD figure** (`monthlyBudgetUSD`, default $150
   ≈ $5/day), pro-rated to a per-day rate via `avgDaysPerMonth = 30.4375` and
   multiplied by the selected range's days. Edited via an NSAlert from the

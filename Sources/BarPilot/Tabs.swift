@@ -66,11 +66,41 @@ private struct TableScaffold<Header: View, Row: View, Footer: View>: View {
 
 @MainActor
 private func totalFooter(_ credits: Double, _ store: UsageStore) -> some View {
+    totalFooter(credits, store, label: "Total")
+}
+
+@MainActor
+private func totalFooter(_ credits: Double, _ store: UsageStore, label: String) -> some View {
     HStack {
-        Text("Total").fontWeight(.semibold)
+        Text(label).fontWeight(.semibold)
         Spacer()
         Text("\(Fmt.credits(credits)) credits").monospacedDigit()
         Text(store.costString(credits: credits)).monospacedDigit().fontWeight(.semibold)
+    }
+}
+
+private struct UnclassifiedLabel: View {
+    @State private var showingInfo = false
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Text(CreditReconciliation.unclassifiedLabel)
+            Button { showingInfo.toggle() } label: {
+                Image(systemName: "info.circle").font(.caption2).foregroundStyle(.blue)
+            }
+            .buttonStyle(.borderless)
+            .popover(isPresented: $showingInfo) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Unclassified credits").font(.caption.weight(.semibold))
+                    Text("GitHub’s account total is higher than the usage BarPilot can attribute from local telemetry. The difference can come from omitted local spans, other clients or devices, server-only Copilot surfaces, or reporting lag.")
+                        .foregroundStyle(.secondary)
+                    Text("BarPilot keeps the difference separate rather than guessing which model, session, or call used it.")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.caption).padding().frame(width: 290)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }
 
@@ -94,13 +124,17 @@ struct SummaryTab: View {
         } row: { i in
             let r = rows[i]
             HStack {
-                Text(r.model).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
-                Text(Fmt.int(r.calls)).numCol(60)
+                Group {
+                    if r.model == CreditReconciliation.unclassifiedLabel { UnclassifiedLabel() }
+                    else { Text(r.model) }
+                }
+                .font(.callout).frame(maxWidth: .infinity, alignment: .leading)
+                Text(r.model == CreditReconciliation.unclassifiedLabel ? "—" : Fmt.int(r.calls)).numCol(60)
                 Text(Fmt.credits(r.credits)).numCol(95)
                 Text(store.costString(credits: r.credits)).numCol(70)
             }
         } footer: {
-            totalFooter(total, store)
+            totalFooter(total, store, label: store.reconciled.isCurrentCycle ? "Total (GitHub)" : "Total")
         }
     }
 }
@@ -193,14 +227,14 @@ struct ModelsTab: View {
     @ViewBuilder
     private func numericCells(calls: Int, credits: Double, inTok: Int, outTok: Int,
                               inRate: Double, outRate: Double, fit: Double,
-                              weight: Font.Weight? = nil) -> some View {
-        Text(Fmt.int(calls)).numCol(40).fontWeight(weight)
+                              weight: Font.Weight? = nil, unclassified: Bool = false) -> some View {
+        Text(unclassified ? "—" : Fmt.int(calls)).numCol(40).fontWeight(weight)
         Text(Fmt.credits(credits)).numCol(64).fontWeight(weight)
-        Text(Fmt.tokens(inTok)).numCol(50).fontWeight(weight)
-        Text(Fmt.tokens(outTok)).numCol(52).fontWeight(weight)
-        Text(inRate.isNaN ? "—" : store.costString(credits: inRate * 1_000_000)).numCol(58).fontWeight(weight)
-        Text(outRate.isNaN ? "—" : store.costString(credits: outRate * 1_000_000)).numCol(60).fontWeight(weight)
-        Text(fit.isNaN ? "—" : String(format: "%.0f%%", fit * 100)).numCol(54).fontWeight(weight)
+        Text(unclassified ? "—" : Fmt.tokens(inTok)).numCol(50).fontWeight(weight)
+        Text(unclassified ? "—" : Fmt.tokens(outTok)).numCol(52).fontWeight(weight)
+        Text(unclassified || inRate.isNaN ? "—" : store.costString(credits: inRate * 1_000_000)).numCol(58).fontWeight(weight)
+        Text(unclassified || outRate.isNaN ? "—" : store.costString(credits: outRate * 1_000_000)).numCol(60).fontWeight(weight)
+        Text(unclassified || fit.isNaN ? "—" : String(format: "%.0f%%", fit * 100)).numCol(54).fontWeight(weight)
     }
 
     var body: some View {
@@ -247,14 +281,19 @@ struct ModelsTab: View {
             case .flat(let r):
                 HStack {
                     HStack(spacing: 0) {
-                        Text(r.model).font(.callout).lineLimit(1).truncationMode(.tail).help(r.model)
-                        if let lvl = r.levels.first?.level {
+                        if r.model == CreditReconciliation.unclassifiedLabel {
+                            UnclassifiedLabel()
+                        } else {
+                            Text(r.model).font(.callout).lineLimit(1).truncationMode(.tail).help(r.model)
+                        }
+                        if r.model != CreditReconciliation.unclassifiedLabel, let lvl = r.levels.first?.level {
                             levelChip(lvl).padding(.leading, 6).layoutPriority(1)
                         }
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     numericCells(calls: r.calls, credits: r.credits, inTok: r.inputTokens,
-                                 outTok: r.outputTokens, inRate: r.inRate, outRate: r.outRate, fit: r.fit)
+                                 outTok: r.outputTokens, inRate: r.inRate, outRate: r.outRate, fit: r.fit,
+                                 unclassified: r.model == CreditReconciliation.unclassifiedLabel)
                 }
             case .group(let r):
                 HStack {
@@ -278,7 +317,7 @@ struct ModelsTab: View {
                 .foregroundStyle(.secondary)
             }
         } footer: {
-            totalFooter(total, store)
+            totalFooter(total, store, label: store.reconciled.isCurrentCycle ? "Total (GitHub)" : "Total")
         }
     }
 }
@@ -291,6 +330,7 @@ struct DailyTab: View {
     @EnvironmentObject var store: UsageStore
     let rows: [DailyRow]
     let total: Double
+    let unallocatedCredits: Double
     @State private var sortAscending = false
 
     private enum DailyItem: Identifiable {
@@ -350,8 +390,12 @@ struct DailyTab: View {
             case .detail(let r):
                 HStack {
                     Text(r.day).font(.callout).monospacedDigit().frame(width: 95, alignment: .leading)
-                    Text(r.model).font(.callout).frame(maxWidth: .infinity, alignment: .leading)
-                    Text(Fmt.int(r.calls)).numCol(55)
+                    Group {
+                        if r.model == CreditReconciliation.unclassifiedLabel { UnclassifiedLabel() }
+                        else { Text(r.model) }
+                    }
+                    .font(.callout).frame(maxWidth: .infinity, alignment: .leading)
+                    Text(r.model == CreditReconciliation.unclassifiedLabel ? "—" : Fmt.int(r.calls)).numCol(55)
                     Text(Fmt.credits(r.credits)).numCol(80)
                     Text(store.costString(credits: r.credits)).numCol(70)
                 }
@@ -365,7 +409,14 @@ struct DailyTab: View {
                 }
             }
         } footer: {
-            totalFooter(total, store)
+            VStack(spacing: 4) {
+                if unallocatedCredits > 0 {
+                    Text("\(Fmt.credits(unallocatedCredits)) unclassified credits predate daily server tracking and can’t be assigned to a day.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                totalFooter(total, store, label: store.reconciled.isCurrentCycle ? "Total (GitHub)" : "Total")
+            }
         }
     }
 }
@@ -444,7 +495,12 @@ struct SessionsTab: View {
                 Text(store.costString(credits: r.credits)).numCol(65)
             }
         } footer: {
-            totalFooter(total, store)
+            VStack(spacing: 4) {
+                Text("Local classified sessions only; unclassified credits can’t be assigned to a session.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                totalFooter(total, store, label: "Classified total")
+            }
         }
     }
 }
@@ -507,7 +563,7 @@ struct TopTab: View {
             }
         } footer: {
             HStack {
-                Text("Showing top \(rows.count) calls")
+                Text("Showing top \(rows.count) local classified calls; unclassified credits can’t be assigned to a call.")
                     .font(.caption).foregroundStyle(.secondary)
                 Spacer()
             }

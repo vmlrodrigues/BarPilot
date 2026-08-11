@@ -11,6 +11,7 @@ struct DetailView: View {
     @EnvironmentObject var store: UsageStore
     @State private var showingUTCInfo = false
     @State private var showingSyncInfo = false
+    @State private var showingCreditInfo = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -19,7 +20,7 @@ struct DetailView: View {
             Divider()
             BudgetBar(
                 title: store.spendTitle,
-                spentCredits: store.report.totalCredits,
+                spentCredits: store.displayTotalCredits,
                 budgetCredits: store.periodBudgetCredits,
                 monthlyBudget: store.monthlyBudget
             )
@@ -117,10 +118,10 @@ struct DetailView: View {
                         .font(.title3)
                         .foregroundStyle(.secondary)
                 } else {
-                    Text(store.costString(credits: store.report.totalCredits))
+                    Text(store.costString(credits: store.displayTotalCredits))
                         .font(.system(size: 34, weight: .bold, design: .rounded))
                         .monospacedDigit()
-                    Text("\(Fmt.credits(store.report.totalCredits)) credits")
+                    Text("\(Fmt.credits(store.displayTotalCredits)) credits")
                         .font(.title3)
                         .foregroundStyle(.secondary)
                 }
@@ -138,13 +139,14 @@ struct DetailView: View {
 
     private var tabs: some View {
         TabView {
-            SummaryTab(rows: store.report.summary, total: store.report.totalCredits)
+            SummaryTab(rows: store.summaryRows, total: store.displayTotalCredits)
                 .tabItem { Text("Summary") }
-            ModelsTab(rows: store.report.models, total: store.report.totalCredits)
+            ModelsTab(rows: store.modelRows, total: store.displayTotalCredits)
                 .tabItem { Text("Models") }
-            DailyTab(rows: store.report.daily, total: store.report.totalCredits)
+            DailyTab(rows: store.dailyRows, total: store.displayTotalCredits,
+                     unallocatedCredits: store.dailyUnallocatedCredits)
                 .tabItem { Text("Daily") }
-            SessionsTab(rows: store.report.sessions, total: store.report.totalCredits)
+            SessionsTab(rows: store.report.sessions, total: store.sessionClassifiedTotalCredits)
                 .tabItem { Text("Sessions") }
             TopTab(rows: store.report.top)
                 .tabItem { Text("Top") }
@@ -195,6 +197,42 @@ struct DetailView: View {
                             configured: store.status.vscodeConfigured, count: store.status.vscodeCount)
                 sourceBadge("Mac App", found: store.status.macAppFound,
                             configured: store.status.macAppConfigured, count: store.status.macAppCount)
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(creditStatusColor)
+                        .frame(width: 7, height: 7)
+                    Text(store.serverUsageStatusLabel)
+                        .font(.caption2)
+                        .foregroundStyle(store.serverUsageError == nil ? Color.secondary : Color.red)
+                        .fixedSize()
+                    Button { showingCreditInfo.toggle() } label: {
+                        Image(systemName: "info.circle").font(.caption2).foregroundStyle(.blue)
+                    }
+                    .buttonStyle(.borderless)
+                    .popover(isPresented: $showingCreditInfo) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("GitHub credit total").font(.caption.weight(.semibold))
+                            if !store.serverUsageEnabled {
+                                Text("Off. Enable **GitHub Credit Total** from the right-click menu to reconcile local attribution with GitHub’s account counter.")
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                if let error = store.serverUsageError {
+                                    Text(error).foregroundStyle(.red)
+                                }
+                                if let sample = store.serverUsageSample {
+                                    Text("Last sample: **\(Fmt.dateTime(sample.capturedAtMs))**")
+                                    Text("Billing-cycle reset: **\(Fmt.dateTime(sample.resetAtMs))**")
+                                } else if store.serverUsageError == nil {
+                                    Text("Waiting for the first sample…").foregroundStyle(.secondary)
+                                }
+                                Text("For This Month, GitHub supplies the headline total while local telemetry supplies model and session detail. Other ranges remain local unless enough server samples exist to reconstruct them.")
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .font(.caption).padding().frame(width: 300)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
                 if store.syncEnabled {
                     let hasError = store.syncError != nil
                     HStack(spacing: 4) {
@@ -305,6 +343,13 @@ struct DetailView: View {
             Text(label).font(.caption2).foregroundStyle(.secondary)
         }
         .help(help)
+    }
+
+    private var creditStatusColor: Color {
+        guard store.serverUsageEnabled else { return Color.secondary.opacity(0.4) }
+        if store.serverUsageError != nil { return .red }
+        if store.serverUsageSample == nil || store.serverUsageIsStale { return .orange }
+        return .green
     }
 }
 
