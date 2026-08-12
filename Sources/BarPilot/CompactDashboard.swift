@@ -303,15 +303,20 @@ private struct CompactBudgetBar: View {
         let spent = store.compactTotalCredits
         let budget = store.monthlyBudget * 100
         let projection = store.compactSpendProjection
-        let maximum = max(budget * 1.2, spent, projection?.projectedCredits ?? 0, 1)
-        let over = budget > 0 && spent > budget
+        let hasBudget = budget > 0
+        let maximum = hasBudget
+            ? budget
+            : max(spent, projection?.projectedCredits ?? 0, 1)
+        let over = hasBudget && spent > budget
 
         VStack(alignment: .leading, spacing: 7) {
             HStack {
                 Text("This month’s spend")
                     .font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("\(store.budgetMoneyString(usd: store.monthlyBudget)) budget")
+                Text(hasBudget
+                     ? "\(store.budgetMoneyString(usd: store.monthlyBudget)) budget"
+                     : "No budget set")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -328,7 +333,7 @@ private struct CompactBudgetBar: View {
                     Capsule()
                         .fill(over ? Color.red : Color.green)
                         .frame(width: width * min(spent / maximum, 1))
-                    if budget > 0 {
+                    if hasBudget {
                         Rectangle()
                             .fill(Color.orange)
                             .frame(width: 2, height: 18)

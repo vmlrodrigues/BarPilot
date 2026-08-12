@@ -230,7 +230,9 @@ overlay never mutates local aggregation.
 - **Budget = one editable monthly USD figure** (`monthlyBudgetUSD`, default $150
   ≈ $5/day), pro-rated to a per-day rate via `avgDaysPerMonth = 30.4375` and
   multiplied by the selected range's days. Edited via an NSAlert from the
-  right-click menu (not an inline field); shown read-only as "$150 / mo".
+  right-click menu (not an inline field); shown read-only as "$150 / mo". In the
+  compact bar, full width is exactly 100% of budget; projected/current fills cap
+  at the boundary while their labels retain actual over-budget values.
 - **Telemetry setup is opt-in and user-confirmed.** Detection is read-only; if a
   source isn't configured, the footer shows a warning + an **Enable…** button
   → confirm dialog → native config (patch VS Code `settings.json`; write a helper

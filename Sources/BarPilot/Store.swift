@@ -98,8 +98,11 @@ final class UsageStore: ObservableObject {
         let saved = UserDefaults.standard.string(forKey: Self.periodKey)
         periodKind = PeriodKind(rawValue: saved ?? "") ?? .thisMonth
 
-        let storedBudget = UserDefaults.standard.double(forKey: Self.budgetKey)
-        monthlyBudget = storedBudget > 0 ? storedBudget : 150  // ≈ $5/day default
+        if UserDefaults.standard.object(forKey: Self.budgetKey) != nil {
+            monthlyBudget = max(0, UserDefaults.standard.double(forKey: Self.budgetKey))
+        } else {
+            monthlyBudget = 150  // ≈ $5/day default
+        }
 
         displayCurrency = Currency(rawValue: UserDefaults.standard.string(forKey: Self.currencyKey) ?? "") ?? .usd
         let cachedRate = UserDefaults.standard.double(forKey: Self.rateKey)
