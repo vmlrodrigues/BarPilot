@@ -298,6 +298,7 @@ struct CompactDashboard: View {
 
 private struct CompactBudgetBar: View {
     @EnvironmentObject var store: UsageStore
+    private let budgetMarkerFraction = 0.70
 
     var body: some View {
         let spent = store.compactTotalCredits
@@ -305,7 +306,7 @@ private struct CompactBudgetBar: View {
         let projection = store.compactSpendProjection
         let hasBudget = budget > 0
         let maximum = hasBudget
-            ? budget
+            ? budget / budgetMarkerFraction
             : max(spent, projection?.projectedCredits ?? 0, 1)
         let over = hasBudget && spent > budget
 
@@ -337,7 +338,7 @@ private struct CompactBudgetBar: View {
                         Rectangle()
                             .fill(Color.orange)
                             .frame(width: 2, height: 18)
-                            .offset(x: width * min(budget / maximum, 1) - 1)
+                            .offset(x: width * budgetMarkerFraction - 1)
                     }
                 }
             }

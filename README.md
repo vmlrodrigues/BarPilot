@@ -29,9 +29,9 @@ optional private-gist sync, app updates, and the USD→AUD exchange-rate fetch.
   - **Monthly budget bar:** set one USD budget from the menu-bar icon's
     right-click menu → **Set Monthly Budget…**. The bar shows current spend,
     projected month-end spend, and the budget marker. Its label uses the selected
-    display currency while calculations remain canonical in USD. The full bar is
-    100% of budget; over-budget fills stop at that boundary while the label retains
-    the actual projection.
+    display currency while calculations remain canonical in USD. The 100% budget
+    marker sits at 70% of the track, leaving visible room to measure projections
+    up to roughly 143% of budget.
   - A temporary **legacy telemetry** view retains Summary, Models, Daily,
     Sessions, and Top during the transition. It is explicitly marked incomplete
     and scheduled for removal.

@@ -231,8 +231,9 @@ overlay never mutates local aggregation.
   ≈ $5/day), pro-rated to a per-day rate via `avgDaysPerMonth = 30.4375` and
   multiplied by the selected range's days. Edited via an NSAlert from the
   right-click menu (not an inline field); shown read-only as "$150 / mo". In the
-  compact bar, full width is exactly 100% of budget; projected/current fills cap
-  at the boundary while their labels retain actual over-budget values.
+  compact bar, the 100% budget marker is fixed at 70% of the track, leaving the
+  final 30% to visualize projections up to about 143% of budget. Fill widths and
+  the marker use that same fixed scale; labels retain actual over-budget values.
 - **Telemetry setup is opt-in and user-confirmed.** Detection is read-only; if a
   source isn't configured, the footer shows a warning + an **Enable…** button
   → confirm dialog → native config (patch VS Code `settings.json`; write a helper
