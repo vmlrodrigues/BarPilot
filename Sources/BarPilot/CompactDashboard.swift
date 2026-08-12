@@ -311,7 +311,7 @@ private struct CompactBudgetBar: View {
                 Text("This month’s spend")
                     .font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("\(store.usdCostString(credits: budget)) budget")
+                Text("\(store.budgetMoneyString(usd: store.monthlyBudget)) budget")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

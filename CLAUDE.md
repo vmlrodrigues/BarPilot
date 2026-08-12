@@ -212,6 +212,9 @@ overlay never mutates local aggregation.
   observed counter deltas. Long gaps within one UTC day can be assigned safely;
   unsampled growth crossing a UTC day boundary remains unallocated. The telemetry
   tabs remain temporarily accessible behind a deprecated legacy-view control. (#34)
+- **The menu-bar figure warns when GitHub is not authoritative.** Reuse the
+  existing warning glyph while disconnected, reconnect-required, stale, or in
+  error; the amount remains the local fallback rather than disappearing.
 - **Multi-machine sync uses schema v2 counter observations.** Each Mac publishes
   only its first locally captured observation in each 15-minute UTC bucket. Pulled
   samples stay in the separate remote store and are

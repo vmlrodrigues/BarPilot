@@ -18,7 +18,9 @@ optional private-gist sync, app updates, and the USD→AUD exchange-rate fetch.
 
 ## What it shows
 
-- **Menu bar:** `$ <total cost>` for the current month, always visible.
+- **Menu bar:** `$ <total cost>` for the current month, always visible. A warning
+  glyph indicates that GitHub is disconnected, stale, or unavailable and the
+  displayed figure may be the incomplete local fallback.
 - **Detail window** (click the menu-bar item):
   - Current billing-cycle credits and their value in both USD and AUD.
   - A daily credit-usage bar chart built from persisted GitHub samples.
@@ -26,7 +28,8 @@ optional private-gist sync, app updates, and the USD→AUD exchange-rate fetch.
     UTC day boundary remain separate rather than being assigned without evidence.
   - **Monthly budget bar:** set one USD budget from the menu-bar icon's
     right-click menu → **Set Monthly Budget…**. The bar shows current spend,
-    projected month-end spend, and the budget marker in both USD and AUD.
+    projected month-end spend, and the budget marker. Its label uses the selected
+    display currency while calculations remain canonical in USD.
   - A temporary **legacy telemetry** view retains Summary, Models, Daily,
     Sessions, and Top during the transition. It is explicitly marked incomplete
     and scheduled for removal.

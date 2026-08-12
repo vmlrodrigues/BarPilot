@@ -227,10 +227,13 @@ final class UsageStore: ObservableObject {
             periodKind: periodKind,
             snapshot: serverUsageEnabled ? serverUsageSample : nil,
         )
-        // Prefix a warning glyph when telemetry has stopped: the menu-bar figure
-        // is where the stale number is shown, so it's where the doubt belongs.
+        // The menu-bar figure must signal when it is a local fallback rather than
+        // the authoritative GitHub total. Reuse the existing warning glyph.
         let cost = costString(credits: compactTotalCredits)
-        menuBarTitle = showExporterWarning ? "⚠︎ " + cost : cost
+        let needsWarning = !serverUsageEnabled || serverUsageError != nil
+            || currentServerUsageSample == nil || serverUsageIsStale
+            || showExporterWarning
+        menuBarTitle = needsWarning ? "⚠︎ " + cost : cost
     }
 
     /// Other machines' payloads from the last successful pull. Excludes this
@@ -455,6 +458,7 @@ final class UsageStore: ObservableObject {
                 guard let fingerprint = await CreditUsageAPI.accountFingerprint(token: token) else {
                     guard serverUsageEnabled, generation == serverUsageGeneration else { return }
                     serverUsageError = "GitHub authenticated, but BarPilot couldn’t verify the account for safe multi-Mac history."
+                    recompute()
                     return
                 }
                 guard serverUsageEnabled, generation == serverUsageGeneration else { return }
@@ -470,6 +474,7 @@ final class UsageStore: ObservableObject {
             guard serverUsageEnabled, generation == serverUsageGeneration else { return }
             guard saved else {
                 serverUsageError = "The GitHub total was received but couldn’t be saved locally."
+                recompute()
                 return
             }
             if serverUsageSample?.resetAtMs != sample.resetAtMs {
@@ -489,8 +494,8 @@ final class UsageStore: ObservableObject {
                 UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
                 UserDefaults.standard.set(true, forKey: Self.serverUsageDisconnectedKey)
                 _ = CreditUsageKeychain.deleteToken()
-                recompute()
             }
+            recompute()
         }
     }
 
