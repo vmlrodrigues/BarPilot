@@ -625,6 +625,10 @@ final class UsageStore: ObservableObject {
         return String(format: "A$%.2f", credits / 100 * usdToAUD)
     }
 
+    func displayCostString(credits: Double) -> String {
+        costString(credits: credits)
+    }
+
     /// Cost from a USD amount, 2 dp, in the display currency.
     func costString(usd: Double) -> String {
         effectiveCurrency.symbol + String(format: "%.2f", toDisplay(usd))

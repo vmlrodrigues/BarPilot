@@ -352,7 +352,7 @@ private struct CompactBudgetBar: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 if let projection {
-                    Text("Projected \(store.usdCostString(credits: projection.projectedCredits))")
+                    Text("Projected \(store.displayCostString(credits: projection.projectedCredits))")
                         .foregroundStyle(projection.overBudget ? Color.red : Color.secondary)
                 }
             }

@@ -233,7 +233,8 @@ overlay never mutates local aggregation.
   right-click menu (not an inline field); shown read-only as "$150 / mo". In the
   compact bar, the 100% budget marker is fixed at 70% of the track, leaving the
   final 30% to visualize projections up to about 143% of budget. Fill widths and
-  the marker use that same fixed scale; labels retain actual over-budget values.
+  the marker use that same fixed scale; budget and projection labels use the
+  selected display currency and retain actual over-budget values.
 - **Telemetry setup is opt-in and user-confirmed.** Detection is read-only; if a
   source isn't configured, the footer shows a warning + an **Enable…** button
   → confirm dialog → native config (patch VS Code `settings.json`; write a helper

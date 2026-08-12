@@ -31,7 +31,8 @@ optional private-gist sync, app updates, and the USD→AUD exchange-rate fetch.
     projected month-end spend, and the budget marker. Its label uses the selected
     display currency while calculations remain canonical in USD. The 100% budget
     marker sits at 70% of the track, leaving visible room to measure projections
-    up to roughly 143% of budget.
+    up to roughly 143% of budget. Budget and projected-spend labels always use the
+    same currency so their difference matches the chart.
   - A temporary **legacy telemetry** view retains Summary, Models, Daily,
     Sessions, and Top during the transition. It is explicitly marked incomplete
     and scheduled for removal.
