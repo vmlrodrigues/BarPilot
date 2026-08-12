@@ -106,8 +106,8 @@ totals with `--dump` against a known-good capture. The rules:
   (`Sources.parseJSONLLine`) and again at cache-load (`SpanCache.load` filters out
   `op_name LIKE 'invoke_agent%'`), so historical cached rollups stop counting too.
 
-When **GitHub Credit Total** is enabled, a second invariant overlays this local
-report for the current UTC billing cycle:
+When GitHub is connected, a second invariant overlays this local report for the
+current UTC billing cycle:
 
 - `headline total = max(GitHub cumulative counter, locally classified credits)`.
 - `unclassified = max(0, GitHub counter - locally classified credits)`.
@@ -200,10 +200,13 @@ overlay never mutates local aggregation.
   `visibleFrame` on each open so it never spills over the top.
 - **Left-click** opens the window; **right-click / control-click** shows the menu
   (Open / Refresh / Set Monthly Budget… / Quit).
-- **GitHub Credit Total is opt-in and separately authorized from gist sync.**
-  It polls GitHub's internal account endpoint every 60 seconds and stores samples
-  in the local span-cache database. The credentials use separate Keychain entries,
-  so disabling one feature cannot silently disable the other. (#33)
+- **GitHub connection is the primary dashboard setup state and is separately
+  authorized from gist sync.** A disconnected window shows a **Connect GitHub**
+  CTA; there is no unsolicited startup prompt. The right-click menu exposes
+  Connect/Disconnect as a secondary account action. It polls GitHub's internal
+  account endpoint every 60 seconds and stores samples in the local span-cache
+  database. The credentials use separate Keychain entries, so disconnecting one
+  feature cannot silently disable the other. (#33)
 - **The primary UI is server-first and current-cycle only.** It shows credits,
   USD + AUD, monthly budget progress, a daily usage bar chart, and daily
   observed counter deltas. Long gaps within one UTC day can be assigned safely;

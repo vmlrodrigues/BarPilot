@@ -47,10 +47,11 @@ final class UsageStore: ObservableObject {
     private var isSyncing = false        // reentrancy guard so overlapping syncNow calls don't interleave
     private var syncPushBlocked = false  // set after a permanent (403/401) failure; cleared on re-enable
 
-    /// Account-level credit counter (opt-in, independent from gist sync).
+    /// Primary account-level credit connection, independent from gist sync.
     @Published private(set) var serverUsageEnabled = false
     @Published private(set) var serverUsageSample: CreditSample?
     @Published private(set) var serverUsageError: String?
+    @Published private(set) var isConnectingServerUsage = false
     private var creditSamples: [CreditSample] = []
     private var serverUsageAccountFingerprint: String?
     private var serverUsageGeneration = 0
@@ -81,6 +82,7 @@ final class UsageStore: ObservableObject {
     private static let rateDateKey = "usdToAUDRateDate"
     private static let syncKey = "multiMachineSyncEnabled"
     private static let serverUsageKey = "serverCreditUsageEnabled"
+    private static let serverUsageDisconnectedKey = "serverCreditUsageExplicitlyDisconnected"
     private static let serverUsageBaselineKey = "serverCreditUsageBaselineMs"
     private static let serverUsageAccountKey = "serverCreditUsageAccountFingerprint"
     private static let utcCalendar: Calendar = {
@@ -111,10 +113,15 @@ final class UsageStore: ObservableObject {
         customTo = now
         customFrom = cal.date(from: cal.dateComponents([.year, .month], from: now)) ?? now
 
-        serverUsageEnabled = UserDefaults.standard.bool(forKey: Self.serverUsageKey)
+        // Connection is credential-driven, not an optional feature toggle. A
+        // disconnected install presents its setup CTA in the primary dashboard.
+        let explicitlyDisconnected = UserDefaults.standard.bool(
+            forKey: Self.serverUsageDisconnectedKey
+        )
+        serverUsageEnabled = !explicitlyDisconnected && CreditUsageKeychain.token() != nil
+        UserDefaults.standard.set(serverUsageEnabled, forKey: Self.serverUsageKey)
         serverUsageAccountFingerprint = UserDefaults.standard.string(forKey: Self.serverUsageAccountKey)
-        if serverUsageEnabled,
-           let baseline = Int64(UserDefaults.standard.string(forKey: Self.serverUsageBaselineKey) ?? ""),
+        if let baseline = Int64(UserDefaults.standard.string(forKey: Self.serverUsageBaselineKey) ?? ""),
            let latest = CreditSampleStore.latest(from: baseline) {
             serverUsageSample = latest
             creditSamples = CreditSampleStore.load(resetAtMs: latest.resetAtMs, from: baseline)
@@ -249,7 +256,10 @@ final class UsageStore: ObservableObject {
     /// Turn sync on with a freshly-obtained token: persist it, enable, and do an
     /// initial push + pull. Returns the machine count now contributing.
     func enableSyncWith(token: String) async -> Int {
-        Keychain.saveToken(token)
+        guard Keychain.saveToken(token) else {
+            syncError = "The sync credential couldn’t be saved securely."
+            return syncMachineCount
+        }
         syncPushBlocked = false; syncError = nil   // fresh start (clears a prior permanent-error block)
         syncLogin = await GitHubBackend(token: token).currentLogin()   // show which account
         syncEnabled = true          // didSet persists + recomputes (local only until pull lands)
@@ -261,10 +271,12 @@ final class UsageStore: ObservableObject {
     /// the token removed. Does NOT delete the remote gist (offered separately).
     func disableSync() {
         syncEnabled = false         // didSet persists + recomputes (back to local-only)
-        Keychain.deleteToken()
+        let removed = Keychain.deleteToken()
         RemoteStore.clear()
         syncLogin = nil
-        syncError = nil
+        syncError = removed
+            ? nil
+            : "Sync is off, but macOS couldn’t remove its saved credential."
         syncPushBlocked = false
         UserDefaults.standard.removeObject(forKey: Self.pushFPKey)
     }
@@ -272,7 +284,8 @@ final class UsageStore: ObservableObject {
     /// Push this machine's payload (only if it changed) and pull the others
     /// into the RemoteStore, then recompute. Safe no-op when off / no token.
     func syncNow(force: Bool = false) async {
-        guard syncEnabled, !isSyncing, let token = Keychain.token() else { return }   // reentrancy guard
+        guard syncEnabled, !isSyncing, !isConnectingServerUsage,
+              let token = Keychain.token() else { return }
         isSyncing = true
         defer { isSyncing = false }
         let backend = GitHubBackend(token: token)
@@ -333,32 +346,68 @@ final class UsageStore: ObservableObject {
     /// Enable account usage with its own credential, then take the opening
     /// baseline. Existing gist-sync authorization is deliberately unaffected.
     func enableServerUsageWith(token: String) async -> Bool {
+        let previousFingerprint = serverUsageAccountFingerprint
+        let previousBaseline = UserDefaults.standard.string(forKey: Self.serverUsageBaselineKey)
         serverUsageGeneration += 1
-        CreditUsageKeychain.saveToken(token)
-        serverUsageAccountFingerprint = nil
-        UserDefaults.standard.removeObject(forKey: Self.serverUsageAccountKey)
-        serverUsageSample = nil
-        creditSamples = []
-        UserDefaults.standard.removeObject(forKey: Self.serverUsageBaselineKey)
-        serverUsageEnabled = true
-        UserDefaults.standard.set(true, forKey: Self.serverUsageKey)
+        let generation = serverUsageGeneration
+        UserDefaults.standard.set(true, forKey: Self.serverUsageDisconnectedKey)
         serverUsageError = nil
-        await refreshServerUsage()
-        guard serverUsageSample != nil && serverUsageError == nil else {
-            let error = serverUsageError
-            serverUsageGeneration += 1
-            serverUsageEnabled = false
-            UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
-            CreditUsageKeychain.deleteToken()
-            serverUsageAccountFingerprint = nil
-            UserDefaults.standard.removeObject(forKey: Self.serverUsageAccountKey)
-            UserDefaults.standard.removeObject(forKey: Self.serverUsageBaselineKey)
-            creditSamples = []
-            serverUsageSample = nil
-            serverUsageError = error
+
+        guard let fingerprint = await CreditUsageAPI.accountFingerprint(token: token) else {
+            guard generation == serverUsageGeneration else { return false }
+            serverUsageError = "GitHub authenticated, but BarPilot couldn’t verify the account for safe multi-Mac history."
             recompute()
             return false
         }
+
+        let sample: CreditSample
+        do {
+            sample = try await CreditUsageAPI.fetch(token: token)
+        } catch {
+            guard generation == serverUsageGeneration else { return false }
+            serverUsageError = Self.serverUsageErrorMessage(error)
+            recompute()
+            return false
+        }
+        guard generation == serverUsageGeneration else { return false }
+
+        guard CreditUsageKeychain.saveToken(token) else {
+            serverUsageError = "GitHub authenticated, but the credential couldn’t be saved securely."
+            recompute()
+            return false
+        }
+        let saved = await Task.detached(priority: .utility) {
+            CreditSampleStore.save(sample)
+        }.value
+        guard generation == serverUsageGeneration else {
+            _ = CreditUsageKeychain.deleteToken()
+            return false
+        }
+        guard saved else {
+            _ = CreditUsageKeychain.deleteToken()
+            serverUsageError = "The GitHub total was received but couldn’t be saved locally."
+            recompute()
+            return false
+        }
+        serverUsageAccountFingerprint = fingerprint
+        UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
+        serverUsageEnabled = true
+        UserDefaults.standard.set(true, forKey: Self.serverUsageKey)
+        UserDefaults.standard.set(false, forKey: Self.serverUsageDisconnectedKey)
+        if previousFingerprint == fingerprint,
+           let baseline = Int64(previousBaseline ?? "") {
+            creditSamples = CreditSampleStore.load(
+                resetAtMs: sample.resetAtMs, from: baseline
+            )
+        } else {
+            creditSamples = [sample]
+            UserDefaults.standard.set(
+                String(sample.capturedAtMs), forKey: Self.serverUsageBaselineKey
+            )
+        }
+        serverUsageSample = sample
+        serverUsageError = nil
+        recompute()
         return true
     }
 
@@ -366,14 +415,22 @@ final class UsageStore: ObservableObject {
         serverUsageGeneration += 1
         serverUsageEnabled = false
         UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
-        CreditUsageKeychain.deleteToken()
-        serverUsageAccountFingerprint = nil
-        UserDefaults.standard.removeObject(forKey: Self.serverUsageAccountKey)
-        serverUsageSample = nil
-        creditSamples = []
-        serverUsageError = nil
-        UserDefaults.standard.removeObject(forKey: Self.serverUsageBaselineKey)
+        UserDefaults.standard.set(true, forKey: Self.serverUsageDisconnectedKey)
+        let removed = CreditUsageKeychain.deleteToken()
+        serverUsageError = removed
+            ? nil
+            : "GitHub is disconnected, but macOS couldn’t remove the saved credential."
         recompute()
+    }
+
+    func beginServerUsageConnection() -> Bool {
+        guard !isConnectingServerUsage else { return false }
+        isConnectingServerUsage = true
+        return true
+    }
+
+    func endServerUsageConnection() {
+        isConnectingServerUsage = false
     }
 
     /// Fetch one cumulative counter observation. A failed request never writes a
@@ -382,7 +439,11 @@ final class UsageStore: ObservableObject {
         let generation = serverUsageGeneration
         guard serverUsageEnabled, !activeServerRefreshes.contains(generation) else { return }
         guard let token = CreditUsageKeychain.token() else {
-            serverUsageError = "Authorization is missing. Reconnect GitHub Credit Total from the menu."
+            serverUsageError = "GitHub is disconnected. Connect again from the usage window."
+            serverUsageEnabled = false
+            UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
+            UserDefaults.standard.set(true, forKey: Self.serverUsageDisconnectedKey)
+            recompute()
             return
         }
         activeServerRefreshes.insert(generation)
@@ -390,8 +451,12 @@ final class UsageStore: ObservableObject {
         do {
             let sample = try await CreditUsageAPI.fetch(token: token)
             guard serverUsageEnabled, generation == serverUsageGeneration else { return }
-            if serverUsageAccountFingerprint == nil,
-               let fingerprint = await CreditUsageAPI.accountFingerprint(token: token) {
+            if serverUsageAccountFingerprint == nil {
+                guard let fingerprint = await CreditUsageAPI.accountFingerprint(token: token) else {
+                    guard serverUsageEnabled, generation == serverUsageGeneration else { return }
+                    serverUsageError = "GitHub authenticated, but BarPilot couldn’t verify the account for safe multi-Mac history."
+                    return
+                }
                 guard serverUsageEnabled, generation == serverUsageGeneration else { return }
                 serverUsageAccountFingerprint = fingerprint
                 UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
@@ -419,13 +484,20 @@ final class UsageStore: ObservableObject {
         } catch {
             guard serverUsageEnabled, generation == serverUsageGeneration else { return }
             serverUsageError = Self.serverUsageErrorMessage(error)
+            if case .unauthorized = error as? CreditUsageError {
+                serverUsageEnabled = false
+                UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
+                UserDefaults.standard.set(true, forKey: Self.serverUsageDisconnectedKey)
+                _ = CreditUsageKeychain.deleteToken()
+                recompute()
+            }
         }
     }
 
     private static func serverUsageErrorMessage(_ error: Error) -> String {
         switch error as? CreditUsageError {
         case .unauthorized:
-            return "GitHub authorization expired. Reconnect GitHub Credit Total from the menu."
+            return "GitHub authentication expired. Disconnect and connect again."
         case .forbidden:
             return "This GitHub account can’t read its Copilot credit total."
         case .invalidResponse:
@@ -486,12 +558,14 @@ final class UsageStore: ObservableObject {
     }
 
     var serverUsageStatusLabel: String {
-        guard serverUsageEnabled else { return "GitHub total · off" }
-        if serverUsageError != nil { return "GitHub total · error" }
-        if serverUsageSample == nil { return "GitHub total · connecting" }
-        if currentServerUsageSample == nil { return "GitHub total · awaiting cycle" }
-        if serverUsageIsStale { return "GitHub total · stale" }
-        return "GitHub total · live"
+        guard serverUsageEnabled else {
+            return serverUsageError == nil ? "GitHub · disconnected" : "GitHub · reconnect required"
+        }
+        if serverUsageError != nil { return "GitHub · error" }
+        if serverUsageSample == nil { return "GitHub · connecting" }
+        if currentServerUsageSample == nil { return "GitHub · awaiting cycle" }
+        if serverUsageIsStale { return "GitHub · stale" }
+        return "GitHub · connected"
     }
 
     private func onPeriodChanged() {

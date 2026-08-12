@@ -12,16 +12,17 @@ import Security
 // ---------------------------------------------------------------------------
 
 private enum SecureTokenStore {
-    static func save(_ token: String, service: String, account: String, devKey: String) {
+    static func save(_ token: String, service: String, account: String, devKey: String) -> Bool {
         if Updater.isDevBuild {
             UserDefaults.standard.set(token, forKey: devKey)
-            return
+            return self.token(service: service, account: account, devKey: devKey) == token
         }
         SecItemDelete(baseQuery(service: service, account: account) as CFDictionary)
         var attrs = baseQuery(service: service, account: account)
         attrs[kSecValueData as String] = Data(token.utf8)
         attrs[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        SecItemAdd(attrs as CFDictionary, nil)
+        guard SecItemAdd(attrs as CFDictionary, nil) == errSecSuccess else { return false }
+        return self.token(service: service, account: account, devKey: devKey) == token
     }
 
     static func token(service: String, account: String, devKey: String) -> String? {
@@ -35,9 +36,14 @@ private enum SecureTokenStore {
         return String(data: data, encoding: .utf8)
     }
 
-    static func delete(service: String, account: String, devKey: String) {
+    static func delete(service: String, account: String, devKey: String) -> Bool {
         UserDefaults.standard.removeObject(forKey: devKey)
-        SecItemDelete(baseQuery(service: service, account: account) as CFDictionary)
+        if Updater.isDevBuild {
+            return token(service: service, account: account, devKey: devKey) == nil
+        }
+        let status = SecItemDelete(baseQuery(service: service, account: account) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else { return false }
+        return token(service: service, account: account, devKey: devKey) == nil
     }
 
     private static func baseQuery(service: String, account: String) -> [String: Any] {
@@ -52,7 +58,7 @@ enum Keychain {
     private static let account = "github-gist-token"
     private static let devKey = "devSyncToken"
 
-    static func saveToken(_ token: String) {
+    static func saveToken(_ token: String) -> Bool {
         SecureTokenStore.save(token, service: service, account: account, devKey: devKey)
     }
 
@@ -60,7 +66,7 @@ enum Keychain {
         SecureTokenStore.token(service: service, account: account, devKey: devKey)
     }
 
-    static func deleteToken() {
+    static func deleteToken() -> Bool {
         SecureTokenStore.delete(service: service, account: account, devKey: devKey)
     }
 }
@@ -72,7 +78,7 @@ enum CreditUsageKeychain {
     private static let account = "github-copilot-usage-token"
     private static let devKey = "devCreditUsageToken"
 
-    static func saveToken(_ token: String) {
+    static func saveToken(_ token: String) -> Bool {
         SecureTokenStore.save(token, service: service, account: account, devKey: devKey)
     }
 
@@ -80,7 +86,7 @@ enum CreditUsageKeychain {
         SecureTokenStore.token(service: service, account: account, devKey: devKey)
     }
 
-    static func deleteToken() {
+    static func deleteToken() -> Bool {
         SecureTokenStore.delete(service: service, account: account, devKey: devKey)
     }
 }

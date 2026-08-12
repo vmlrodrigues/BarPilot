@@ -3,6 +3,7 @@ import Charts
 
 struct CompactDashboard: View {
     @EnvironmentObject var store: UsageStore
+    let connectGitHub: () -> Void
     let showLegacy: () -> Void
 
     var body: some View {
@@ -11,6 +12,9 @@ struct CompactDashboard: View {
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    if !store.serverUsageEnabled {
+                        connectionCard
+                    }
                     valueCards
                     CompactBudgetBar()
                     dailyChartSection
@@ -23,6 +27,44 @@ struct CompactDashboard: View {
         }
         .frame(width: 600)
         .frame(minHeight: 480, maxHeight: .infinity)
+    }
+
+    private var connectionCard: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "person.crop.circle.badge.exclamationmark")
+                .font(.title2)
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(store.serverUsageError == nil
+                     ? "Connect GitHub for accurate credit usage"
+                     : "Reconnect GitHub")
+                    .font(.subheadline.weight(.semibold))
+                Text(connectionMessage)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 8)
+            Button {
+                connectGitHub()
+            } label: {
+                if store.isConnectingServerUsage {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Text("Connect GitHub")
+                }
+            }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.regular)
+                .disabled(store.isConnectingServerUsage)
+        }
+        .padding(12)
+        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var connectionMessage: String {
+        if let error = store.serverUsageError { return error }
+        return "BarPilot is temporarily showing incomplete local telemetry. Connect to load GitHub’s account-wide credit total and begin daily tracking."
     }
 
     private var header: some View {
@@ -235,8 +277,8 @@ struct CompactDashboard: View {
     }
 
     private var statusColor: Color {
-        guard store.serverUsageEnabled else { return Color.secondary.opacity(0.4) }
         if store.serverUsageError != nil { return .red }
+        guard store.serverUsageEnabled else { return .orange }
         if store.serverUsageSample == nil || store.serverUsageIsStale { return .orange }
         return .green
     }

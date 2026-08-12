@@ -30,8 +30,9 @@ optional private-gist sync, app updates, and the USD→AUD exchange-rate fetch.
   - A temporary **legacy telemetry** view retains Summary, Models, Daily,
     Sessions, and Top during the transition. It is explicitly marked incomplete
     and scheduled for removal.
-  - **GitHub Credit Total** (right-click menu) connects the current-cycle
-    account counter. Failed polls retain the last good value.
+  - A first-run **Connect GitHub** card authenticates the current-cycle account
+    counter. BarPilot does not interrupt startup with a sign-in dialog; the
+    dashboard remains usable with its temporary local fallback until connected.
   - The legacy footer shows each telemetry source's status — **green** = data flowing,
     **orange** = telemetry enabled but no traces yet, **grey** = telemetry not
     enabled. If either source's OTel telemetry isn't configured, a warning with
@@ -74,6 +75,12 @@ and stores each successful cumulative observation in the local SQLite database.
 Daily usage is derived from counter increases: observations from the same UTC day
 can be assigned to that day, while an unsampled increase crossing a day boundary
 remains unallocated. Failed polls never write a zero.
+
+GitHub connection is the dashboard’s normal setup state, not an optional usage
+mode. If no credential is available, the window explains the local fallback and
+offers **Connect GitHub**. The right-click menu provides the secondary
+**Connect GitHub…** or **Disconnect GitHub** account action. Disconnecting removes
+only this credential; saved observations and multi-machine sync remain intact.
 
 Optional **Multi-Machine Sync** stores a compact versioned payload in a secret
 gist. Each Mac publishes only observations it captured itself: every counter

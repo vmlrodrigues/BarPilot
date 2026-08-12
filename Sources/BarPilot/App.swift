@@ -108,7 +108,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.animates = false
         popover.delegate = self
         popover.contentViewController = NSHostingController(
-            rootView: DetailView().environmentObject(store)
+            rootView: DetailView { [weak self] in
+                Task { await self?.runCreditUsageDeviceFlow() }
+            }
+            .environmentObject(store)
         )
         popover.contentSize = desiredContentSize()
 
@@ -171,9 +174,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         login.target = self
         login.state = LoginItem.isEnabled ? .on : .off
         menu.addItem(login)
-        let creditUsage = NSMenuItem(title: "GitHub Credit Total", action: #selector(toggleCreditUsage), keyEquivalent: "")
+        let creditUsage = NSMenuItem(
+            title: store.serverUsageEnabled ? "Disconnect GitHub" : "Connect GitHub…",
+            action: #selector(toggleCreditUsage), keyEquivalent: ""
+        )
         creditUsage.target = self
-        creditUsage.state = store.serverUsageEnabled ? .on : .off
+        creditUsage.isEnabled = !store.isConnectingServerUsage
         menu.addItem(creditUsage)
         let sync = NSMenuItem(title: "Multi-Machine Sync", action: #selector(toggleSync), keyEquivalent: "")
         sync.target = self
@@ -219,14 +225,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         LoginItem.toggle()
     }
 
-    /// Account-total reconciliation: separately authorized from gist sync so
-    /// either feature can be turned off without deleting the other's token.
+    /// The primary GitHub connection is separate from gist sync, so disconnecting
+    /// credit usage cannot silently disable multi-machine sync.
     @objc private func toggleCreditUsage() {
         if store.serverUsageEnabled {
             let a = NSAlert()
-            a.messageText = "Turn off GitHub Credit Total?"
-            a.informativeText = "BarPilot will return to local telemetry totals. Saved daily counter samples stay on this Mac, but the account authorization token is removed."
-            a.addButton(withTitle: "Turn Off")
+            a.messageText = "Disconnect GitHub?"
+            a.informativeText = "BarPilot will stop refreshing the authoritative credit total and temporarily show incomplete local telemetry. Saved daily counter history and multi-machine sync remain untouched."
+            a.addButton(withTitle: "Disconnect")
             a.addButton(withTitle: "Cancel")
             NSApp.activate(ignoringOtherApps: true)
             if a.runModal() == .alertFirstButtonReturn { store.disableServerUsage() }
@@ -292,6 +298,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func runCreditUsageDeviceFlow() async {
+        guard store.beginServerUsageConnection() else { return }
+        defer { store.endServerUsageConnection() }
+
         let dc: DeviceCode
         do { dc = try await GitHubBackend.requestDeviceCode(scope: "read:user") }
         catch {
@@ -302,11 +311,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(dc.userCode, forType: .string)
         let a = NSAlert()
-        a.messageText = "Use GitHub’s credit total?"
+        a.messageText = "Connect BarPilot to GitHub?"
         a.informativeText = """
-        BarPilot will read your account’s Copilot credit counter once a minute and save cumulative samples locally. This makes the current billing-cycle total authoritative while keeping local telemetry for model and session detail.
+        BarPilot will read your account’s Copilot credit counter once a minute and save cumulative samples locally. This provides the current billing-cycle total, costs, budget progress, and daily usage.
 
-        GitHub’s endpoint is internal and may change. No prompts, code, or usage content are sent by BarPilot.
+        GitHub returns the cumulative credit total, reset date, and timestamp. BarPilot does not request or send prompts, code, sessions, or model details.
 
         Open GitHub and enter the code below (already copied to your clipboard). It finishes on its own once you approve.
         """
@@ -321,12 +330,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let token = try await GitHubBackend.pollForToken(
                 deviceCode: dc.deviceCode, interval: dc.interval, expiresIn: dc.expiresIn)
             if await store.enableServerUsageWith(token: token) {
-                showInfo("GitHub credit total enabled", "BarPilot is now using GitHub’s current billing-cycle counter for the headline total.")
+                showInfo("GitHub connected", "BarPilot is now using GitHub’s current billing-cycle credit counter.")
             } else {
-                showInfo("Credit total couldn’t start", store.serverUsageError ?? "GitHub did not return a usable credit total.")
+                showInfo("GitHub couldn’t connect", store.serverUsageError ?? "GitHub did not return a usable credit total.")
             }
         } catch {
-            showInfo("Credit total not enabled", "Authorization didn’t complete. You can try again from the menu.")
+            showInfo("GitHub not connected", "Authentication didn’t complete. You can try again from the usage window.")
         }
     }
 

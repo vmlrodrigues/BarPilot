@@ -8,6 +8,7 @@ import AppKit
 
 struct DetailView: View {
     @EnvironmentObject var store: UsageStore
+    let connectGitHub: () -> Void
     @State private var showingUTCInfo = false
     @State private var showingSyncInfo = false
     @State private var showingCreditInfo = false
@@ -18,7 +19,7 @@ struct DetailView: View {
             if showingLegacyTelemetry {
                 legacyView
             } else {
-                CompactDashboard {
+                CompactDashboard(connectGitHub: connectGitHub) {
                     showingLegacyTelemetry = true
                 }
             }
@@ -246,9 +247,9 @@ struct DetailView: View {
                     .buttonStyle(.borderless)
                     .popover(isPresented: $showingCreditInfo) {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("GitHub credit total").font(.caption.weight(.semibold))
+                            Text("GitHub connection").font(.caption.weight(.semibold))
                             if !store.serverUsageEnabled {
-                                Text("Off. Enable **GitHub Credit Total** from the right-click menu to reconcile local attribution with GitHub’s account counter.")
+                                Text("GitHub is disconnected. Use **Connect GitHub** in the current dashboard to restore the authoritative account counter.")
                                     .foregroundStyle(.secondary)
                             } else {
                                 if let error = store.serverUsageError {
