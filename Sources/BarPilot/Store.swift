@@ -13,6 +13,7 @@ import AppKit
 @MainActor
 final class UsageStore: ObservableObject {
     @Published private(set) var report: Report = .empty
+    @Published private(set) var currentMonthReport: Report = .empty
     @Published private(set) var isLoading = false
     @Published private(set) var lastUpdated: Date?
     @Published private(set) var status = SourcesStatus()
@@ -54,7 +55,7 @@ final class UsageStore: ObservableObject {
     private var serverUsageGeneration = 0
     private var activeServerRefreshes: Set<Int> = []
 
-    /// Text shown in the menu bar (the selected period's total cost).
+    /// Text shown in the menu bar (the compact current-month total cost).
     @Published private(set) var menuBarTitle: String = "—"
     /// Is the Copilot app recording telemetry right now? Drives the menu-bar
     /// warning glyph and the window banner (#27).
@@ -80,6 +81,11 @@ final class UsageStore: ObservableObject {
     private static let syncKey = "multiMachineSyncEnabled"
     private static let serverUsageKey = "serverCreditUsageEnabled"
     private static let serverUsageBaselineKey = "serverCreditUsageBaselineMs"
+    private static let utcCalendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        return calendar
+    }()
     /// Average days per month (365.25 / 12) — used to convert the monthly
     /// budget into a stable per-day rate for any selected range.
     private static let avgDaysPerMonth = 30.4375
@@ -193,6 +199,19 @@ final class UsageStore: ObservableObject {
             report = Aggregator.build(
                 records: allRecords, fromStr: range.from, toStr: range.to, todayStr: today)
         }
+        let monthRange = PeriodResolver.range(
+            kind: .thisMonth, customFrom: customFrom, customTo: customTo)
+        if range.from == monthRange.from && range.to == monthRange.to {
+            currentMonthReport = report
+        } else if syncEnabled {
+            currentMonthReport = Aggregator.buildCombined(
+                localRecords: allRecords, remoteAggregates: currentRemoteAggregates(),
+                fromStr: monthRange.from, toStr: monthRange.to, todayStr: today)
+        } else {
+            currentMonthReport = Aggregator.build(
+                records: allRecords, fromStr: monthRange.from,
+                toStr: monthRange.to, todayStr: today)
+        }
         reconciled = CreditReconciliation.build(
             report: report,
             periodKind: periodKind,
@@ -200,7 +219,7 @@ final class UsageStore: ObservableObject {
         )
         // Prefix a warning glyph when telemetry has stopped: the menu-bar figure
         // is where the stale number is shown, so it's where the doubt belongs.
-        let cost = costString(credits: reconciled.totalCredits)
+        let cost = costString(credits: compactTotalCredits)
         menuBarTitle = showExporterWarning ? "⚠︎ " + cost : cost
     }
 
@@ -392,6 +411,22 @@ final class UsageStore: ObservableObject {
     }
 
     var displayTotalCredits: Double { reconciled.totalCredits }
+    var currentServerUsageSample: CreditSample? {
+        guard let sample = serverUsageSample,
+              CreditReconciliation.isCurrentCycle(sample) else { return nil }
+        return sample
+    }
+    var compactTotalCredits: Double {
+        guard serverUsageEnabled, let sample = currentServerUsageSample else {
+            return currentMonthReport.totalCredits
+        }
+        return max(sample.creditsUsed, currentMonthReport.totalCredits)
+    }
+    var creditTimeline: CreditTimeline {
+        guard let current = currentServerUsageSample else { return .empty }
+        return CreditTimeline.build(
+            samples: creditSamples.filter { $0.resetAtMs == current.resetAtMs })
+    }
     var classifiedTotalCredits: Double { reconciled.classifiedCredits }
     var sessionClassifiedTotalCredits: Double {
         report.sessions.reduce(0) { $0 + $1.credits }
@@ -410,6 +445,7 @@ final class UsageStore: ObservableObject {
         guard serverUsageEnabled else { return "GitHub total · off" }
         if serverUsageError != nil { return "GitHub total · error" }
         if serverUsageSample == nil { return "GitHub total · connecting" }
+        if currentServerUsageSample == nil { return "GitHub total · awaiting cycle" }
         if serverUsageIsStale { return "GitHub total · stale" }
         return "GitHub total · live"
     }
@@ -454,6 +490,15 @@ final class UsageStore: ObservableObject {
         effectiveCurrency.symbol + String(format: "%.2f", toDisplay(credits / 100.0))
     }
 
+    func usdCostString(credits: Double) -> String {
+        String(format: "$%.2f", credits / 100)
+    }
+
+    func audCostString(credits: Double) -> String {
+        guard let usdToAUD else { return "A$—" }
+        return String(format: "A$%.2f", credits / 100 * usdToAUD)
+    }
+
     /// Cost from a USD amount, 2 dp, in the display currency.
     func costString(usd: Double) -> String {
         effectiveCurrency.symbol + String(format: "%.2f", toDisplay(usd))
@@ -494,6 +539,15 @@ final class UsageStore: ObservableObject {
         displayReport.todayCredits = reconciled.todayCredits
         return SpendProjection.compute(periodKind: periodKind, report: displayReport,
                                 monthlyBudgetUSD: monthlyBudget, now: Date())
+    }
+
+    var compactSpendProjection: SpendProjection? {
+        var displayReport = currentMonthReport
+        displayReport.totalCredits = compactTotalCredits
+        return SpendProjection.compute(
+            periodKind: .thisMonth, report: displayReport,
+            monthlyBudgetUSD: monthlyBudget, now: Date(),
+            calendar: Self.utcCalendar)
     }
 
     // -----------------------------------------------------------------------

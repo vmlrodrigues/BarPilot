@@ -164,9 +164,11 @@ Sources/BarPilot/
   Aggregator.swift   Aggregator + PeriodResolver — date-range & bucketing math.
   CreditUsage.swift  Defensive `/copilot_internal/user` client + response model.
   CreditSamples.swift  SQLite persistence for cumulative account-counter samples.
+  CreditTimeline.swift  Hourly counter snapshots + conservative observed deltas.
   CreditReconciliation.swift  Pure server-total/local-attribution overlay.
   Dump.swift         Dump.run() — the --dump output path.
   DetailView.swift   Window UI: header, sparkline, budget bar.
+  CompactDashboard.swift  Primary server-first dashboard and chart.
   Tabs.swift         Summary / Models / Daily / Sessions / Top tables.
   Setup.swift        TelemetrySetup — opt-in native OTel enablement.
   Updater.swift      Silent GitHub-Releases auto-updater (Developer ID-gated).
@@ -199,6 +201,11 @@ records (instant); only the timer / refresh / window-open re-reads disk.
   It polls GitHub's internal account endpoint every 60 seconds and stores samples
   in the local span-cache database. The credentials use separate Keychain entries,
   so disabling one feature cannot silently disable the other. (#33)
+- **The primary UI is server-first and current-cycle only.** It shows credits,
+  USD + AUD, monthly budget progress, an hourly cumulative chart, and daily
+  observed counter deltas. Counter growth across gaps longer than 90 minutes is
+  shown as unallocated rather than assigned to a day. The telemetry tabs remain
+  temporarily accessible behind a deprecated legacy-view control. (#34)
 - **Budget = one editable monthly USD figure** (`monthlyBudgetUSD`, default $150
   ≈ $5/day), pro-rated to a per-day rate via `avgDaysPerMonth = 30.4375` and
   multiplied by the selected range's days. Edited via an NSAlert from the

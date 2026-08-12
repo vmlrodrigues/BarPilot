@@ -6,9 +6,10 @@
 
 [![Download for Mac](https://img.shields.io/badge/Download_for_Mac-007AFF?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/vmlrodrigues/BarPilot/releases/latest/download/BarPilot.dmg)
 
-A macOS **menu-bar app** that shows your GitHub Copilot AIU credit **cost** for a
-selected period at a glance. Click the menu-bar item to open a window with the
-full breakdown — summary, models, daily, sessions, and top calls.
+A macOS **menu-bar app** that shows your GitHub Copilot AIU credit **cost** at a
+glance. Click the menu-bar item to open a compact current-cycle dashboard with
+credits, USD and AUD values, budget progress, hourly snapshots, and observed
+daily spend.
 
 Written in **Swift / SwiftUI**, fully self-contained with **no external
 dependencies**: it reads your local GitHub Copilot OTel telemetry directly off
@@ -18,19 +19,18 @@ the USD→AUD exchange-rate fetch.
 
 ## What it shows
 
-- **Menu bar:** `$ <total cost>` for the selected period, always visible.
+- **Menu bar:** `$ <total cost>` for the current month, always visible.
 - **Detail window** (click the menu-bar item):
-  - Period selector — Today, Last 7 Days, This Month, Last 30 Days, This Year,
-    All Time, or a custom date range.
-  - Big total (cost + credits) and a daily-spend sparkline.
-  - **Budget bar** for the *selected* period: you set one **monthly budget** in
-    USD (from the menu-bar icon's right-click menu → **Set Monthly Budget…**);
-    it's converted to a per-day rate and pro-rated across the days in the chosen
-    span (so "Today" shows ~1/30th of it, "Last 7 Days" shows 7 days' worth,
-    etc.). Shows spend vs budget and % used; the current monthly figure is
-    displayed as "$150 / mo".
-  - Tabs: **Summary** (by model), **Models** (with token breakdown), **Daily**,
-    **Sessions**, **Top** (most expensive calls).
+  - Current billing-cycle credits and their value in both USD and AUD.
+  - An hourly cumulative-counter chart built from persisted GitHub samples.
+  - An observed daily-spend table. Opening and offline-gap usage remains separate
+    rather than being assigned to a day without evidence.
+  - **Monthly budget bar:** set one USD budget from the menu-bar icon's
+    right-click menu → **Set Monthly Budget…**. The bar shows current spend,
+    projected month-end spend, and the budget marker in both USD and AUD.
+  - A temporary **legacy telemetry** view retains Summary, Models, Daily,
+    Sessions, and Top during the transition. It is explicitly marked incomplete
+    and scheduled for removal.
   - Optional **GitHub Credit Total** (right-click menu): uses GitHub's current
     billing-cycle counter as the headline total, keeps local telemetry for the
     detailed breakdown, and shows any difference as a separated **Unclassified**
@@ -137,7 +137,9 @@ Sources/BarPilot/
   Aggregator.swift   Date-range math, model normalisation, per-view rows
   CreditUsage.swift  GitHub account-counter client + defensive response parser
   CreditSamples.swift Persistent cumulative credit samples
+  CreditTimeline.swift Conservative hourly and daily sample projection
   CreditReconciliation.swift Server total + local attribution overlay
+  CompactDashboard.swift Primary current-cycle dashboard + legacy transition
   DetailView.swift   Window UI: header, sparkline, budget bar, status footer
   Tabs.swift         Summary / Models / Daily / Sessions / Top tables
   Setup.swift        Native opt-in OTel telemetry enablement (the "Enable…" button)

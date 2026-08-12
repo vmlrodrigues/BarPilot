@@ -35,6 +35,16 @@ struct ReconciledUsage {
 enum CreditReconciliation {
     static let unclassifiedLabel = "Unclassified"
 
+    static func isCurrentCycle(_ sample: CreditSample, now: Date = Date()) -> Bool {
+        guard sample.resetAt > now else { return false }
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        guard let cycleStart = utc.date(byAdding: .month, value: -1, to: sample.resetAt),
+              let currentStart = utc.date(from: utc.dateComponents([.year, .month], from: now))
+        else { return false }
+        return cycleStart == currentStart
+    }
+
     static func build(
         report: Report,
         periodKind: PeriodKind,
@@ -66,7 +76,7 @@ enum CreditReconciliation {
     }
 
     private static func matchesCurrentCycle(snapshot: CreditSample, report: Report, now: Date) -> Bool {
-        guard snapshot.resetAt > now else { return false }
+        guard isCurrentCycle(snapshot, now: now) else { return false }
         var utc = Calendar(identifier: .gregorian)
         utc.timeZone = TimeZone(identifier: "UTC")!
         guard let start = utc.date(byAdding: .month, value: -1, to: snapshot.resetAt) else { return false }
@@ -75,6 +85,7 @@ enum CreditReconciliation {
     }
 
     static func verify() {
+        CreditTimeline.verify()
         let reset = Aggregator.utcMidnightMs("2030-02-01")
         let t0 = Aggregator.utcMidnightMs("2030-01-10")
         let t1 = t0 + 60_000

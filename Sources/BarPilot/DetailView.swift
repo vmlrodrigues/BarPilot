@@ -2,9 +2,8 @@ import SwiftUI
 import AppKit
 
 // ---------------------------------------------------------------------------
-// DetailView — the window shown when the menu-bar item is clicked.
-// Header (period + total + sparkline), today's budget bar, and tabbed tables
-// (Summary / Models / Daily / Sessions / Top).
+// DetailView — the compact server-first dashboard plus the temporary legacy
+// telemetry interface.
 // ---------------------------------------------------------------------------
 
 struct DetailView: View {
@@ -12,9 +11,23 @@ struct DetailView: View {
     @State private var showingUTCInfo = false
     @State private var showingSyncInfo = false
     @State private var showingCreditInfo = false
+    @State private var showingLegacyTelemetry = false
 
     var body: some View {
+        Group {
+            if showingLegacyTelemetry {
+                legacyView
+            } else {
+                CompactDashboard {
+                    showingLegacyTelemetry = true
+                }
+            }
+        }
+    }
+
+    private var legacyView: some View {
         VStack(alignment: .leading, spacing: 0) {
+            legacyBanner
             exporterBanner
             header
             Divider()
@@ -33,6 +46,29 @@ struct DetailView: View {
         }
         .frame(width: 600)
         .frame(minHeight: 480, maxHeight: .infinity)
+    }
+
+    private var legacyBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "clock.arrow.circlepath")
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Legacy telemetry view")
+                    .font(.caption.weight(.semibold))
+                Text("Model and session details are incomplete because local telemetry omits billed calls. This interface will be removed soon.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Back to current view") {
+                showingLegacyTelemetry = false
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.10))
     }
 
     // MARK: Header
