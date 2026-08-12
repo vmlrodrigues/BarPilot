@@ -1,4 +1,5 @@
 import SwiftUI
+import Charts
 
 struct CompactDashboard: View {
     @EnvironmentObject var store: UsageStore
@@ -12,7 +13,7 @@ struct CompactDashboard: View {
                 VStack(alignment: .leading, spacing: 16) {
                     valueCards
                     CompactBudgetBar()
-                    hourlySection
+                    dailyChartSection
                     dailySection
                 }
                 .padding(16)
@@ -41,6 +42,14 @@ struct CompactDashboard: View {
                 }
                 Spacer()
                 if store.isLoading { ProgressView().controlSize(.small) }
+                Button {
+                    showLegacy()
+                } label: {
+                    Label("Legacy telemetry", systemImage: "clock.arrow.circlepath")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Open the previous telemetry-based interface.")
                 Button {
                     Task { await store.reload() }
                 } label: {
@@ -99,14 +108,14 @@ struct CompactDashboard: View {
         .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10))
     }
 
-    private var hourlySection: some View {
+    private var dailyChartSection: some View {
         let timeline = store.creditTimeline
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Hourly credit snapshots")
+                    Text("Daily credit usage")
                         .font(.subheadline.weight(.semibold))
-                    Text(timelineSubtitle)
+                    Text(dailyChartSubtitle)
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
@@ -117,20 +126,20 @@ struct CompactDashboard: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            HourlyCreditsChart(points: timeline.hourly)
+            DailyCreditsBarChart(points: timeline.daily)
                 .frame(height: 150)
         }
     }
 
-    private var timelineSubtitle: String {
+    private var dailyChartSubtitle: String {
         let timeline = store.creditTimeline
         guard timeline.firstAtMs != nil else {
             return "Waiting for saved GitHub counter samples."
         }
         if timeline.unallocatedCredits > 0 {
-            return "\(Fmt.credits(timeline.unallocatedCredits)) credits crossed an offline gap and remain unallocated."
+            return "\(Fmt.credits(timeline.unallocatedCredits)) credits cannot be assigned to a day."
         }
-        return "Cumulative GitHub counter, reduced to one point per hour."
+        return "Observed increases between saved GitHub counter samples."
     }
 
     private var dailySection: some View {
@@ -214,10 +223,6 @@ struct CompactDashboard: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Button("Show legacy telemetry") { showLegacy() }
-                .buttonStyle(.borderless)
-                .font(.caption)
-                .help("Temporarily open the telemetry-based interface scheduled for removal.")
             Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")\(Updater.isDevBuild ? "-dev" : "")")
                 .font(.caption2)
                 .foregroundStyle(Updater.isDevBuild ? Color.orange : Color.secondary)
@@ -311,79 +316,37 @@ private struct CompactBudgetBar: View {
     }
 }
 
-private struct HourlyCreditsChart: View {
-    let points: [HourlyCreditPoint]
-    private let maximumJoinedGapMs: Int64 = 90 * 60 * 1000
+private struct DailyCreditsBarChart: View {
+    let points: [ObservedDayCredits]
 
     var body: some View {
-        GeometryReader { geometry in
-            if points.count < 2 {
-                Text(points.isEmpty ? "No samples yet" : "Waiting for another hourly snapshot")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                let values = points.map(\.credits)
-                let minimum = values.min() ?? 0
-                let maximum = values.max() ?? minimum
-                let spread = max(maximum - minimum, 1)
-                let plotHeight = geometry.size.height - 22
-                let firstTime = points.first?.atMs ?? 0
-                let timeRange = max((points.last?.atMs ?? firstTime) - firstTime, 1)
-
-                ZStack(alignment: .topLeading) {
-                    VStack(spacing: 0) {
-                        ForEach(0..<4, id: \.self) { _ in
-                            Divider()
-                            Spacer()
-                        }
-                    }
-                    .opacity(0.35)
-                    .frame(height: plotHeight)
-
-                    linePath(
-                        size: CGSize(width: geometry.size.width, height: plotHeight),
-                        minimum: minimum, spread: spread,
-                        firstTime: firstTime, timeRange: timeRange
-                    )
-                    .stroke(Color.accentColor, style: StrokeStyle(lineWidth: 2, lineJoin: .round))
-
-                    HStack {
-                        Text(Self.axisFormatter.string(from: date(points.first!.atMs)))
-                        Spacer()
-                        Text(Self.axisFormatter.string(from: date(points.last!.atMs)))
-                    }
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .offset(y: plotHeight + 6)
+        if points.isEmpty {
+            Text("No complete observed daily increases yet")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            Chart(points.sorted { $0.day < $1.day }) { point in
+                BarMark(
+                    x: .value("Day", point.date, unit: .day),
+                    y: .value("Credits", point.credits)
+                )
+                .foregroundStyle(Color.accentColor.gradient)
+                .cornerRadius(3)
+            }
+            .chartXAxis {
+                AxisMarks(values: .automatic(desiredCount: 6)) {
+                    AxisGridLine()
+                    AxisTick()
+                    AxisValueLabel(format: .dateTime.day().month(.abbreviated))
+                }
+            }
+            .chartYAxis {
+                AxisMarks(position: .leading, values: .automatic(desiredCount: 4)) {
+                    AxisGridLine()
+                    AxisValueLabel()
                 }
             }
         }
     }
-
-    private func linePath(
-        size: CGSize, minimum: Double, spread: Double,
-        firstTime: Int64, timeRange: Int64
-    ) -> Path {
-        Path { path in
-            for (index, point) in points.enumerated() {
-                let x = size.width * CGFloat(point.atMs - firstTime) / CGFloat(timeRange)
-                let y = size.height * (1 - CGFloat((point.credits - minimum) / spread))
-                let joinsPrevious = index > 0
-                    && point.atMs - points[index - 1].atMs <= maximumJoinedGapMs
-                if !joinsPrevious { path.move(to: CGPoint(x: x, y: y)) }
-                else { path.addLine(to: CGPoint(x: x, y: y)) }
-            }
-        }
-    }
-
-    private func date(_ ms: Int64) -> Date {
-        Date(timeIntervalSince1970: Double(ms) / 1000)
-    }
-
-    private static let axisFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.dateFormat = "d MMM, h a"
-        return formatter
-    }()
 }

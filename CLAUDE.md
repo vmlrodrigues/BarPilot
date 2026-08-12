@@ -164,7 +164,7 @@ Sources/BarPilot/
   Aggregator.swift   Aggregator + PeriodResolver — date-range & bucketing math.
   CreditUsage.swift  Defensive `/copilot_internal/user` client + response model.
   CreditSamples.swift  SQLite persistence for cumulative account-counter samples.
-  CreditTimeline.swift  Hourly counter snapshots + conservative observed deltas.
+  CreditTimeline.swift  Conservative observed daily counter deltas.
   CreditReconciliation.swift  Pure server-total/local-attribution overlay.
   Dump.swift         Dump.run() — the --dump output path.
   DetailView.swift   Window UI: header, sparkline, budget bar.
@@ -202,7 +202,7 @@ records (instant); only the timer / refresh / window-open re-reads disk.
   in the local span-cache database. The credentials use separate Keychain entries,
   so disabling one feature cannot silently disable the other. (#33)
 - **The primary UI is server-first and current-cycle only.** It shows credits,
-  USD + AUD, monthly budget progress, an hourly cumulative chart, and daily
+  USD + AUD, monthly budget progress, a daily usage bar chart, and daily
   observed counter deltas. Counter growth across gaps longer than 90 minutes is
   shown as unallocated rather than assigned to a day. The telemetry tabs remain
   temporarily accessible behind a deprecated legacy-view control. (#34)

@@ -8,8 +8,7 @@
 
 A macOS **menu-bar app** that shows your GitHub Copilot AIU credit **cost** at a
 glance. Click the menu-bar item to open a compact current-cycle dashboard with
-credits, USD and AUD values, budget progress, hourly snapshots, and observed
-daily spend.
+credits, USD and AUD values, budget progress, and an observed daily-usage chart.
 
 Written in **Swift / SwiftUI**, fully self-contained with **no external
 dependencies**: it reads your local GitHub Copilot OTel telemetry directly off
@@ -22,7 +21,7 @@ the USD→AUD exchange-rate fetch.
 - **Menu bar:** `$ <total cost>` for the current month, always visible.
 - **Detail window** (click the menu-bar item):
   - Current billing-cycle credits and their value in both USD and AUD.
-  - An hourly cumulative-counter chart built from persisted GitHub samples.
+  - A daily credit-usage bar chart built from persisted GitHub samples.
   - An observed daily-spend table. Opening and offline-gap usage remains separate
     rather than being assigned to a day without evidence.
   - **Monthly budget bar:** set one USD budget from the menu-bar icon's
@@ -137,7 +136,7 @@ Sources/BarPilot/
   Aggregator.swift   Date-range math, model normalisation, per-view rows
   CreditUsage.swift  GitHub account-counter client + defensive response parser
   CreditSamples.swift Persistent cumulative credit samples
-  CreditTimeline.swift Conservative hourly and daily sample projection
+  CreditTimeline.swift Conservative daily sample projection
   CreditReconciliation.swift Server total + local attribution overlay
   CompactDashboard.swift Primary current-cycle dashboard + legacy transition
   DetailView.swift   Window UI: header, sparkline, budget bar, status footer
