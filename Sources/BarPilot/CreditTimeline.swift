@@ -23,9 +23,9 @@ struct CreditTimeline {
         unallocatedCredits: 0, firstAtMs: nil, lastAtMs: nil
     )
 
-    /// Build an observed timeline from a cumulative counter. Deltas spanning more
-    /// than 90 minutes are kept unallocated because sleep/offline gaps cannot be
-    /// assigned honestly to an hour or day.
+    /// Build an observed timeline from a cumulative counter. A long gap can still
+    /// be assigned when both observations fall within the same UTC day; gaps that
+    /// cross a day boundary remain unallocated because their split is unknowable.
     static func build(samples: [CreditSample]) -> CreditTimeline {
         let ordered = samples.sorted { $0.capturedAtMs < $1.capturedAtMs }
         guard let first = ordered.first, let last = ordered.last else { return .empty }
@@ -46,7 +46,12 @@ struct CreditTimeline {
                     highWater = current.creditsUsed
                     continue
                 }
-                guard elapsed > 0, elapsed <= maxObservedGapMs else {
+                guard elapsed > 0 else { continue }
+                let previousAt = previous.serverAtMs ?? previous.capturedAtMs
+                let currentAt = current.serverAtMs ?? current.capturedAtMs
+                let sameUTCDay = utcDay(previousAt, calendar: calendar)
+                    == utcDay(currentAt, calendar: calendar)
+                guard elapsed <= maxObservedGapMs || sameUTCDay else {
                     highWater = max(highWater, current.creditsUsed)
                     continue
                 }
@@ -54,7 +59,7 @@ struct CreditTimeline {
                 let delta = current.creditsUsed - highWater
                 guard delta > 0 else { continue }
                 highWater = current.creditsUsed
-                let day = utcDay(current.serverAtMs ?? current.capturedAtMs, calendar: calendar)
+                let day = utcDay(currentAt, calendar: calendar)
                 byDay[day, default: 0] += delta
                 observed += delta
             }
@@ -101,9 +106,17 @@ struct CreditTimeline {
         ]
         let timeline = build(samples: samples)
         precondition(timeline.openingCredits == 100)
-        precondition(timeline.observedCredits == 40)
-        precondition(timeline.unallocatedCredits == 60)
-        precondition(timeline.daily.first?.credits == 40)
+        precondition(timeline.observedCredits == 100)
+        precondition(timeline.unallocatedCredits == 0)
+        precondition(timeline.daily.first?.credits == 100)
+
+        let crossDayStart = Aggregator.utcMidnightMs("2030-01-10") + 23 * hour
+        let crossDay = build(samples: [
+            CreditSample(capturedAtMs: crossDayStart, serverAtMs: nil, resetAtMs: reset, creditsUsed: 100),
+            CreditSample(capturedAtMs: crossDayStart + 3 * hour, serverAtMs: nil, resetAtMs: reset, creditsUsed: 160)
+        ])
+        precondition(crossDay.observedCredits == 0)
+        precondition(crossDay.unallocatedCredits == 60)
 
         let corrected = build(samples: [
             CreditSample(capturedAtMs: start, serverAtMs: nil, resetAtMs: reset, creditsUsed: 100),
