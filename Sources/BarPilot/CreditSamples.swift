@@ -4,8 +4,9 @@ import SQLite3
 // ---------------------------------------------------------------------------
 // CreditSampleStore — cumulative server-counter observations.
 //
-// Samples live beside the span cache but in their own table. Poll failures are
-// never written, and reconciliation never diffs across a reset or decrease.
+// Samples live beside the legacy span cache but in their own durable table. The
+// database remains after telemetry retirement. Poll failures are never written,
+// and reconciliation never diffs across a reset or decrease.
 // ---------------------------------------------------------------------------
 
 enum CreditSampleStore {

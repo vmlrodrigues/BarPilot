@@ -274,7 +274,7 @@ enum Aggregator {
     // Sessions/Top stay LOCAL. Daily buckets by UTC day (Design Decision 1).
     // Sync-OFF never calls this — it uses build(...) — so OFF stays byte-identical.
     // -----------------------------------------------------------------------
-    static func buildCombined(localRecords: [UsageRecord], remoteAggregates: [MachineAggregate],
+    static func buildCombined(localRecords: [UsageRecord], remoteAggregates: [MachineSyncPayload],
                               fromStr: String, toStr: String, todayStr: String) -> Report {
         let localAgg = SyncAggregate.project(localRecords, machineId: "local", label: nil, updatedAt: "")
         let allRows = localAgg.rows + remoteAggregates.flatMap { $0.rows }

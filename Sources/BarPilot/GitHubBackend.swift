@@ -122,10 +122,10 @@ struct GitHubBackend: SyncBackend {
             .min { ($0["created_at"] as? String ?? "") < ($1["created_at"] as? String ?? "") }?["id"] as? String
     }
 
-    func push(_ aggregate: MachineAggregate) async throws {
-        guard let data = try? JSONEncoder().encode(aggregate),
+    func push(_ payload: MachineSyncPayload) async throws {
+        guard let data = try? JSONEncoder().encode(payload),
               let json = String(data: data, encoding: .utf8) else { throw SyncError.encoding }
-        let files: [String: Any] = ["machine-\(aggregate.machineId).json": ["content": json]]
+        let files: [String: Any] = ["machine-\(payload.machineId).json": ["content": json]]
         if let id = try await findGistId() {
             let body = try JSONSerialization.data(withJSONObject: ["files": files])
             _ = try await send(authed(URL(string: "https://api.github.com/gists/\(id)")!, "PATCH", body), expect: 200)
@@ -135,17 +135,26 @@ struct GitHubBackend: SyncBackend {
         }
     }
 
-    func pullOthers(excluding selfId: String) async throws -> [MachineAggregate] {
+    func pullOthers(excluding selfId: String) async throws -> [MachineSyncPayload] {
         guard let id = try await findGistId() else { return [] }
         let data = try await send(authed(URL(string: "https://api.github.com/gists/\(id)")!), expect: 200)
         guard let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let files = j["files"] as? [String: Any] else { throw SyncError.network }
-        var out: [MachineAggregate] = []
+        var out: [MachineSyncPayload] = []
         for (name, meta) in files {
-            guard name.hasPrefix("machine-"), let m = meta as? [String: Any],
-                  let content = m["content"] as? String,
-                  let cdata = content.data(using: .utf8),
-                  let agg = try? JSONDecoder().decode(MachineAggregate.self, from: cdata),
+            guard name.hasPrefix("machine-"), let m = meta as? [String: Any] else { continue }
+            let cdata: Data
+            if m["truncated"] as? Bool == true {
+                guard let raw = m["raw_url"] as? String,
+                      let url = URL(string: raw) else { throw SyncError.network }
+                cdata = try await send(authed(url), expect: 200)
+            } else {
+                guard let content = m["content"] as? String,
+                      let data = content.data(using: .utf8) else { continue }
+                cdata = data
+            }
+            guard
+                  let agg = try? JSONDecoder().decode(MachineSyncPayload.self, from: cdata),
                   agg.machineId != selfId else { continue }
             out.append(agg)
         }

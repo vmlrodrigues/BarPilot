@@ -291,7 +291,7 @@ struct DetailView: View {
                                 } else if !hasError {
                                     Text("Authorized account: checking…").foregroundStyle(.secondary)
                                 }
-                                Text("Each machine stores a small per-day, per-model usage summary in a secret gist in that account — no code or content. Summary / Models / Daily / total combine across machines; Sessions & Top stay per-machine. All machines must use the **same** account.")
+                                Text("Each Mac stores compact account-counter observations in a secret gist — no code, prompts, or content. The current dashboard unions matching observations to fill offline gaps; it never adds account totals together. The legacy summary remains synced during its deprecation window.")
                                     .foregroundStyle(.secondary)
                             }
                             .font(.caption).padding().frame(width: 290)

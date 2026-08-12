@@ -27,7 +27,11 @@ struct CreditTimeline {
     /// be assigned when both observations fall within the same UTC day; gaps that
     /// cross a day boundary remain unallocated because their split is unknowable.
     static func build(samples: [CreditSample]) -> CreditTimeline {
-        let ordered = samples.sorted { $0.capturedAtMs < $1.capturedAtMs }
+        let ordered = samples.sorted {
+            let lhs = $0.serverAtMs ?? $0.capturedAtMs
+            let rhs = $1.serverAtMs ?? $1.capturedAtMs
+            return lhs == rhs ? $0.capturedAtMs < $1.capturedAtMs : lhs < rhs
+        }
         guard let first = ordered.first, let last = ordered.last else { return .empty }
 
         var calendar = Calendar(identifier: .gregorian)
@@ -41,14 +45,14 @@ struct CreditTimeline {
             for index in 1..<ordered.count {
                 let previous = ordered[index - 1]
                 let current = ordered[index]
-                let elapsed = current.capturedAtMs - previous.capturedAtMs
                 guard current.resetAtMs == previous.resetAtMs else {
                     highWater = current.creditsUsed
                     continue
                 }
-                guard elapsed > 0 else { continue }
                 let previousAt = previous.serverAtMs ?? previous.capturedAtMs
                 let currentAt = current.serverAtMs ?? current.capturedAtMs
+                let elapsed = currentAt - previousAt
+                guard elapsed > 0 else { continue }
                 let sameUTCDay = utcDay(previousAt, calendar: calendar)
                     == utcDay(currentAt, calendar: calendar)
                 guard elapsed <= maxObservedGapMs || sameUTCDay else {
@@ -83,8 +87,8 @@ struct CreditTimeline {
             openingCredits: first.creditsUsed,
             observedCredits: observed,
             unallocatedCredits: max(0, totalIncrease - observed),
-            firstAtMs: first.capturedAtMs,
-            lastAtMs: last.capturedAtMs
+            firstAtMs: first.serverAtMs ?? first.capturedAtMs,
+            lastAtMs: last.serverAtMs ?? last.capturedAtMs
         )
     }
 

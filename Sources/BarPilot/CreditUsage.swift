@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 // ---------------------------------------------------------------------------
 // CreditUsageAPI — account-level Copilot usage from GitHub's own counter.
@@ -26,6 +27,23 @@ struct CreditSample: Equatable {
 }
 
 enum CreditUsageAPI {
+    /// Opaque equality key for preventing observations from different Copilot
+    /// accounts being merged. The underlying account identifier is never stored
+    /// or included in the sync payload.
+    static func accountFingerprint(token: String) async -> String? {
+        var req = URLRequest(url: URL(string: "https://api.github.com/user")!)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.setValue("BarPilot", forHTTPHeaderField: "User-Agent")
+        req.timeoutInterval = 30
+        guard let (data, response) = try? await URLSession.shared.data(for: req),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let id = json["id"] as? NSNumber else { return nil }
+        let digest = SHA256.hash(data: Data("barpilot-credit:\(id.int64Value)".utf8))
+        return digest.prefix(16).map { String(format: "%02x", $0) }.joined()
+    }
+
     static func fetch(token: String, now: Date = Date()) async throws -> CreditSample {
         var req = URLRequest(url: URL(string: "https://api.github.com/copilot_internal/user")!)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")

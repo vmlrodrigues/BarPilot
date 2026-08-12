@@ -2,10 +2,9 @@ import Foundation
 import SQLite3
 
 // ---------------------------------------------------------------------------
-// RemoteStore — a SEPARATE local SQLite store of OTHER machines' pulled
-// aggregates, keyed by machine UUID. Deliberately isolated from the raw span
-// cache (Cache.swift): it holds clearly-foreign, pre-aggregated data, never raw
-// spans, so there's no cross-machine dedup or consistency problem.
+// RemoteStore — a SEPARATE local SQLite store of OTHER machines' pulled sync
+// payloads, keyed by random machine UUID. It holds authoritative counter
+// observations plus temporary legacy aggregates, never raw spans or content.
 //
 // Each pull replaces a machine's row wholesale (INSERT OR REPLACE). Cleared on
 // disable / revert. A missing/foreign machine can be forgotten individually
@@ -41,8 +40,8 @@ enum RemoteStore {
         return db
     }
 
-    /// Store (or replace) one machine's aggregate.
-    static func save(_ agg: MachineAggregate) {
+    /// Store (or replace) one machine's payload.
+    static func save(_ agg: MachineSyncPayload) {
         guard let data = try? JSONEncoder().encode(agg),
               let json = String(data: data, encoding: .utf8),
               let db = open() else { return }
@@ -56,18 +55,18 @@ enum RemoteStore {
         sqlite3_step(stmt)
     }
 
-    /// All stored machine aggregates (undecodable rows are skipped).
-    static func load() -> [MachineAggregate] {
+    /// All stored machine payloads (undecodable rows are skipped).
+    static func load() -> [MachineSyncPayload] {
         guard let db = open() else { return [] }
         defer { sqlite3_close(db) }
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, "SELECT json FROM machines", -1, &stmt, nil) == SQLITE_OK else { return [] }
         defer { sqlite3_finalize(stmt) }
-        var out: [MachineAggregate] = []
+        var out: [MachineSyncPayload] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
             if let c = sqlite3_column_text(stmt, 0),
                let data = String(cString: c).data(using: .utf8),
-               let agg = try? JSONDecoder().decode(MachineAggregate.self, from: data) {
+               let agg = try? JSONDecoder().decode(MachineSyncPayload.self, from: data) {
                 out.append(agg)
             }
         }
@@ -101,7 +100,7 @@ enum RemoteStore {
         }
     }
 
-    /// Wipe all remote aggregates (on disable / revert). Local raw cache untouched.
+    /// Wipe all remote payloads (on disable / revert). Local history is untouched.
     static func clear() {
         guard let db = open() else { return }
         defer { sqlite3_close(db) }

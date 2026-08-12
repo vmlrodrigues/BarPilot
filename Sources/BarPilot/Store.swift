@@ -34,8 +34,8 @@ final class UsageStore: ObservableObject {
     /// Latest USD→AUD rate (nil until fetched/cached); published so the UI updates.
     @Published private(set) var usdToAUD: Double?
 
-    /// Multi-machine sync (opt-in, default OFF). When ON, the aggregate tabs show
-    /// this machine + remote machines combined; Sessions/Top stay local.
+    /// Multi-machine sync (opt-in, default OFF). The primary timeline unions
+    /// account-counter observations; legacy aggregate tabs still combine rows.
     @Published var syncEnabled: Bool { didSet { UserDefaults.standard.set(syncEnabled, forKey: Self.syncKey); recompute() } }
     /// Machines contributing to the combined view (this + remotes); 1 when OFF.
     @Published private(set) var syncMachineCount: Int = 1
@@ -52,6 +52,7 @@ final class UsageStore: ObservableObject {
     @Published private(set) var serverUsageSample: CreditSample?
     @Published private(set) var serverUsageError: String?
     private var creditSamples: [CreditSample] = []
+    private var serverUsageAccountFingerprint: String?
     private var serverUsageGeneration = 0
     private var activeServerRefreshes: Set<Int> = []
 
@@ -81,6 +82,7 @@ final class UsageStore: ObservableObject {
     private static let syncKey = "multiMachineSyncEnabled"
     private static let serverUsageKey = "serverCreditUsageEnabled"
     private static let serverUsageBaselineKey = "serverCreditUsageBaselineMs"
+    private static let serverUsageAccountKey = "serverCreditUsageAccountFingerprint"
     private static let utcCalendar: Calendar = {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "UTC")!
@@ -110,6 +112,7 @@ final class UsageStore: ObservableObject {
         customFrom = cal.date(from: cal.dateComponents([.year, .month], from: now)) ?? now
 
         serverUsageEnabled = UserDefaults.standard.bool(forKey: Self.serverUsageKey)
+        serverUsageAccountFingerprint = UserDefaults.standard.string(forKey: Self.serverUsageAccountKey)
         if serverUsageEnabled,
            let baseline = Int64(UserDefaults.standard.string(forKey: Self.serverUsageBaselineKey) ?? ""),
            let latest = CreditSampleStore.latest(from: baseline) {
@@ -223,9 +226,9 @@ final class UsageStore: ObservableObject {
         menuBarTitle = showExporterWarning ? "⚠︎ " + cost : cost
     }
 
-    /// Other machines' aggregates to combine, from the local RemoteStore (last
-    /// pull). Excludes this machine's own id defensively.
-    private func currentRemoteAggregates() -> [MachineAggregate] {
+    /// Other machines' payloads from the last successful pull. Excludes this
+    /// machine's own id defensively.
+    private func currentRemoteAggregates() -> [MachineSyncPayload] {
         RemoteStore.load().filter { $0.machineId != Self.machineId }
     }
 
@@ -240,7 +243,6 @@ final class UsageStore: ObservableObject {
         UserDefaults.standard.set(id, forKey: "syncMachineId")
         return id
     }
-    private static var machineLabel: String { Host.current().localizedName ?? ProcessInfo.processInfo.hostName }
     private static func nowISO() -> String { ISO8601DateFormatter().string(from: Date()) }
     private static let pushFPKey = "syncLastPushFingerprint"
 
@@ -267,7 +269,7 @@ final class UsageStore: ObservableObject {
         UserDefaults.standard.removeObject(forKey: Self.pushFPKey)
     }
 
-    /// Push this machine's aggregate (only if it changed) and pull the others
+    /// Push this machine's payload (only if it changed) and pull the others
     /// into the RemoteStore, then recompute. Safe no-op when off / no token.
     func syncNow(force: Bool = false) async {
         guard syncEnabled, !isSyncing, let token = Keychain.token() else { return }   // reentrancy guard
@@ -275,9 +277,20 @@ final class UsageStore: ObservableObject {
         defer { isSyncing = false }
         let backend = GitHubBackend(token: token)
         if syncLogin == nil { syncLogin = await backend.currentLogin() }   // backfill for already-enabled installs
-        let mine = SyncAggregate.project(allRecords, machineId: Self.machineId,
-                                         label: Self.machineLabel, updatedAt: Self.nowISO())
-        let fp = "\(mine.rows.count):\(mine.rows.reduce(0.0) { $0 + $1.credits }):\(mine.rows.reduce(0) { $0 + $1.inTok + $1.outTok })"
+        let mine = SyncAggregate.project(
+            allRecords, creditSamples: creditSamples,
+            accountFingerprint: serverUsageAccountFingerprint,
+            machineId: Self.machineId, label: nil, updatedAt: Self.nowISO()
+        )
+        let syncedSamples = mine.creditSamples ?? []
+        let fp = [
+            "\(mine.rows.count)",
+            "\(mine.rows.reduce(0.0) { $0 + $1.credits })",
+            "\(mine.rows.reduce(0) { $0 + $1.inTok + $1.outTok })",
+            "\(syncedSamples.count)",
+            "\(syncedSamples.first?.resetAtMs ?? 0)",
+            "\(mine.accountFingerprint ?? "")"
+        ].joined(separator: ":")
         if !syncPushBlocked && (force || fp != UserDefaults.standard.string(forKey: Self.pushFPKey) || syncError != nil) {
             do {
                 try await backend.push(mine)
@@ -322,6 +335,8 @@ final class UsageStore: ObservableObject {
     func enableServerUsageWith(token: String) async -> Bool {
         serverUsageGeneration += 1
         CreditUsageKeychain.saveToken(token)
+        serverUsageAccountFingerprint = nil
+        UserDefaults.standard.removeObject(forKey: Self.serverUsageAccountKey)
         serverUsageSample = nil
         creditSamples = []
         UserDefaults.standard.removeObject(forKey: Self.serverUsageBaselineKey)
@@ -335,6 +350,8 @@ final class UsageStore: ObservableObject {
             serverUsageEnabled = false
             UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
             CreditUsageKeychain.deleteToken()
+            serverUsageAccountFingerprint = nil
+            UserDefaults.standard.removeObject(forKey: Self.serverUsageAccountKey)
             UserDefaults.standard.removeObject(forKey: Self.serverUsageBaselineKey)
             creditSamples = []
             serverUsageSample = nil
@@ -350,6 +367,8 @@ final class UsageStore: ObservableObject {
         serverUsageEnabled = false
         UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
         CreditUsageKeychain.deleteToken()
+        serverUsageAccountFingerprint = nil
+        UserDefaults.standard.removeObject(forKey: Self.serverUsageAccountKey)
         serverUsageSample = nil
         creditSamples = []
         serverUsageError = nil
@@ -371,6 +390,12 @@ final class UsageStore: ObservableObject {
         do {
             let sample = try await CreditUsageAPI.fetch(token: token)
             guard serverUsageEnabled, generation == serverUsageGeneration else { return }
+            if serverUsageAccountFingerprint == nil,
+               let fingerprint = await CreditUsageAPI.accountFingerprint(token: token) {
+                guard serverUsageEnabled, generation == serverUsageGeneration else { return }
+                serverUsageAccountFingerprint = fingerprint
+                UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
+            }
             if creditSamples.isEmpty {
                 UserDefaults.standard.set(String(sample.capturedAtMs), forKey: Self.serverUsageBaselineKey)
             }
@@ -424,8 +449,27 @@ final class UsageStore: ObservableObject {
     }
     var creditTimeline: CreditTimeline {
         guard let current = currentServerUsageSample else { return .empty }
-        return CreditTimeline.build(
-            samples: creditSamples.filter { $0.resetAtMs == current.resetAtMs })
+        guard let accountFingerprint = serverUsageAccountFingerprint else {
+            return CreditTimeline.build(
+                samples: creditSamples.filter { $0.resetAtMs == current.resetAtMs }
+            )
+        }
+        let remotes = syncEnabled ? currentRemoteAggregates() : []
+        let merged = SyncAggregate.mergedCreditSamples(
+            local: creditSamples, remotes: remotes,
+            resetAtMs: current.resetAtMs,
+            accountFingerprint: accountFingerprint
+        )
+        return CreditTimeline.build(samples: merged)
+    }
+
+    var counterSyncMachineCount: Int {
+        guard syncEnabled, let accountFingerprint = serverUsageAccountFingerprint else { return 1 }
+        let matching = currentRemoteAggregates().filter {
+            $0.accountFingerprint == accountFingerprint
+                && !($0.creditSamples ?? []).isEmpty
+        }
+        return matching.count + 1
     }
     var classifiedTotalCredits: Double { reconciled.classifiedCredits }
     var sessionClassifiedTotalCredits: Double {

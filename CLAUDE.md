@@ -65,7 +65,7 @@ Other headless modes — run the relevant ones after touching their area:
 | `--verify-incremental` | incremental JSONL reads never lose/duplicate a record (#24) |
 | `--verify-watchdog` | exporter-heartbeat rules: warn only when running-but-not-writing (#27) |
 | `--verify-projection` | spend-projection run-rate math + guards (#18) |
-| `--verify-sync` | sync aggregate reproduces the raw Models fit (#3) |
+| `--verify-sync` | v2 sync payload, account isolation, remote gap-fill, legacy fit |
 | `--verify-credits` | server-counter parsing, current-cycle guards, and unclassified reconciliation (#33) |
 | `--sync-preview` | combined multi-machine view vs a simulated second machine |
 | `--diagnose` | support report: state, a timed load, recent reload log |
@@ -183,11 +183,14 @@ Info.plist           LSUIElement (menu-bar-only) agent bundle.
 build-app.sh         Build + assemble + ad-hoc codesign the .app.
 ```
 
-Data flow: `DataSources.loadAll()` (off-actor) → `UsageStore.allRecords` (cached
-raw) → `Aggregator.build(...)` on every period change → local `Report` →
-`CreditReconciliation.build(...)` → SwiftUI views. The reconciliation overlay
-never mutates local aggregation. Changing the period only re-aggregates cached
-records (instant); only the timer / refresh / window-open re-reads disk.
+Primary data flow: `CreditUsageAPI` → `CreditSampleStore` → local observations +
+matching `MachineSyncPayload` observations → `CreditTimeline` →
+`CompactDashboard`. Account counters are unioned and deduplicated, never summed.
+
+Legacy data flow: `DataSources.loadAll()` (off-actor) → `UsageStore.allRecords`
+(cached raw) → `Aggregator.build(...)` on every period change → local `Report` →
+`CreditReconciliation.build(...)` → deprecated telemetry views. The reconciliation
+overlay never mutates local aggregation.
 
 ## Design decisions — don't casually revert these (all user-chosen)
 
@@ -203,9 +206,21 @@ records (instant); only the timer / refresh / window-open re-reads disk.
   so disabling one feature cannot silently disable the other. (#33)
 - **The primary UI is server-first and current-cycle only.** It shows credits,
   USD + AUD, monthly budget progress, a daily usage bar chart, and daily
-  observed counter deltas. Counter growth across gaps longer than 90 minutes is
-  shown as unallocated rather than assigned to a day. The telemetry tabs remain
-  temporarily accessible behind a deprecated legacy-view control. (#34)
+  observed counter deltas. Long gaps within one UTC day can be assigned safely;
+  unsampled growth crossing a UTC day boundary remains unallocated. The telemetry
+  tabs remain temporarily accessible behind a deprecated legacy-view control. (#34)
+- **Multi-machine sync uses schema v2 counter observations.** Each Mac publishes
+  only its first locally captured observation in each 15-minute UTC bucket. Pulled
+  samples stay in the separate remote store and are
+  never re-published. An opaque account fingerprint gates merging; account-wide
+  counter values are never added across machines. Schema v2 retains legacy
+  aggregate rows only during deprecation. Truncated gist files are fetched through
+  their authenticated `raw_url`.
+- **Legacy retirement does not delete the application database.** `credit_samples`
+  shares the existing SQLite file with `spans` and `meta`. Stop telemetry
+  ingestion first; leave legacy tables intact for rollback, then remove them only
+  in a later versioned migration. The remote store likewise remains during the
+  transition.
 - **Budget = one editable monthly USD figure** (`monthlyBudgetUSD`, default $150
   ≈ $5/day), pro-rated to a per-day rate via `avgDaysPerMonth = 30.4375` and
   multiplied by the selected range's days. Edited via an NSAlert from the

@@ -11,10 +11,10 @@ glance. Click the menu-bar item to open a compact current-cycle dashboard with
 credits, USD and AUD values, budget progress, and an observed daily-usage chart.
 
 Written in **Swift / SwiftUI**, fully self-contained with **no external
-dependencies**: it reads your local GitHub Copilot OTel telemetry directly off
-disk — your usage data never leaves your machine. Network access is limited to
-GitHub authentication and the optional account credit counter, app updates, and
-the USD→AUD exchange-rate fetch.
+dependencies**. The primary dashboard stores GitHub’s account credit counter
+locally; the deprecated detail view reads Copilot OTel telemetry directly from
+disk. Network access is limited to GitHub authentication and credit totals,
+optional private-gist sync, app updates, and the USD→AUD exchange-rate fetch.
 
 ## What it shows
 
@@ -22,20 +22,17 @@ the USD→AUD exchange-rate fetch.
 - **Detail window** (click the menu-bar item):
   - Current billing-cycle credits and their value in both USD and AUD.
   - A daily credit-usage bar chart built from persisted GitHub samples.
-  - An observed daily-spend table. Opening and offline-gap usage remains separate
-    rather than being assigned to a day without evidence.
+  - An observed daily-spend table. Opening usage and unsampled growth crossing a
+    UTC day boundary remain separate rather than being assigned without evidence.
   - **Monthly budget bar:** set one USD budget from the menu-bar icon's
     right-click menu → **Set Monthly Budget…**. The bar shows current spend,
     projected month-end spend, and the budget marker in both USD and AUD.
   - A temporary **legacy telemetry** view retains Summary, Models, Daily,
     Sessions, and Top during the transition. It is explicitly marked incomplete
     and scheduled for removal.
-  - Optional **GitHub Credit Total** (right-click menu): uses GitHub's current
-    billing-cycle counter as the headline total, keeps local telemetry for the
-    detailed breakdown, and shows any difference as a separated **Unclassified**
-    row in Summary and Models rather than guessing which model, day, session, or
-    call used it.
-  - Footer shows each data source's status — **green** = data flowing,
+  - **GitHub Credit Total** (right-click menu) connects the current-cycle
+    account counter. Failed polls retain the last good value.
+  - The legacy footer shows each telemetry source's status — **green** = data flowing,
     **orange** = telemetry enabled but no traces yet, **grey** = telemetry not
     enabled. If either source's OTel telemetry isn't configured, a warning with
     an **Enable…** button appears: it shows exactly what will change (VS Code
@@ -70,9 +67,24 @@ default, or AUD (100 credits = $1.00 USD).
 > BarPilot will appear in the **Always Hidden** section. Open Ice → **Settings →
 > Menu Bar Layout** and drag BarPilot up into the **Visible** section.
 
-## Data sources
+## Credit data
 
-The attribution sources are read directly off disk, merged, and de-duplicated:
+The primary dashboard polls GitHub’s authenticated account counter once a minute
+and stores each successful cumulative observation in the local SQLite database.
+Daily usage is derived from counter increases: observations from the same UTC day
+can be assigned to that day, while an unsampled increase crossing a day boundary
+remains unallocated. Failed polls never write a zero.
+
+Optional **Multi-Machine Sync** stores a compact versioned payload in a secret
+gist. Each Mac publishes only observations it captured itself: every counter
+cycle’s first observation captured in each 15-minute interval.
+Matching observations are unioned and de-duplicated, never summed, because every
+Mac is observing the same account-wide counter. An opaque account fingerprint
+prevents observations from different Copilot accounts being merged.
+
+## Legacy telemetry sources
+
+The deprecated detail view reads these attribution sources directly off disk:
 
 | Source | Format | Path |
 |---|---|---|
@@ -85,11 +97,8 @@ A source is silently skipped if its file is absent. Credits = `nano_aiu / 1e9`;
 cost = `credits / 100` (100 credits = $1.00). Model names are normalised so
 `claude-sonnet-4-6` (VS Code) and `claude-sonnet-4.6` (Mac App) merge.
 
-When **GitHub Credit Total** is enabled, BarPilot also polls GitHub's authenticated
-account counter once a minute and stores cumulative samples locally. The endpoint
-is internal and unsupported, so failures retain the last good sample and local
-telemetry remains the fallback. The live counter is directly authoritative only
-for **This Month**; other selected ranges remain local.
+The account endpoint is internal and unsupported. Local telemetry remains
+available temporarily as a fallback and for the explicitly marked legacy view.
 
 The JSONL file is large (100 MB+), so it's memory-mapped and scanned in a single
 pass — only the few hundred lines carrying a usage attribute are JSON-parsed.
@@ -139,6 +148,8 @@ Sources/BarPilot/
   CreditTimeline.swift Conservative daily sample projection
   CreditReconciliation.swift Server total + local attribution overlay
   CompactDashboard.swift Primary current-cycle dashboard + legacy transition
+  SyncAggregate.swift Versioned counter-observation + legacy sync payload
+  GitHubBackend.swift Private-gist multi-machine sync transport
   DetailView.swift   Window UI: header, sparkline, budget bar, status footer
   Tabs.swift         Summary / Models / Daily / Sessions / Top tables
   Setup.swift        Native opt-in OTel telemetry enablement (the "Enable…" button)
@@ -161,7 +172,7 @@ If you truly see nothing, confirm it's running: `pgrep -lf BarPilot`.
 ## Notes
 
 - The app refreshes automatically every 60 seconds, on window open, and when you
-  press the refresh button or change the period. Your period choice is remembered.
+  press the refresh button. The legacy view remembers its selected period.
 - **Auto-update:** BarPilot checks GitHub for a newer release shortly after launch
   and every few hours. When one is found it downloads the notarised DMG, verifies
   it's signed by the same developer, then installs it and relaunches — silently, in

@@ -1,16 +1,13 @@
 import Foundation
 
 // ---------------------------------------------------------------------------
-// SyncAggregate — the compact per-(UTC-day, model, level) projection of this
-// machine's raw cache that gets synced between machines. NEVER raw spans.
+// SyncAggregate — the versioned per-machine payload used for multi-Mac sync.
 //
-// Each row carries the regression cross-products (sii…scc) alongside the totals,
-// so summing rows — across days, levels, or machines — reconstructs the
-// Models-tab effective-rate fit exactly (summation is associative; the fit is a
-// pure function of those sums). Bucketing by (day, model, level) preserves the
-// 0.6.0 reasoning-level breakdown in the combined multi-machine view.
+// Counter observations are account-wide and are merged, never summed. Legacy
+// telemetry aggregates remain in schema v2 only while the old interface is
+// available. No raw spans, prompts, or content are synced.
 //
-// This file is transport-agnostic: it computes and (de)serializes the aggregate.
+// This file is transport-agnostic: it computes and serializes the payload.
 // Pushing/pulling it lives behind SyncBackend (added later).
 // ---------------------------------------------------------------------------
 
@@ -26,21 +23,47 @@ struct AggregateRow: Codable {
     var sii: Double, soo: Double, sio: Double, sic: Double, soc: Double, scc: Double
 }
 
-/// One machine's full aggregate (one file per machine on the sync backend).
-struct MachineAggregate: Codable {
+struct SyncedCreditSample: Codable, Equatable {
+    var capturedAtMs: Int64
+    var serverAtMs: Int64?
+    var resetAtMs: Int64
+    var creditsUsed: Double
+
+    init(_ sample: CreditSample) {
+        capturedAtMs = sample.capturedAtMs
+        serverAtMs = sample.serverAtMs
+        resetAtMs = sample.resetAtMs
+        creditsUsed = sample.creditsUsed
+    }
+
+    var creditSample: CreditSample {
+        CreditSample(
+            capturedAtMs: capturedAtMs, serverAtMs: serverAtMs,
+            resetAtMs: resetAtMs, creditsUsed: creditsUsed
+        )
+    }
+}
+
+/// One machine's complete versioned payload (one file per machine).
+struct MachineSyncPayload: Codable {
     var schemaVersion: Int
     var machineId: String
     var machineLabel: String?
     var updatedAt: String     // ISO8601 UTC
     var rows: [AggregateRow]
+    var accountFingerprint: String? = nil
+    var creditSamples: [SyncedCreditSample]? = nil
 }
 
 enum SyncAggregate {
-    static let schemaVersion = 1
+    static let schemaVersion = 2
 
-    /// Project raw records into per-(UTC-day, model, level) aggregate rows.
-    static func project(_ records: [UsageRecord],
-                        machineId: String, label: String?, updatedAt: String) -> MachineAggregate {
+    /// Project local-only data into the payload for this machine. Re-publishing
+    /// pulled observations would create feedback loops, so callers must never pass
+    /// remote samples here.
+    static func project(_ records: [UsageRecord], creditSamples: [CreditSample] = [],
+                        accountFingerprint: String? = nil,
+                        machineId: String, label: String?, updatedAt: String) -> MachineSyncPayload {
         struct Key: Hashable { let day: String; let model: String; let level: String? }
         struct Acc {
             var calls = 0; var credits = 0.0; var inTok = 0; var outTok = 0
@@ -62,8 +85,71 @@ enum SyncAggregate {
                          calls: a.calls, credits: a.credits, inTok: a.inTok, outTok: a.outTok,
                          sii: a.sii, soo: a.soo, sio: a.sio, sic: a.sic, soc: a.soc, scc: a.scc)
         }
-        return MachineAggregate(schemaVersion: schemaVersion, machineId: machineId,
-                                machineLabel: label, updatedAt: updatedAt, rows: rows)
+        return MachineSyncPayload(
+            schemaVersion: schemaVersion, machineId: machineId,
+            machineLabel: label, updatedAt: updatedAt, rows: rows,
+            accountFingerprint: accountFingerprint,
+            creditSamples: accountFingerprint == nil
+                ? nil
+                : compactCreditSamples(creditSamples).map(SyncedCreditSample.init)
+        )
+    }
+
+    /// Preserve the first local observation in each 15-minute UTC bucket. Local
+    /// storage keeps every poll; immutable buckets keep sync to at most four
+    /// payload updates per hour and about 3,000 rows per 31-day cycle.
+    static func compactCreditSamples(_ samples: [CreditSample]) -> [CreditSample] {
+        struct Bucket: Hashable {
+            var resetAtMs: Int64
+            var quarterHour: Int64
+        }
+        let ordered = samples.sorted { $0.capturedAtMs < $1.capturedAtMs }
+        var firstByBucket: [Bucket: CreditSample] = [:]
+        for sample in ordered {
+            let bucket = Bucket(
+                resetAtMs: sample.resetAtMs,
+                quarterHour: sample.capturedAtMs / (15 * 60 * 1000)
+            )
+            if firstByBucket[bucket] == nil {
+                firstByBucket[bucket] = sample
+            }
+        }
+        return firstByBucket.values
+            .sorted { $0.capturedAtMs < $1.capturedAtMs }
+    }
+
+    /// Merge the same account-wide counter as observed by several machines.
+    /// Exact duplicate observations collapse; values are never added together.
+    static func mergedCreditSamples(
+        local: [CreditSample], remotes: [MachineSyncPayload],
+        resetAtMs: Int64, accountFingerprint: String
+    ) -> [CreditSample] {
+        struct Key: Hashable {
+            let capturedAtMs: Int64
+            let serverAtMs: Int64?
+            let resetAtMs: Int64
+            let creditsBits: UInt64
+        }
+        let remote = remotes
+            .filter { $0.accountFingerprint == accountFingerprint }
+            .flatMap { $0.creditSamples ?? [] }
+            .map(\.creditSample)
+        var seen: Set<Key> = []
+        return (local + remote)
+            .filter { $0.resetAtMs == resetAtMs }
+            .filter { sample in
+                seen.insert(Key(
+                    capturedAtMs: sample.capturedAtMs,
+                    serverAtMs: sample.serverAtMs,
+                    resetAtMs: sample.resetAtMs,
+                    creditsBits: sample.creditsUsed.bitPattern
+                )).inserted
+            }
+            .sorted {
+                let lhs = $0.serverAtMs ?? $0.capturedAtMs
+                let rhs = $1.serverAtMs ?? $1.capturedAtMs
+                return lhs == rhs ? $0.capturedAtMs < $1.capturedAtMs : lhs < rhs
+            }
     }
 
     // -----------------------------------------------------------------------
@@ -78,9 +164,76 @@ enum SyncAggregate {
         let raw = Aggregator.build(records: records, fromStr: range.from, toStr: range.to, todayStr: today)
 
         // Project, then round-trip through JSON to also exercise Codable + size.
-        let agg = project(records, machineId: "self", label: "verify", updatedAt: "")
+        let sampleStart = Aggregator.utcMidnightMs("2030-01-10")
+        let reset = Aggregator.utcMidnightMs("2030-02-01")
+        let sampleFixture = [
+            CreditSample(capturedAtMs: sampleStart, serverAtMs: nil, resetAtMs: reset, creditsUsed: 100),
+            CreditSample(capturedAtMs: sampleStart + 60_000, serverAtMs: nil, resetAtMs: reset, creditsUsed: 100),
+            CreditSample(capturedAtMs: sampleStart + 3_600_000, serverAtMs: nil, resetAtMs: reset, creditsUsed: 100),
+            CreditSample(capturedAtMs: sampleStart + 3_660_000, serverAtMs: nil, resetAtMs: reset, creditsUsed: 110)
+        ]
+        let agg = project(
+            records, creditSamples: sampleFixture,
+            accountFingerprint: "same-account",
+            machineId: "self", label: nil, updatedAt: ""
+        )
         let data = try! JSONEncoder().encode(agg)
-        let decoded = try! JSONDecoder().decode(MachineAggregate.self, from: data)
+        let decoded = try! JSONDecoder().decode(MachineSyncPayload.self, from: data)
+        precondition(decoded.schemaVersion == 2 && decoded.creditSamples?.count == 2,
+                     "sync v2 must round-trip one immutable observation per 15 minutes")
+        let legacyJSON = """
+        {"schemaVersion":1,"machineId":"legacy","updatedAt":"","rows":[]}
+        """
+        let legacy = try! JSONDecoder().decode(
+            MachineSyncPayload.self, from: Data(legacyJSON.utf8)
+        )
+        precondition(legacy.accountFingerprint == nil && legacy.creditSamples == nil,
+                     "schema v1 payloads must remain readable during migration")
+        let merged = mergedCreditSamples(
+            local: sampleFixture,
+            remotes: [decoded],
+            resetAtMs: reset,
+            accountFingerprint: "same-account"
+        )
+        precondition(merged.count == sampleFixture.count,
+                     "remote observations must union with exact local duplicates, not sum")
+        var otherAccount = decoded
+        otherAccount.accountFingerprint = "different-account"
+        otherAccount.creditSamples = [
+            SyncedCreditSample(CreditSample(
+                capturedAtMs: sampleStart + 7_200_000, serverAtMs: nil,
+                resetAtMs: reset, creditsUsed: 999
+            ))
+        ]
+        let isolated = mergedCreditSamples(
+            local: sampleFixture,
+            remotes: [otherAccount],
+            resetAtMs: reset,
+            accountFingerprint: "same-account"
+        )
+        precondition(isolated.count == sampleFixture.count,
+                     "counter observations from another account must be ignored")
+
+        let gapStart = Aggregator.utcMidnightMs("2030-01-10") + 23 * 3_600_000
+        let localGap = [
+            CreditSample(capturedAtMs: gapStart, serverAtMs: nil, resetAtMs: reset, creditsUsed: 100),
+            CreditSample(capturedAtMs: gapStart + 3 * 3_600_000, serverAtMs: nil, resetAtMs: reset, creditsUsed: 160)
+        ]
+        let remoteGap = project(
+            [], creditSamples: [
+                CreditSample(capturedAtMs: gapStart + 3_600_000, serverAtMs: nil, resetAtMs: reset, creditsUsed: 120),
+                CreditSample(capturedAtMs: gapStart + 2 * 3_600_000, serverAtMs: nil, resetAtMs: reset, creditsUsed: 150)
+            ],
+            accountFingerprint: "same-account",
+            machineId: "remote", label: nil, updatedAt: ""
+        )
+        let filledTimeline = CreditTimeline.build(samples: mergedCreditSamples(
+            local: localGap, remotes: [remoteGap],
+            resetAtMs: reset, accountFingerprint: "same-account"
+        ))
+        precondition(filledTimeline.observedCredits == 60
+                     && filledTimeline.unallocatedCredits == 0,
+                     "remote observations must fill a local cross-day sampling gap")
 
         struct S {
             var calls = 0; var credits = 0.0; var inTok = 0; var outTok = 0
@@ -125,6 +278,7 @@ enum SyncAggregate {
             let rtOK = reloaded.count == 1
                 && reloaded.first?.machineId == agg.machineId
                 && reloaded.first?.rows.count == agg.rows.count
+                && reloaded.first?.creditSamples?.count == agg.creditSamples?.count
             err.write(Data((rtOK
                 ? "remote-store: PASS — aggregate persisted and reloaded intact (\(reloaded.first?.rows.count ?? 0) rows)\n"
                 : "remote-store: FAIL — persistence round-trip mismatch\n").utf8))
@@ -142,10 +296,10 @@ enum SyncAggregate {
         let (records, _) = DataSources.loadAll()
         let local = project(records, machineId: "this-mac", label: "this machine", updatedAt: "")
         // Real sync pulls each OTHER machine's actual aggregate; here we mirror.
-        let sim = MachineAggregate(schemaVersion: schemaVersion, machineId: "sim-mac-2",
+        let sim = MachineSyncPayload(schemaVersion: schemaVersion, machineId: "sim-mac-2",
                                    machineLabel: "simulated machine 2", updatedAt: "", rows: local.rows)
 
-        func perModel(_ macs: [MachineAggregate]) -> [String: (calls: Int, credits: Double)] {
+        func perModel(_ macs: [MachineSyncPayload]) -> [String: (calls: Int, credits: Double)] {
             var m: [String: (Int, Double)] = [:]
             for mac in macs { for r in mac.rows {
                 var t = m[r.model] ?? (0, 0.0); t.0 += r.calls; t.1 += r.credits; m[r.model] = t

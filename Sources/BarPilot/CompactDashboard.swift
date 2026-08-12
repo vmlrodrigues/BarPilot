@@ -32,14 +32,6 @@ struct CompactDashboard: View {
                     .foregroundStyle(.tint)
                 Text("Copilot Credits")
                     .font(.headline)
-                if Updater.isDevBuild {
-                    Text("PROTOTYPE")
-                        .font(.caption2.weight(.bold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Color.orange, in: Capsule())
-                }
                 Spacer()
                 if store.isLoading { ProgressView().controlSize(.small) }
                 Button {
@@ -221,6 +213,14 @@ struct CompactDashboard: View {
                 Text("· updated \(Fmt.dateTime(Int64(updated.timeIntervalSince1970 * 1000)))")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
+            }
+            if store.syncEnabled {
+                let hasError = store.syncError != nil
+                Text(hasError
+                     ? "· sync error"
+                     : "· sync \(store.counterSyncMachineCount) Mac\(store.counterSyncMachineCount == 1 ? "" : "s")")
+                    .font(.caption2)
+                    .foregroundStyle(hasError ? Color.red : Color.secondary)
             }
             Spacer()
             Text("v\(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?")\(Updater.isDevBuild ? "-dev" : "")")

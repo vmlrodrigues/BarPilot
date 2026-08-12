@@ -17,7 +17,7 @@ struct AppMain {
             Dump.run()
             exit(0)
         }
-        // Dev-only: prove the sync aggregate projection reproduces the raw fit.
+        // Dev-only: verify the versioned sync payload and legacy projection.
         if CommandLine.arguments.contains("--verify-sync") {
             SyncAggregate.verifySelfConsistency()
             exit(0)
@@ -240,7 +240,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if store.syncEnabled {
             let a = NSAlert()
             a.messageText = "Turn off multi-machine sync?"
-            a.informativeText = "This machine will show only its own usage again. Your local data is untouched; the token is removed and cached remote data cleared. Your gist on GitHub is left in place."
+            a.informativeText = "This Mac will stop using counter observations captured by your other Macs. Local history is untouched; the token is removed and cached remote data cleared. Your gist on GitHub is left in place."
             a.addButton(withTitle: "Turn Off")
             a.addButton(withTitle: "Cancel")
             NSApp.activate(ignoringOtherApps: true)
@@ -266,7 +266,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         1.  You run Copilot on more than one Mac.
         2.  Your GitHub account can create gists.
 
-        Most work or enterprise accounts have gists disabled, so sync won’t work with those — a gist is where the data is stored. What’s shared is a small per-day, per-model usage summary (credit and token counts) in a secret gist in your account: no code, no prompts, no content. Every Mac must use the same account.
+        Most work or enterprise accounts have gists disabled, so sync won’t work with those — a gist is where the data is stored. BarPilot shares compact cumulative credit observations so one Mac can fill another Mac’s offline gaps. During the legacy transition it also retains the existing daily telemetry summary. No code, prompts, or content are uploaded. Every Mac must use the same account.
 
         Open GitHub and enter the code below (already copied to your clipboard). It finishes on its own once you approve.
         """
