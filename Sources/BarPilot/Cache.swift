@@ -33,6 +33,9 @@ enum SpanCache {
             return nil
         }
         sqlite3_exec(db, "PRAGMA journal_mode=WAL", nil, nil, nil)
+        // Wait for a competing writer rather than failing instantly; the credit
+        // sample store writes this same file from another task.
+        sqlite3_busy_timeout(db, 5000)
         sqlite3_exec(db, """
         CREATE TABLE IF NOT EXISTS spans (
             span_id       TEXT PRIMARY KEY,

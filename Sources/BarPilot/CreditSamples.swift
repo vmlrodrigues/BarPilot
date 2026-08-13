@@ -23,6 +23,11 @@ enum CreditSampleStore {
             return nil
         }
         sqlite3_exec(db, "PRAGMA journal_mode=WAL", nil, nil, nil)
+        // Credit samples are written from a different task than the span
+        // merge, so two writers now contend for this file. WAL allows
+        // concurrent readers but still only one writer: without a timeout the
+        // loser gets SQLITE_BUSY immediately instead of waiting its turn.
+        sqlite3_busy_timeout(db, 5000)
         sqlite3_exec(db, """
         CREATE TABLE IF NOT EXISTS credit_samples (
             captured_at_ms INTEGER PRIMARY KEY,

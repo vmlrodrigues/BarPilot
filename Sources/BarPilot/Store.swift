@@ -399,11 +399,22 @@ final class UsageStore: ObservableObject {
             return false
         }
         guard saved else {
-            _ = CreditUsageKeychain.deleteToken()
-            serverUsageError = "The GitHub total was received but couldn’t be saved locally."
-            recompute()
-            return false
+            // Authentication succeeded and the credential is stored; only the
+            // opening sample failed to persist. Discarding the token here would
+            // bounce the user back to "Connect GitHub" at the end of a device
+            // flow they completed correctly. Fall through and connect: the
+            // sample is still shown from memory and the next poll re-saves it.
+            DiagLog.write("connect: opening sample not persisted; connecting anyway")
+            return finishServerUsageConnection(sample: sample, fingerprint: fingerprint)
         }
+        return finishServerUsageConnection(sample: sample, fingerprint: fingerprint)
+    }
+
+    /// Commit a verified connection. Shared so a failed *local* persist takes
+    /// exactly the same path as a successful one.
+    private func finishServerUsageConnection(
+        sample: CreditSample, fingerprint: String
+    ) -> Bool {
         serverUsageAccountFingerprint = fingerprint
         UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
         serverUsageEnabled = true

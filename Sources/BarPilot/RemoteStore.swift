@@ -30,6 +30,7 @@ enum RemoteStore {
             return nil
         }
         sqlite3_exec(db, "PRAGMA journal_mode=WAL", nil, nil, nil)
+        sqlite3_busy_timeout(db, 5000)
         sqlite3_exec(db, """
         CREATE TABLE IF NOT EXISTS machines (
             machine_id TEXT PRIMARY KEY,

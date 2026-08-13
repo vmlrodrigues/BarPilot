@@ -43,6 +43,13 @@ All notable changes to BarPilot are documented here.
   the telemetry database and its tables are all still there. (#34)
 
 ### Fixed
+- **Connecting GitHub could fail at the last moment and ask you to start over.**
+  Saving your credit reading and BarPilot's own 60-second refresh now write to
+  the same database, and whichever arrived second was rejected outright instead
+  of waiting its turn. Landing on the connect step meant a completed sign-in was
+  thrown away and the credential deleted. Writers now wait for each other, and a
+  reading that still can't be saved no longer discards a sign-in that worked —
+  the next refresh saves it. (#34)
 - **Settings window layout and behaviour.** It now opens centred, remembers where
   you move it, and closes with cmd-W or quits with cmd-Q — BarPilot is a menu-bar
   agent with no main menu, so it had none of those shortcuts. The switches line up

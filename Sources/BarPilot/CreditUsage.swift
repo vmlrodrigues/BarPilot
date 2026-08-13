@@ -48,6 +48,16 @@ enum CreditUsageAPI {
         return derivedFingerprint(accountId: id.int64Value)
     }
 
+    /// Stable identity for the connected account.
+    ///
+    /// Changing anything here — algorithm, salt, iteration count, or the
+    /// password string — changes the fingerprint for accounts that have not
+    /// changed at all. Saved samples carry the *old* fingerprint, so they are no
+    /// longer `NULL` and `adoptUnattributed` cannot rescue them; queries under
+    /// the new fingerprint return nothing and the user's history disappears
+    /// exactly as it did before rows were attributed. If this ever has to
+    /// change, ship it with a migration that re-maps old to new (and bump the
+    /// adoption meta key), not on its own.
     static func derivedFingerprint(accountId: Int64) -> String? {
         var out = [UInt8](repeating: 0, count: 16)
         let password = Array("barpilot-credit:\(accountId)".utf8)
