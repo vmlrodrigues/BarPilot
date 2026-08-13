@@ -2,7 +2,8 @@
 #
 #   make local                  Ad-hoc local/dev build  -> ./BarPilot.app
 #   make run                    Launch ./BarPilot.app
-#   make release VERSION=0.1.0  Developer ID sign + notarise + DMG + GitHub release
+#   make dmg VERSION=0.1.0      Developer ID sign + notarise + DMG (no tag/publish)
+#   make release VERSION=0.1.0  Everything in `dmg`, then tag + GitHub release
 #   make check                  Verify tools + signing certificate
 #   make clean                  Remove build artifacts
 #
@@ -26,7 +27,7 @@ NOTARIZE_PROFILE      := barpilot-notarization
 # Push with the gh-authenticated account (avoids stale keychain creds 403ing).
 GIT_PUSH := git -c credential.helper="" -c credential.helper="!gh auth git-credential" push
 
-.PHONY: all local run release check clean help
+.PHONY: all local run dmg release check clean help
 
 all: local
 
@@ -34,7 +35,8 @@ help:
 	@echo "BarPilot targets:"
 	@echo "  local                    Ad-hoc local build   -> ./$(APP)"
 	@echo "  run                      Launch ./$(APP)"
-	@echo "  release VERSION=x.y.z    Developer ID sign + notarise + DMG + GitHub release"
+	@echo "  dmg VERSION=x.y.z        Developer ID sign + notarise + DMG (no tag/publish)"
+	@echo "  release VERSION=x.y.z    Everything in 'dmg', then tag + GitHub release"
 	@echo "  check                    Verify tools + signing certificate"
 	@echo "  clean                    Remove build artifacts"
 
@@ -52,8 +54,8 @@ check:
 	@security find-identity -v -p codesigning | grep -q "$(RELEASE_SIGN_IDENTITY)" || { echo "x Developer ID cert not in keychain. Expected:"; echo "    $(RELEASE_SIGN_IDENTITY)"; exit 1; }
 	@echo "OK - all release prerequisites present."
 
-release: check
-	@[ "$(VERSION)" != "0.0.0" ] || { echo "Set a version:  make release VERSION=x.y.z  (or edit ./VERSION)"; exit 1; }
+dmg: check
+	@[ "$(VERSION)" != "0.0.0" ] || { echo "Set a version:  make dmg VERSION=x.y.z  (or edit ./VERSION)"; exit 1; }
 	@echo "=== Building BarPilot $(VERSION) for distribution ==="
 	@rm -rf "$(STAGING)" "$(DMG_NAME)" && mkdir -p "$(STAGING)"
 	@echo "-> Building + signing (Developer ID . Hardened Runtime)..."
@@ -78,11 +80,14 @@ release: check
 	@echo "-> Gatekeeper check..."
 	@xcrun stapler validate "$(DMG_NAME)" && echo "   stapler: OK"
 	@spctl --assess --type open --context context:primary-signature --ignore-cache "$(STAGING)/$(APP)" && echo "   Gatekeeper: OK" || echo "   WARNING: Gatekeeper check failed - review signing/entitlements"
+	@rm -rf "$(STAGING)"
+	@echo "=== Built $(CURDIR)/$(DMG_NAME) (v$(VERSION)) - not tagged, not published ==="
+
+release: dmg
 	@echo "-> Tagging + publishing GitHub release..."
 	git tag "v$(VERSION)"
 	$(GIT_PUSH) origin main "v$(VERSION)"
 	gh release create "v$(VERSION)" --title "BarPilot v$(VERSION)" --notes "BarPilot v$(VERSION). Download the DMG below and drag BarPilot to Applications." "$(DMG_NAME)"
-	@rm -rf "$(STAGING)"
 	@echo "=== Released v$(VERSION) -> https://github.com/vmlrodrigues/BarPilot/releases/tag/v$(VERSION) ==="
 
 clean:

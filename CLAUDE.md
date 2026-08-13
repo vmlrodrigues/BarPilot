@@ -38,6 +38,12 @@ Before running `make release VERSION=x.y.z`:
    add a new `## [Unreleased]` section at the top for future changes.
 3. Commit both files on the feature branch, merge to `main`, then release.
 
+`make dmg VERSION=x.y.z` runs the identical build/sign/notarise/staple pipeline but
+stops before tagging and publishing, so you can install the artifact on a second Mac
+and test the upgrade before anyone else receives it. `make release` depends on `dmg`,
+so the tested binary and the published one are produced the same way. Note `release`
+pushes **main** — merge first.
+
 ## Build / run / verify
 
 ```sh

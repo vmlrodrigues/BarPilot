@@ -4,6 +4,8 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+## [0.10.0] — 2026-08-13
+
 ### Added
 - **Settings window.** Monthly budget, currency, GitHub connection, multi-machine
   sync, start at login, updates and diagnostics now live in one place, reachable
