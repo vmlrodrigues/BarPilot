@@ -52,6 +52,8 @@ final class UsageStore: ObservableObject {
     @Published private(set) var serverUsageSample: CreditSample?
     @Published private(set) var serverUsageError: String?
     @Published private(set) var isConnectingServerUsage = false
+    /// The in-flight device-flow poll, retained so the user can cancel it.
+    private var serverUsageConnectTask: Task<Void, Never>?
     /// Cached in `recompute()` — see `buildCreditTimeline()`.
     @Published private(set) var creditTimeline: CreditTimeline = .empty
     @Published private(set) var counterSyncMachineCount = 1
@@ -453,6 +455,20 @@ final class UsageStore: ObservableObject {
 
     func endServerUsageConnection() {
         isConnectingServerUsage = false
+        serverUsageConnectTask = nil
+    }
+
+    /// Let the user abandon a device-flow authorization that can't complete —
+    /// an account needing a sign-in route BarPilot can't drive, for instance.
+    /// Without this the only exit was force-quitting the app.
+    func cancelServerUsageConnection() {
+        serverUsageConnectTask?.cancel()
+        serverUsageConnectTask = nil
+    }
+
+    /// Hand the store the running device-flow task so `cancel` can reach it.
+    func registerServerUsageConnectTask(_ task: Task<Void, Never>) {
+        serverUsageConnectTask = task
     }
 
     /// Fetch one cumulative counter observation. A failed request never writes a

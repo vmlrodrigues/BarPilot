@@ -12,6 +12,8 @@ import Foundation
 
 enum SyncError: Error {
     case network, denied, expired, encoding, forbidden, unauthorized
+    /// The user backed out, or we stopped waiting for an approval that never came.
+    case cancelled, timedOut
     /// Won't fix itself — stop auto-retrying until the user re-authorizes.
     var isPermanent: Bool {
         switch self { case .forbidden, .unauthorized: return true; default: return false }
@@ -55,12 +57,28 @@ struct GitHubBackend: SyncBackend {
                           interval: (j["interval"] as? Int) ?? 5, expiresIn: (j["expires_in"] as? Int) ?? 900)
     }
 
-    /// Poll until the user authorizes (or the code expires). Returns the token.
-    static func pollForToken(deviceCode: String, interval: Int, expiresIn: Int) async throws -> String {
+    /// How long to keep waiting for an approval before giving up and handing the
+    /// button back. GitHub's own device codes last 15 minutes, which is far too
+    /// long to sit on a spinner: an account that can't complete sign-in here (an
+    /// SSO route that has to be taken elsewhere, say) leaves no way out but
+    /// force-quitting. Kept above a minute because a first-time SSO sign-in
+    /// regularly takes longer than that, and cancelling is now always available.
+    static let authorizationTimeout: TimeInterval = 120
+
+    /// Poll until the user authorizes. Gives up at `timeout`, and stops promptly
+    /// if the surrounding task is cancelled.
+    static func pollForToken(deviceCode: String, interval: Int, expiresIn: Int,
+                             timeout: TimeInterval = authorizationTimeout) async throws -> String {
         var wait = max(interval, 1)
-        let deadline = Date().addingTimeInterval(Double(expiresIn))
+        let deadline = Date().addingTimeInterval(min(Double(expiresIn), timeout))
         while Date() < deadline {
-            try? await Task.sleep(nanoseconds: UInt64(wait) * 1_000_000_000)
+            // Never sleep past the deadline, or a 5s poll interval could hold the
+            // spinner open well beyond the timeout the user was promised.
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { break }
+            do { try await Task.sleep(nanoseconds: UInt64(min(Double(wait), remaining) * 1_000_000_000)) }
+            catch { throw SyncError.cancelled }
+            if Task.isCancelled { throw SyncError.cancelled }
             var req = URLRequest(url: URL(string: "https://github.com/login/oauth/access_token")!)
             req.httpMethod = "POST"
             req.setValue("application/json", forHTTPHeaderField: "Accept")
@@ -76,7 +94,7 @@ struct GitHubBackend: SyncBackend {
             default:                     continue   // authorization_pending / transient
             }
         }
-        throw SyncError.expired
+        throw SyncError.timedOut
     }
 
     // MARK: Gist storage (SyncBackend)

@@ -43,6 +43,12 @@ All notable changes to BarPilot are documented here.
   the telemetry database and its tables are all still there. (#34)
 
 ### Fixed
+- **Connecting to GitHub could hang with no way out.** BarPilot waited as long as
+  GitHub's device code stayed valid — fifteen minutes — with the button disabled
+  and no cancel, so an account that has to sign in by some route BarPilot can't
+  open for you left force-quitting as the only escape. There is now a Cancel
+  button next to the spinner, and the wait gives up on its own after two minutes
+  and hands the button back with an explanation. (#34)
 - **Connecting GitHub could fail at the last moment and ask you to start over.**
   Saving your credit reading and BarPilot's own 60-second refresh now write to
   the same database, and whichever arrived second was rejected outright instead

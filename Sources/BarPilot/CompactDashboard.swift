@@ -46,18 +46,23 @@ struct CompactDashboard: View {
             }
             Spacer(minLength: 8)
             Button {
-                connectGitHub()
+                if store.isConnectingServerUsage {
+                    store.cancelServerUsageConnection()
+                } else {
+                    connectGitHub()
+                }
             } label: {
                 if store.isConnectingServerUsage {
-                    ProgressView()
-                        .controlSize(.small)
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Cancel")
+                    }
                 } else {
                     Text("Connect GitHub")
                 }
             }
                 .buttonStyle(.borderedProminent)
                 .controlSize(.regular)
-                .disabled(store.isConnectingServerUsage)
         }
         .padding(12)
         .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))

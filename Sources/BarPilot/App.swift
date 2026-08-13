@@ -111,7 +111,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.contentViewController = NSHostingController(
             rootView: DetailView(
                 connectGitHub: { [weak self] in
-                    Task { await self?.runCreditUsageDeviceFlow() }
+                    self?.startCreditUsageDeviceFlow()
                 },
                 openSettings: { [weak self] in self?.openSettings() }
             )
@@ -200,7 +200,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let actions = SettingsActions(
-            connectGitHub: { [weak self] in Task { await self?.runCreditUsageDeviceFlow() } },
+            connectGitHub: { [weak self] in self?.startCreditUsageDeviceFlow() },
             disconnectGitHub: { [weak self] in self?.confirmDisconnectGitHub() },
             toggleSync: { [weak self] in self?.toggleSync() },
             checkForUpdates: { Updater.checkNow() },
@@ -255,7 +255,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if store.serverUsageEnabled {
             confirmDisconnectGitHub()
         } else {
-            Task { await runCreditUsageDeviceFlow() }
+            startCreditUsageDeviceFlow()
         }
     }
 
@@ -327,6 +327,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Start the device flow and hand the task to the store, so the usage window
+    /// and Settings can cancel an authorization that is never going to land.
+    func startCreditUsageDeviceFlow() {
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.runCreditUsageDeviceFlow()
+        }
+        store.registerServerUsageConnectTask(task)
+    }
+
     private func runCreditUsageDeviceFlow() async {
         guard store.beginServerUsageConnection() else { return }
         defer { store.endServerUsageConnection() }
@@ -364,6 +374,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 showInfo("GitHub couldn’t connect", store.serverUsageError ?? "GitHub did not return a usable credit total.")
             }
+        } catch SyncError.cancelled {
+            // The user asked to stop; they don't need a dialog telling them so.
+        } catch SyncError.timedOut {
+            showInfo("GitHub not connected", """
+            BarPilot stopped waiting for approval after \(Int(GitHubBackend.authorizationTimeout / 60)) minutes.
+
+            If signing in to GitHub needs a route BarPilot can’t open for you, complete that sign-in in your browser first, then connect again.
+            """)
         } catch {
             showInfo("GitHub not connected", "Authentication didn’t complete. You can try again from the usage window.")
         }

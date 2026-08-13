@@ -162,7 +162,10 @@ struct SettingsView: View {
                 }
                 Spacer()
                 if store.isConnectingServerUsage {
-                    ProgressView().controlSize(.small)
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Button("Cancel") { store.cancelServerUsageConnection() }
+                    }
                 } else if store.serverUsageEnabled {
                     Button("Disconnect", action: actions.disconnectGitHub)
                 } else {
