@@ -31,25 +31,48 @@ struct SettingsView: View {
     @State private var startAtLogin: Bool = LoginItem.isEnabled
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 18) {
-                budgetSection
-                Divider()
-                currencySection
-                Divider()
-                accountSection
-                Divider()
-                generalSection
-            }
-            .padding(20)
+        VStack(alignment: .leading, spacing: 18) {
+            budgetSection
+            Divider()
+            currencySection
+            Divider()
+            accountSection
+            Divider()
+            generalSection
         }
+        .padding(20)
         .frame(width: 460)
-        .frame(minHeight: 600, maxHeight: 760)
+        // No ScrollView and no min/max height: the hosting controller then sizes
+        // the window to exactly fit the content, instead of padding it out with
+        // dead space at the bottom.
+        .fixedSize(horizontal: false, vertical: true)
         .onAppear { budgetText = currentBudgetText }
         // The budget is stored in USD, so switching currency must restate the
         // field in the newly selected one rather than leave a stale number.
         .onChange(of: store.displayCurrency) { _ in budgetText = currentBudgetText }
         .onChange(of: store.usdToAUD) { _ in budgetText = currentBudgetText }
+    }
+
+    /// A label-plus-switch row where the switch always sits hard right, so the
+    /// switches line up regardless of how long each label runs.
+    private func switchRow(
+        _ title: String, _ detail: String?, isOn: Binding<Bool>
+    ) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                if let detail {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 12)
+            Toggle("", isOn: isOn)
+                .toggleStyle(.switch)
+                .labelsHidden()
+        }
     }
 
     // -- Budget --------------------------------------------------------------
@@ -148,19 +171,10 @@ struct SettingsView: View {
                 }
             }
 
-            Toggle(isOn: Binding(
+            switchRow("Multi-machine sync", syncDetail, isOn: Binding(
                 get: { store.syncEnabled },
                 set: { _ in actions.toggleSync() }
-            )) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Multi-machine sync")
-                    Text(syncDetail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .toggleStyle(.switch)
+            ))
             if let error = store.syncError {
                 Text(error).font(.caption).foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
@@ -182,23 +196,17 @@ struct SettingsView: View {
 
     private var generalSection: some View {
         section("General", nil) {
-            Toggle(isOn: Binding(
-                get: { startAtLogin },
-                set: { _ in
-                    LoginItem.toggle()
-                    // Reflect what the system actually did: registration can be
-                    // refused, and a switch that lies is worse than no switch.
-                    startAtLogin = LoginItem.isEnabled
-                }
-            )) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Start at login")
-                    Text("Open BarPilot automatically when you log in.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .toggleStyle(.switch)
+            switchRow("Start at login", "Open BarPilot automatically when you log in.",
+                      isOn: Binding(
+                          get: { startAtLogin },
+                          set: { _ in
+                              LoginItem.toggle()
+                              // Reflect what the system actually did:
+                              // registration can be refused, and a switch that
+                              // lies is worse than no switch.
+                              startAtLogin = LoginItem.isEnabled
+                          }
+                      ))
 
             HStack(spacing: 10) {
                 Button("Check for Updates", action: actions.checkForUpdates)
@@ -206,9 +214,12 @@ struct SettingsView: View {
                     .help("Save a support report — timings and counts only, no code, prompts or account details.")
                 Spacer()
             }
+            .padding(.top, 2)
+
             Text("BarPilot \(Updater.currentVersion())\(Updater.isDevBuild ? " (development build — auto-update disabled)" : "")")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .padding(.top, 12)
         }
     }
 

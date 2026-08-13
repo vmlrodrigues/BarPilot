@@ -214,6 +214,22 @@ overlay never mutates local aggregation.
   `--settings` launch flag (the documented notch/overflow gotcha can put the
   status item out of reach). `isReleasedWhenClosed = false`; `windowWillClose`
   clears the reference and restores the `.accessory` activation policy.
+  Three things there are load-bearing and easy to break:
+  - **Size the host before positioning.** `host.view.layoutSubtreeIfNeeded()` then
+    `setContentSize(host.view.fittingSize)` *before* centring. SwiftUI's fitting
+    size isn't known at construction, so centring first centres a near-empty
+    window and it then grows from that wrong origin (it landed hard against the
+    top of the screen).
+  - **Position persists** via `setFrameUsingName` / `setFrameAutosaveName`
+    (`AppDelegate.settingsFrameName`); `trueCenter` is used only when nothing is
+    saved, because `NSWindow.center()` deliberately sits in the upper third.
+  - **`SettingsWindow` overrides `performKeyEquivalent`** for ⌘W / ⌘Q / ⌘M.
+    BarPilot is an `LSUIElement` agent with no main menu, so AppKit supplies none
+    of the standard shortcuts and the window otherwise looks broken.
+  The content is a plain `VStack` with `.fixedSize(horizontal: false, vertical:
+  true)` — no `ScrollView` and no min/max height, or the window pads itself out
+  with dead space. Switch rows go through `switchRow`, which puts the switch after
+  a `Spacer` so switches align on the right regardless of label length.
 - **The budget field is AppKit-backed (`BudgetField`), and its parsing is pure
   (`BudgetInput`).** SwiftUI's `TextField` places the click's caret *after* it
   reports focus, so a typed figure gets appended to the existing one — 1000

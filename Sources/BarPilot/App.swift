@@ -209,15 +209,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let host = NSHostingController(
             rootView: SettingsView(actions: actions).environmentObject(store)
         )
-        let window = NSWindow(contentViewController: host)
+        let window = SettingsWindow(contentViewController: host)
         window.title = "BarPilot Settings"
         window.styleMask = [.titled, .closable, .miniaturizable]
         window.isReleasedWhenClosed = false
         window.delegate = self
-        window.center()
+        // Settle the hosting view's size before positioning: SwiftUI's fitting
+        // size isn't known at construction, so centring first would centre a
+        // near-empty window and then grow it from that wrong origin.
+        host.view.layoutSubtreeIfNeeded()
+        window.setContentSize(host.view.fittingSize)
+        if !window.setFrameUsingName(Self.settingsFrameName) { Self.trueCenter(window) }
+        window.setFrameAutosaveName(Self.settingsFrameName)
         settingsWindow = window
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+    }
+
+    static let settingsFrameName = "BarPilotSettingsWindow"
+
+    /// `NSWindow.center()` deliberately sits the window in the upper third,
+    /// which reads as "too high" rather than centred for a panel this tall.
+    private static func trueCenter(_ window: NSWindow) {
+        guard let visible = (window.screen ?? NSScreen.main)?.visibleFrame else {
+            window.center()
+            return
+        }
+        let size = window.frame.size
+        window.setFrameOrigin(NSPoint(
+            x: visible.midX - size.width / 2,
+            y: visible.midY - size.height / 2))
     }
 
     @objc private func openWindow() {
@@ -470,5 +491,39 @@ extension AppDelegate: NSWindowDelegate {
         // keep the Dock/menu-bar focus it took to show settings.
         NSApp.setActivationPolicy(
             CommandLine.arguments.contains("--regular") ? .regular : .accessory)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SettingsWindow — supplies the standard close/quit key equivalents.
+//
+// BarPilot is an LSUIElement agent, so it has no main menu and therefore none of
+// the shortcuts AppKit would normally derive from one. Without this, cmd-W and
+// cmd-Q simply do nothing while the settings window is focused, which reads as a
+// broken window rather than a deliberate omission.
+// ---------------------------------------------------------------------------
+
+final class SettingsWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard mods == .command, let key = event.charactersIgnoringModifiers?.lowercased() else {
+            return super.performKeyEquivalent(with: event)
+        }
+        switch key {
+        case "w":
+            performClose(nil)
+            return true
+        case "q":
+            NSApp.terminate(nil)
+            return true
+        case "m":
+            performMiniaturize(nil)
+            return true
+        default:
+            return super.performKeyEquivalent(with: event)
+        }
     }
 }

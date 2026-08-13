@@ -41,6 +41,12 @@ All notable changes to BarPilot are documented here.
   the telemetry database and its tables are all still there. (#34)
 
 ### Fixed
+- **Settings window layout and behaviour.** It now opens centred, remembers where
+  you move it, and closes with cmd-W or quits with cmd-Q — BarPilot is a menu-bar
+  agent with no main menu, so it had none of those shortcuts. The switches line up
+  on the right instead of sitting wherever their labels ended, and the window sizes
+  to its content rather than leaving a band of empty space below the version line.
+  (#34)
 - **A mistyped budget could be saved without complaint.** Typing into the budget
   field appended to the existing figure instead of replacing it, so 1000 could
   silently become 12001000 — which then wrecked the budget bar and the projection
