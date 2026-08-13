@@ -4,6 +4,7 @@ import Charts
 struct CompactDashboard: View {
     @EnvironmentObject var store: UsageStore
     let connectGitHub: () -> Void
+    let openSettings: () -> Void
     let showLegacy: () -> Void
 
     var body: some View {
@@ -91,6 +92,15 @@ struct CompactDashboard: View {
                 }
                 .buttonStyle(.borderless)
                 .help("Refresh now")
+                Button {
+                    openSettings()
+                } label: {
+                    Label("Settings", systemImage: "gearshape.fill")
+                        .labelStyle(.iconOnly)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Budget, currency, GitHub connection, sync and updates")
             }
 
             HStack(alignment: .firstTextBaseline) {
@@ -118,28 +128,67 @@ struct CompactDashboard: View {
         .padding(.vertical, 14)
     }
 
+    /// Clicking a card selects the currency shown in the menu bar (and across
+    /// the window). The cards are the most legible place to see both figures
+    /// side by side, so they are also the most natural place to pick one.
     private var valueCards: some View {
         HStack(spacing: 10) {
             valueCard(
-                title: "US dollars", value: store.usdCostString(credits: store.compactTotalCredits),
+                currency: .usd, title: "US dollars",
+                value: store.usdCostString(credits: store.compactTotalCredits),
                 detail: "100 credits = US$1")
             valueCard(
-                title: "Australian dollars", value: store.audCostString(credits: store.compactTotalCredits),
+                currency: .aud, title: "Australian dollars",
+                value: store.audCostString(credits: store.compactTotalCredits),
                 detail: store.usdToAUD.map { String(format: "Live rate · %.4f", $0) } ?? "Exchange rate unavailable")
         }
     }
 
-    private func valueCard(title: String, value: String, detail: String) -> some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title).font(.caption).foregroundStyle(.secondary)
-            Text(value)
-                .font(.title2.weight(.semibold))
-                .monospacedDigit()
-            Text(detail).font(.caption2).foregroundStyle(.tertiary)
+    private func valueCard(
+        currency: Currency, title: String, value: String, detail: String
+    ) -> some View {
+        // Compare against effectiveCurrency, not displayCurrency: AUD falls back
+        // to USD until a rate loads, and the badge must show what the menu bar
+        // is actually displaying rather than what was requested.
+        let isMenuBar = store.effectiveCurrency == currency
+        let unavailable = currency == .aud && store.usdToAUD == nil
+        return Button {
+            store.displayCurrency = currency
+        } label: {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 5) {
+                    Text(title).font(.caption).foregroundStyle(.secondary)
+                    Spacer(minLength: 4)
+                    if isMenuBar {
+                        Label("Menu bar", systemImage: "menubar.rectangle")
+                            .font(.caption2.weight(.medium))
+                            .labelStyle(.titleAndIcon)
+                            .foregroundStyle(.tint)
+                    }
+                }
+                Text(value)
+                    .font(.title2.weight(.semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(.primary)
+                Text(detail).font(.caption2).foregroundStyle(.tertiary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .background(
+                Color.primary.opacity(isMenuBar ? 0.075 : 0.045),
+                in: RoundedRectangle(cornerRadius: 10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(isMenuBar ? Color.accentColor : .clear, lineWidth: 1.5))
+            .contentShape(RoundedRectangle(cornerRadius: 10))
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
-        .background(Color.primary.opacity(0.045), in: RoundedRectangle(cornerRadius: 10))
+        .buttonStyle(.plain)
+        .disabled(unavailable)
+        .help(unavailable
+              ? "Available once an exchange rate loads."
+              : (isMenuBar ? "Already shown in the menu bar"
+                           : "Show \(currency.code) in the menu bar"))
+        .accessibilityAddTraits(isMenuBar ? [.isSelected] : [])
     }
 
     private var dailyChartSection: some View {
@@ -385,6 +434,12 @@ private struct DailyCreditsBarChart: View {
         calendar: utcCalendar, timeZone: TimeZone(identifier: "UTC")!
     ).day().month(.abbreviated)
 
+    /// Keep the label count sane: one tick per day for a short cycle, thinning
+    /// out as the month fills up.
+    private var dayStride: Int {
+        max(1, Int(ceil(Double(points.count) / 6.0)))
+    }
+
     var body: some View {
         if points.isEmpty {
             Text("No complete observed daily increases yet")
@@ -401,7 +456,10 @@ private struct DailyCreditsBarChart: View {
                 .cornerRadius(3)
             }
             .chartXAxis {
-                AxisMarks(values: .automatic(desiredCount: 6)) {
+                // Whole-day strides, never `.automatic`: with only a few days in
+                // the cycle an automatic tick count lands on half-days, and since
+                // the label format has no time component every day is drawn twice.
+                AxisMarks(values: .stride(by: .day, count: dayStride)) {
                     AxisGridLine()
                     AxisTick()
                     AxisValueLabel(format: Self.axisDayFormat)

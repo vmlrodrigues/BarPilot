@@ -326,6 +326,8 @@ struct SpendProjection {
         check("last day of month -> nil", compute(periodKind: .thisMonth, report: report(days: 31, credits: 300), monthlyBudgetUSD: 150, now: now, calendar: cal) == nil)
         check("non-thisMonth period -> nil", compute(periodKind: .previousMonth, report: report(days: 10, credits: 300), monthlyBudgetUSD: 150, now: now, calendar: cal) == nil)
 
+        BudgetInput.verify(check)
+
         err.write(Data("verify-projection: \(fail == 0 ? "PASS" : "FAIL") — \(pass) ok, \(fail) failed\n".utf8))
     }
 }

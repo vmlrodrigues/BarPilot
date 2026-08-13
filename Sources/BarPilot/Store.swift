@@ -835,35 +835,4 @@ final class UsageStore: ObservableObject {
 
     /// Set the monthly budget via a simple input dialog (right-click menu entry).
     /// Input is in the displayed currency; stored canonically in USD.
-    func promptForBudget() {
-        let cur = effectiveCurrency
-        let alert = NSAlert()
-        alert.messageText = "Monthly budget"
-        alert.informativeText = "Your Copilot budget per month, in \(cur.code) (\(cur.symbol)). It's pro-rated across the days in the selected period."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 200, height: 24))
-        if cur == .aud, let rate = usdToAUD {
-            field.stringValue = String(Int((monthlyBudget * rate).rounded()))
-        } else {
-            field.stringValue = Fmt.money(monthlyBudget).replacingOccurrences(of: "$", with: "")
-        }
-        field.placeholderString = cur == .aud ? "e.g. 230" : "e.g. 150"
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Save")
-        alert.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        alert.window.initialFirstResponder = field
-
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let cleaned = field.stringValue
-            .trimmingCharacters(in: .whitespaces)
-            .replacingOccurrences(of: "A$", with: "")
-            .replacingOccurrences(of: "$", with: "")
-            .replacingOccurrences(of: ",", with: "")
-        guard let value = Double(cleaned), value >= 0 else { return }
-        if cur == .aud, let rate = usdToAUD, rate > 0 {
-            monthlyBudget = value / rate          // entered AUD → canonical USD
-        } else {
-            monthlyBudget = value
-        }
-    }
 }

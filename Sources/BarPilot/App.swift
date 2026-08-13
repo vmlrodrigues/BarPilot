@@ -86,6 +86,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // NSMenu (the period Picker) runs its modal event loop. This global monitor
     // ensures clicks in other apps still close the popover in that case.
     private var outsideClickMonitor: Any?
+    private var settingsWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(CommandLine.arguments.contains("--regular") ? .regular : .accessory)
@@ -108,9 +109,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.animates = false
         popover.delegate = self
         popover.contentViewController = NSHostingController(
-            rootView: DetailView { [weak self] in
-                Task { await self?.runCreditUsageDeviceFlow() }
-            }
+            rootView: DetailView(
+                connectGitHub: { [weak self] in
+                    Task { await self?.runCreditUsageDeviceFlow() }
+                },
+                openSettings: { [weak self] in self?.openSettings() }
+            )
             .environmentObject(store)
         )
         popover.contentSize = desiredContentSize()
@@ -128,6 +132,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             SpanCache.prune()
             CreditSampleStore.prune()
         }
+
+        // A crowded menu bar (or a notch) can push the status item somewhere the
+        // user can't reach, which would otherwise make settings unreachable too.
+        if CommandLine.arguments.contains("--settings") { openSettings() }
     }
 
     /// Left-click toggles the window; right-click (or control-click) shows a menu.
@@ -144,6 +152,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let button = statusItem.button else { return }
         if popover.isShown { popover.performClose(nil) }
 
+        // Actions only. Everything that changes behaviour lives in Settings, so
+        // a setting has exactly one home rather than being spread across a menu,
+        // a submenu and a modal.
         let menu = NSMenu()
         let open = NSMenuItem(title: "Open Usage Window", action: #selector(openWindow), keyEquivalent: "")
         open.target = self
@@ -152,39 +163,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refresh.target = self
         menu.addItem(refresh)
         menu.addItem(.separator())
-        let budget = NSMenuItem(title: "Set Monthly Budget (\(store.budgetMoneyString(usd: store.monthlyBudget)))…",
-                                action: #selector(setBudget), keyEquivalent: "")
-        budget.target = self
-        menu.addItem(budget)
 
-        let currency = NSMenuItem(title: "Currency", action: nil, keyEquivalent: "")
-        let currencyMenu = NSMenu()
-        for c in Currency.allCases {
-            let item = NSMenuItem(title: c.menuLabel, action: #selector(setCurrency(_:)), keyEquivalent: "")
-            item.target = self
-            item.state = (store.displayCurrency == c) ? .on : .off
-            item.representedObject = c.rawValue
-            currencyMenu.addItem(item)
-        }
-        currency.submenu = currencyMenu
-        menu.addItem(currency)
-        menu.addItem(.separator())
-
-        let login = NSMenuItem(title: "Start at Login", action: #selector(toggleStartAtLogin), keyEquivalent: "")
-        login.target = self
-        login.state = LoginItem.isEnabled ? .on : .off
-        menu.addItem(login)
-        let creditUsage = NSMenuItem(
-            title: store.serverUsageEnabled ? "Disconnect GitHub" : "Connect GitHub…",
-            action: #selector(toggleCreditUsage), keyEquivalent: ""
-        )
-        creditUsage.target = self
-        creditUsage.isEnabled = !store.isConnectingServerUsage
-        menu.addItem(creditUsage)
-        let sync = NSMenuItem(title: "Multi-Machine Sync", action: #selector(toggleSync), keyEquivalent: "")
-        sync.target = self
-        sync.state = store.syncEnabled ? .on : .off
-        menu.addItem(sync)
+        let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ",")
+        settings.target = self
+        menu.addItem(settings)
         let updates = NSMenuItem(title: "Check for Updates", action: #selector(checkForUpdates), keyEquivalent: "")
         updates.target = self
         menu.addItem(updates)
@@ -204,6 +186,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.maxY + 4), in: button)
     }
 
+    // -----------------------------------------------------------------------
+    // Settings
+    // -----------------------------------------------------------------------
+
+    /// A real window, not a popover: every control here opens a sheet, alert or
+    /// save panel, and a `.transient` popover closes as soon as one takes focus.
+    @objc func openSettings() {
+        if popover.isShown { popover.performClose(nil) }
+        if let existing = settingsWindow {
+            NSApp.activate(ignoringOtherApps: true)
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
+        let actions = SettingsActions(
+            connectGitHub: { [weak self] in Task { await self?.runCreditUsageDeviceFlow() } },
+            disconnectGitHub: { [weak self] in self?.confirmDisconnectGitHub() },
+            toggleSync: { [weak self] in self?.toggleSync() },
+            checkForUpdates: { Updater.checkNow() },
+            saveDiagnostics: { [weak self] in self?.saveDiagnostics() }
+        )
+        let host = NSHostingController(
+            rootView: SettingsView(actions: actions).environmentObject(store)
+        )
+        let window = NSWindow(contentViewController: host)
+        window.title = "BarPilot Settings"
+        window.styleMask = [.titled, .closable, .miniaturizable]
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.center()
+        settingsWindow = window
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
     @objc private func openWindow() {
         if !popover.isShown { togglePopover(nil) }
     }
@@ -212,37 +228,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { await store.reload() }
     }
 
-    @objc private func setBudget() {
-        store.promptForBudget()
-    }
-
-    @objc private func setCurrency(_ sender: NSMenuItem) {
-        guard let raw = sender.representedObject as? String, let c = Currency(rawValue: raw) else { return }
-        store.displayCurrency = c
-    }
-
-    @objc private func toggleStartAtLogin() {
-        LoginItem.toggle()
-    }
-
     /// The primary GitHub connection is separate from gist sync, so disconnecting
     /// credit usage cannot silently disable multi-machine sync.
     @objc private func toggleCreditUsage() {
         if store.serverUsageEnabled {
-            let a = NSAlert()
-            a.messageText = "Disconnect GitHub?"
-            a.informativeText = "BarPilot will stop refreshing the authoritative credit total and temporarily show incomplete local telemetry. Saved daily counter history and multi-machine sync remain untouched."
-            a.addButton(withTitle: "Disconnect")
-            a.addButton(withTitle: "Cancel")
-            NSApp.activate(ignoringOtherApps: true)
-            if a.runModal() == .alertFirstButtonReturn { store.disableServerUsage() }
+            confirmDisconnectGitHub()
         } else {
             Task { await runCreditUsageDeviceFlow() }
         }
     }
 
+    /// Shared by the settings window and the legacy footer control.
+    func confirmDisconnectGitHub() {
+        guard store.serverUsageEnabled else { return }
+        let a = NSAlert()
+        a.messageText = "Disconnect GitHub?"
+        a.informativeText = "BarPilot will stop refreshing the authoritative credit total and temporarily show incomplete local telemetry. Saved daily counter history and multi-machine sync remain untouched."
+        a.addButton(withTitle: "Disconnect")
+        a.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        if a.runModal() == .alertFirstButtonReturn { store.disableServerUsage() }
+    }
+
     /// Multi-machine sync: enable via GitHub device flow, or confirm-disable.
-    @objc private func toggleSync() {
+    @objc func toggleSync() {
         if store.syncEnabled {
             let a = NSAlert()
             a.messageText = "Turn off multi-machine sync?"
@@ -358,7 +367,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return field
     }
 
-    @objc private func checkForUpdates() {
+    @objc func checkForUpdates() {
         Updater.checkNow()
     }
 
@@ -371,7 +380,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Save the same report as `--diagnose` to a file the user can send. Building
     /// it runs a load, so do that off the main actor and keep the UI responsive.
     /// The save panel states what's inside so sharing is an informed choice (#31).
-    @objc private func saveDiagnostics() {
+    @objc func saveDiagnostics() {
         NSApp.activate(ignoringOtherApps: true)
         let panel = NSSavePanel()
         panel.title = "Save BarPilot Diagnostics"
@@ -447,5 +456,19 @@ extension AppDelegate: NSPopoverDelegate {
     /// monitor, or the status-bar button toggle). Always clean up the monitor.
     func popoverDidClose(_ notification: Notification) {
         removeOutsideClickMonitor()
+    }
+}
+
+extension AppDelegate: NSWindowDelegate {
+    /// Drop the settings window on close. It is `isReleasedWhenClosed = false`
+    /// so AppKit won't free it underneath us; holding a stale reference would
+    /// re-show a window whose SwiftUI state no longer reflects the store.
+    func windowWillClose(_ notification: Notification) {
+        guard let closing = notification.object as? NSWindow, closing === settingsWindow else { return }
+        settingsWindow = nil
+        // The app is an accessory agent: without a visible window it should not
+        // keep the Dock/menu-bar focus it took to show settings.
+        NSApp.setActivationPolicy(
+            CommandLine.arguments.contains("--regular") ? .regular : .accessory)
     }
 }

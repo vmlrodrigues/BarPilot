@@ -173,6 +173,7 @@ Sources/BarPilot/
   Dump.swift         Dump.run() — the --dump output path.
   DetailView.swift   Window UI: header, sparkline, budget bar.
   CompactDashboard.swift  Primary server-first dashboard and chart.
+  SettingsView.swift  Settings window (budget, currency, GitHub, sync, general).
   Tabs.swift         Summary / Models / Daily / Sessions / Top tables.
   Setup.swift        TelemetrySetup — opt-in native OTel enablement.
   Updater.swift      Silent GitHub-Releases auto-updater (Developer ID-gated).
@@ -202,11 +203,35 @@ overlay never mutates local aggregation.
   MenuBarExtra is unreliable in a hand-assembled SwiftPM bundle. UI is still
   SwiftUI, hosted in the popover. Popover size is re-clamped to the screen's
   `visibleFrame` on each open so it never spills over the top.
-- **Left-click** opens the window; **right-click / control-click** shows the menu
-  (Open / Refresh / Set Monthly Budget… / Quit).
+- **Left-click** opens the window; **right-click / control-click** shows the menu.
+  **The menu holds actions only** — Open Usage Window, Refresh Now, Settings…,
+  Check for Updates, What's New, Save Diagnostics…, Quit. Anything that *sets* or
+  *toggles* state belongs in Settings, not the menu.
+- **Settings is a real `NSWindow` (`SettingsView.swift`), not a popover.** The
+  status-item popover is `.transient`, so it closes the instant a sheet, alert or
+  save panel takes focus — which is every interesting settings control. Opened by
+  the cog button in the dashboard header, by "Settings… ⌘," in the menu, or by the
+  `--settings` launch flag (the documented notch/overflow gotcha can put the
+  status item out of reach). `isReleasedWhenClosed = false`; `windowWillClose`
+  clears the reference and restores the `.accessory` activation policy.
+- **The budget field is AppKit-backed (`BudgetField`), and its parsing is pure
+  (`BudgetInput`).** SwiftUI's `TextField` places the click's caret *after* it
+  reports focus, so a typed figure gets appended to the existing one — 1000
+  becomes 12001000 with nothing on screen to explain the resulting nonsense
+  budget bar. `NSTextField.selectText` on `becomeFirstResponder` is deterministic
+  where a deferred `selectAll` on the field editor is not. `updateNSView` syncs on
+  binding *provenance* (`Coordinator.lastSeenText`), not on `currentEditor()`,
+  because the field takes first responder as the window opens and an
+  editor-based guard would swallow the initial value. `BudgetInput.parse` rejects
+  non-numeric, negative, non-finite and anything above `BudgetInput.maximum`
+  (1,000,000); it is covered by `--verify-projection`.
+- **Clicking a currency card in the dashboard selects the menu-bar currency.**
+  The cards compare against `store.effectiveCurrency`, not `displayCurrency`, so
+  the "Menu bar" badge shows what is actually rendered (AUD falls back to USD
+  until a rate loads).
 - **GitHub connection is the primary dashboard setup state and is separately
   authorized from gist sync.** A disconnected window shows a **Connect GitHub**
-  CTA; there is no unsolicited startup prompt. The right-click menu exposes
+  CTA; there is no unsolicited startup prompt. Settings exposes
   Connect/Disconnect as a secondary account action. It polls GitHub's internal
   account endpoint every 60 seconds and stores samples in the local span-cache
   database. The credentials use separate Keychain entries, so disconnecting one
@@ -257,8 +282,8 @@ overlay never mutates local aggregation.
   transition.
 - **Budget = one editable monthly USD figure** (`monthlyBudgetUSD`, default $150
   ≈ $5/day), pro-rated to a per-day rate via `avgDaysPerMonth = 30.4375` and
-  multiplied by the selected range's days. Edited via an NSAlert from the
-  right-click menu (not an inline field); shown read-only as "$150 / mo". In the
+  multiplied by the selected range's days. Edited in Settings via an inline field
+  + Set button (the old NSAlert prompt is gone). In the
   compact bar, the 100% budget marker is fixed at 70% of the track, leaving the
   final 30% to visualize projections up to about 143% of budget. Fill widths and
   the marker use that same fixed scale; budget and projection labels use the
@@ -276,7 +301,7 @@ overlay never mutates local aggregation.
   hand-assembled SwiftPM bundle. **The app now makes network calls** (GitHub) —
   keep the "no network for your *data*" wording accurate.
 - **Start at Login** via `SMAppService.mainApp` (`LoginItem.swift`), toggled from
-  the right-click menu — no third-party dependency.
+  Settings — no third-party dependency.
 - **Currency (USD/AUD):** everything is computed/stored in USD; AUD is a
   display-time conversion via a live rate (`Currency.swift`, open.er-api.com,
   fetched on launch + every 24h, cached in UserDefaults for offline use). The

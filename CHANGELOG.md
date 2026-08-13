@@ -5,6 +5,14 @@ All notable changes to BarPilot are documented here.
 ## [Unreleased]
 
 ### Added
+- **Settings window.** Monthly budget, currency, GitHub connection, multi-machine
+  sync, start at login, updates and diagnostics now live in one place, reachable
+  from the cog button in the usage window or "Settings…" in the right-click menu.
+  The budget is an editable field with its own Set button rather than a dialog.
+  (#34)
+- **Pick which currency shows in the menu bar by clicking its card.** The USD and
+  AUD cards in the usage window are now buttons; the selected one is outlined and
+  badged "Menu bar". (#34)
 - **BarPilot now reads your credit total from GitHub itself, not from local
   telemetry.** The old figure was assembled from Copilot's on-disk trace files,
   which turned out to miss whole categories of billed calls — so it always read
@@ -14,9 +22,8 @@ All notable changes to BarPilot are documented here.
   readings. (#33, #34)
 - **Connect GitHub.** The window asks you to connect the first time, rather than
   hiding it behind a menu option, and explains that it's showing an incomplete
-  local figure until you do. Connect and Disconnect also live in the right-click
-  menu. Disconnecting removes only that credential — multi-machine sync and your
-  saved history are untouched. (#34)
+  local figure until you do. Disconnect lives in Settings, and removes only that
+  credential — multi-machine sync and your saved history are untouched. (#34)
 - **The menu-bar figure warns when it isn't authoritative.** The existing warning
   glyph now also appears when GitHub is disconnected, stale, or erroring, so a
   local fallback figure never quietly passes as the real one. (#34)
@@ -25,12 +32,23 @@ All notable changes to BarPilot are documented here.
   together, because every Mac is watching the same account-wide number. (#34)
 
 ### Changed
+- **The right-click menu is now just actions.** Open, refresh, updates, what's
+  new, diagnostics and quit. Everything that sets or toggles something moved into
+  Settings, so the menu stops being two unrelated things at once. (#34)
 - **The old Summary / Models / Daily / Sessions / Top interface is deprecated.**
   It's still one click away under "Legacy telemetry", clearly marked as
   incomplete, and will be removed in a future release. Nothing has been deleted:
   the telemetry database and its tables are all still there. (#34)
 
 ### Fixed
+- **A mistyped budget could be saved without complaint.** Typing into the budget
+  field appended to the existing figure instead of replacing it, so 1000 could
+  silently become 12001000 — which then wrecked the budget bar and the projection
+  with nothing on screen to explain it. Focusing the field now selects the whole
+  value, and anything above 1,000,000 is rejected with a message rather than
+  stored. (#34)
+- **The chart labelled every day twice** ("11 Aug, 11 Aug, 12 Aug…") over short
+  ranges, because the axis was landing on half-day ticks. (#34)
 - **The dashboard stayed blank for anyone whose billing cycle doesn't start at
   midnight UTC on the 1st.** Connecting appeared to work, readings were saved,
   and yet the chart, the daily table and the real total never showed up — with no

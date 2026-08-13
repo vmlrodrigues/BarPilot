@@ -9,6 +9,7 @@ import AppKit
 struct DetailView: View {
     @EnvironmentObject var store: UsageStore
     let connectGitHub: () -> Void
+    let openSettings: () -> Void
     @State private var showingUTCInfo = false
     @State private var showingSyncInfo = false
     @State private var showingCreditInfo = false
@@ -19,9 +20,11 @@ struct DetailView: View {
             if showingLegacyTelemetry {
                 legacyView
             } else {
-                CompactDashboard(connectGitHub: connectGitHub) {
-                    showingLegacyTelemetry = true
-                }
+                CompactDashboard(
+                    connectGitHub: connectGitHub,
+                    openSettings: openSettings,
+                    showLegacy: { showingLegacyTelemetry = true }
+                )
             }
         }
     }
