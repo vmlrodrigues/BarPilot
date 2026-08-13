@@ -43,6 +43,15 @@ All notable changes to BarPilot are documented here.
 - **One corrected or lowered reading wiped every day on the chart.** A refund or
   server-side adjustment late in the month erased weeks of daily figures it
   couldn't possibly affect. Days already recorded now stay put. (#34)
+- **Reconnecting GitHub appeared to wipe your daily usage history.** Saved
+  readings were tied to the account only by a moving "start here" marker, which
+  had to be pushed forward to the moment of reconnection every time BarPilot
+  couldn't confirm it was still the same account — hiding everything before it.
+  Changing how accounts are identified (see Security, below) made that happen to
+  the same account, so upgrading and reconnecting left the chart showing only the
+  last few minutes. Nothing was ever deleted, and it comes back on its own:
+  readings now record which account they belong to, existing ones are claimed on
+  the next connect or poll, and the marker is gone. (#34)
 - **Chart bars were labelled one day earlier than the table below them** for
   anyone west of UTC, even though that table is explicitly marked UTC. (#34)
 - **Disconnecting GitHub left its data on screen.** The headline dropped back to

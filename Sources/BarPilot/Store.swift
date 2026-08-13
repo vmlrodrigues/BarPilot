@@ -86,7 +86,6 @@ final class UsageStore: ObservableObject {
     private static let syncKey = "multiMachineSyncEnabled"
     private static let serverUsageKey = "serverCreditUsageEnabled"
     private static let serverUsageDisconnectedKey = "serverCreditUsageExplicitlyDisconnected"
-    private static let serverUsageBaselineKey = "serverCreditUsageBaselineMs"
     private static let serverUsageAccountKey = "serverCreditUsageAccountFingerprint"
     private static let utcCalendar: Calendar = {
         var calendar = Calendar(identifier: .gregorian)
@@ -132,7 +131,9 @@ final class UsageStore: ObservableObject {
         // even though the samples were sitting in the database.
         if let latest = CreditSampleStore.latest() {
             serverUsageSample = latest
-            creditSamples = Self.loadCycleSamples(resetAtMs: latest.resetAtMs)
+            creditSamples = Self.loadCycleSamples(
+                resetAtMs: latest.resetAtMs, account: serverUsageAccountFingerprint
+            )
         }
 
         Task { await reload() }
@@ -359,8 +360,6 @@ final class UsageStore: ObservableObject {
     /// Enable account usage with its own credential, then take the opening
     /// baseline. Existing gist-sync authorization is deliberately unaffected.
     func enableServerUsageWith(token: String) async -> Bool {
-        let previousFingerprint = serverUsageAccountFingerprint
-        let previousBaseline = UserDefaults.standard.string(forKey: Self.serverUsageBaselineKey)
         serverUsageGeneration += 1
         let generation = serverUsageGeneration
         UserDefaults.standard.set(true, forKey: Self.serverUsageDisconnectedKey)
@@ -390,7 +389,10 @@ final class UsageStore: ObservableObject {
             return false
         }
         let saved = await Task.detached(priority: .utility) {
-            CreditSampleStore.save(sample)
+            // Claim pre-attribution rows before the first attributed write, so
+            // the opening sample and the existing history share one account.
+            CreditSampleStore.adoptUnattributed(account: fingerprint)
+            return CreditSampleStore.save(sample, account: fingerprint)
         }.value
         guard generation == serverUsageGeneration else {
             _ = CreditUsageKeychain.deleteToken()
@@ -407,14 +409,13 @@ final class UsageStore: ObservableObject {
         serverUsageEnabled = true
         UserDefaults.standard.set(true, forKey: Self.serverUsageKey)
         UserDefaults.standard.set(false, forKey: Self.serverUsageDisconnectedKey)
-        if previousFingerprint == fingerprint, previousBaseline != nil {
-            creditSamples = Self.loadCycleSamples(resetAtMs: sample.resetAtMs)
-        } else {
-            creditSamples = [sample]
-            UserDefaults.standard.set(
-                String(sample.capturedAtMs), forKey: Self.serverUsageBaselineKey
-            )
-        }
+        // Reconnecting must not cost the user their history. This used to reset
+        // to a single sample whenever the fingerprint differed from the stored
+        // one — which fires for the *same* account whenever the derivation
+        // changes, silently hiding the cycle. Attribution now lives on the rows,
+        // so a genuinely different account is excluded by the query instead.
+        creditSamples = Self.loadCycleSamples(resetAtMs: sample.resetAtMs, account: fingerprint)
+        if !creditSamples.contains(sample) { creditSamples.append(sample) }
         serverUsageSample = sample
         serverUsageError = nil
         recompute()
@@ -472,11 +473,10 @@ final class UsageStore: ObservableObject {
                 serverUsageAccountFingerprint = fingerprint
                 UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
             }
-            if creditSamples.isEmpty, UserDefaults.standard.string(forKey: Self.serverUsageBaselineKey) == nil {
-                UserDefaults.standard.set(String(sample.capturedAtMs), forKey: Self.serverUsageBaselineKey)
-            }
+            let account = serverUsageAccountFingerprint
             let saved = await Task.detached(priority: .utility) {
-                CreditSampleStore.save(sample)
+                if let account { CreditSampleStore.adoptUnattributed(account: account) }
+                return CreditSampleStore.save(sample, account: account)
             }.value
             guard serverUsageEnabled, generation == serverUsageGeneration else { return }
             guard saved else {
@@ -487,18 +487,19 @@ final class UsageStore: ObservableObject {
             // Only treat this as a genuine rollover when the cycle actually moved
             // FORWARD and the counter reset with it. Reacting to any change meant
             // one response whose reset resolved from a different field discarded
-            // the cycle's history and pushed the baseline past every stored row.
+            // the cycle's history even though nothing had actually rolled over.
             let previous = serverUsageSample
             let rolledOver = previous.map {
                 sample.resetAtMs > $0.resetAtMs && sample.creditsUsed < $0.creditsUsed
             } ?? false
             if rolledOver {
                 creditSamples = [sample]
-                UserDefaults.standard.set(String(sample.capturedAtMs), forKey: Self.serverUsageBaselineKey)
             } else if previous == nil || sample.resetAtMs != previous?.resetAtMs {
                 // First sample of the session, or the reset instant shifted within
                 // the same cycle: re-read from storage instead of discarding.
-                creditSamples = Self.loadCycleSamples(resetAtMs: sample.resetAtMs)
+                creditSamples = Self.loadCycleSamples(
+                    resetAtMs: sample.resetAtMs, account: serverUsageAccountFingerprint
+                )
                 if !creditSamples.contains(sample) { creditSamples.append(sample) }
             } else {
                 creditSamples.append(sample)
@@ -538,12 +539,13 @@ final class UsageStore: ObservableObject {
     /// cycle's history permanently. The baseline is still honoured as a lower
     /// bound so an explicit disconnect/reconnect boundary is respected, but it
     /// can never hide rows belonging to the cycle it was taken in.
-    private static func loadCycleSamples(resetAtMs: Int64) -> [CreditSample] {
-        let baseline = Int64(UserDefaults.standard.string(forKey: serverUsageBaselineKey) ?? "")
-        let all = CreditSampleStore.load(resetAtMs: resetAtMs, from: 0)
-        guard let baseline else { return all }
-        let bounded = all.filter { $0.capturedAtMs >= baseline }
-        return bounded.isEmpty ? all : bounded
+    /// Load the current cycle's persisted samples for the connected account.
+    /// Rows are attributed at write time, so a disconnect/reconnect — or a
+    /// change in how the account fingerprint is derived — no longer hides them.
+    /// The old mutable baseline pointer did exactly that: it was the only thing
+    /// isolating accounts, so it had to jump forward on every reconnect.
+    private static func loadCycleSamples(resetAtMs: Int64, account: String?) -> [CreditSample] {
+        CreditSampleStore.load(resetAtMs: resetAtMs, account: account)
     }
 
     var displayTotalCredits: Double { reconciled.totalCredits }

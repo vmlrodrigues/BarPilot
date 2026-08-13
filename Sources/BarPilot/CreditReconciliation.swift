@@ -199,6 +199,57 @@ enum CreditReconciliation {
         )
         precondition(alignedWithTime.isCurrentCycle,
                      "a time-of-day reset on an aligned day must still overlay")
+        verifyAccountRetention()
         print("credit reconciliation verification passed")
+    }
+
+    /// Reconnecting, or changing how the account fingerprint is derived, must
+    /// never cost the user their stored history. This is a real regression:
+    /// switching the fingerprint to a key-derived form made the same account
+    /// look like a different one, and the reconnect path responded by hiding the
+    /// entire cycle behind a freshly advanced baseline pointer.
+    private static func verifyAccountRetention() {
+        let reset = Aggregator.utcMidnightMs("2030-04-01")
+        let base = Aggregator.utcMidnightMs("2030-03-10")
+        let old = "fingerprint-before-derivation-change"
+        let new = "fingerprint-after-derivation-change"
+        let other = "a-genuinely-different-account"
+
+        CreditSampleStore.withTemporaryStore {
+            // History captured before rows carried an account.
+            for i in 0..<3 {
+                precondition(
+                    CreditSampleStore.save(
+                        CreditSample(capturedAtMs: base + Int64(i) * 60_000, serverAtMs: nil,
+                                     resetAtMs: reset, creditsUsed: Double(10 * (i + 1))),
+                        account: nil),
+                    "unattributed sample must save")
+            }
+            precondition(CreditSampleStore.load(resetAtMs: reset, account: old).count == 3,
+                         "pre-attribution rows must be visible to the connected account")
+
+            // Reconnecting under a *different-looking* fingerprint for the same
+            // account must adopt, not discard.
+            let adopted = CreditSampleStore.adoptUnattributed(account: new)
+            precondition(adopted == 3, "adoption must claim every unattributed row")
+            precondition(CreditSampleStore.load(resetAtMs: reset, account: new).count == 3,
+                         "history must survive a fingerprint derivation change")
+
+            // Adoption is one-shot: a second account cannot inherit the first's.
+            precondition(CreditSampleStore.adoptUnattributed(account: other) == 0,
+                         "adoption must not run twice")
+            precondition(CreditSampleStore.load(resetAtMs: reset, account: other).isEmpty,
+                         "a different account must not see another account's history")
+
+            // New rows stay attributed and isolated.
+            CreditSampleStore.save(
+                CreditSample(capturedAtMs: base + 600_000, serverAtMs: nil,
+                             resetAtMs: reset, creditsUsed: 90),
+                account: other)
+            precondition(CreditSampleStore.load(resetAtMs: reset, account: new).count == 3,
+                         "another account's writes must not appear in this account's cycle")
+            precondition(CreditSampleStore.load(resetAtMs: reset, account: other).count == 1,
+                         "an account must see its own writes")
+        }
     }
 }

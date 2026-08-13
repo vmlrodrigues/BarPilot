@@ -114,9 +114,13 @@ current UTC billing cycle:
 - Unclassified credits are never distributed across known models, days, sessions,
   or calls. Summary / Models show a separated final bucket; Daily / Sessions / Top
   remain local and classified-only.
-- The opening sample establishes the persisted connection boundary. Cumulative
-  samples are not converted into daily rows because gaps cannot be assigned to a
-  day reliably.
+- The opening sample is attributed to the connected account and joins that
+  account's existing history; it does not establish a visibility boundary.
+  Cumulative samples are not converted into daily rows because gaps cannot be
+  assigned to a day reliably.
+- Disconnecting removes only the credential. Stored samples, the account
+  attribution on them, and sync authorization are all left intact, so
+  reconnecting restores the existing history rather than starting a new one.
 - Failed polls are not persisted as zero. The last good sample remains available,
   and ranges outside the provable current-cycle window retain local totals.
 - Run `--verify-credits` after changing any of this reconciliation behavior.
@@ -233,11 +237,16 @@ overlay never mutates local aggregation.
   blanked the entire dashboard for those accounts with no error shown. The legacy
   overlay (`matchesCurrentCycle`) keeps the extra day-key check because it sits on
   top of a locally aggregated calendar-month range.
-- **Sample history is addressed by cycle, never by a mutable pointer alone.**
-  `Store.loadCycleSamples` reads by `resetAtMs`, using the persisted baseline only
-  as a lower bound with a fallback. Rollover is committed only when the reset moves
-  forward *and* the counter drops. Keying reloads off the baseline pointer alone
-  let one stray response orphan a whole cycle of stored samples permanently.
+- **Sample history is addressed by cycle and account, never by a mutable pointer.**
+  `credit_samples.account` records which account observed each row, and
+  `Store.loadCycleSamples` reads by `resetAtMs` + account. Rollover is committed
+  only when the reset moves forward *and* the counter drops. The former baseline
+  pointer is **deleted, not repurposed** — it was the only account-isolation
+  mechanism, so it had to be shoved forward on every reconnect, and any change to
+  fingerprint derivation made the *same* account look new and hid the whole cycle.
+  `CreditSampleStore.adoptUnattributed` claims pre-migration rows exactly once
+  (guarded by a `meta` key) so a second account can never inherit the first's
+  history. Never reintroduce a time-based visibility gate for account isolation.
 - **`DiagLog` and `--diagnose` carry no monetary or credit figures.** The reload
   line records a menu-state token and a drift flag, not the total, because
   `--diagnose` output is documented as safe to paste into a public issue.
