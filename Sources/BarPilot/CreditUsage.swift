@@ -1,5 +1,5 @@
 import Foundation
-import CryptoKit
+import CommonCrypto
 
 // ---------------------------------------------------------------------------
 // CreditUsageAPI — account-level Copilot usage from GitHub's own counter.
@@ -27,9 +27,14 @@ struct CreditSample: Equatable {
 }
 
 enum CreditUsageAPI {
-    /// Opaque equality key for preventing observations from different Copilot
-    /// accounts being merged. The underlying account identifier is never stored
-    /// or included in the sync payload.
+    /// Equality key for preventing observations from different Copilot accounts
+    /// being merged. It has to be deterministic across Macs, so no per-install
+    /// salt is possible — and a plain SHA-256 over GitHub's small, dense numeric
+    /// id space is trivially reversed with a precomputed table, which matters
+    /// because this value is published into the sync gist. PBKDF2 with a high
+    /// iteration count makes that enumeration impractical while costing one
+    /// hash per connect. The underlying account identifier is never stored or
+    /// included in the sync payload.
     static func accountFingerprint(token: String) async -> String? {
         var req = URLRequest(url: URL(string: "https://api.github.com/user")!)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -40,8 +45,28 @@ enum CreditUsageAPI {
               (response as? HTTPURLResponse)?.statusCode == 200,
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let id = json["id"] as? NSNumber else { return nil }
-        let digest = SHA256.hash(data: Data("barpilot-credit:\(id.int64Value)".utf8))
-        return digest.prefix(16).map { String(format: "%02x", $0) }.joined()
+        return derivedFingerprint(accountId: id.int64Value)
+    }
+
+    static func derivedFingerprint(accountId: Int64) -> String? {
+        var out = [UInt8](repeating: 0, count: 16)
+        let password = Array("barpilot-credit:\(accountId)".utf8)
+        let salt = Array("barpilot-account-fingerprint-v1".utf8)
+        let status = password.withUnsafeBufferPointer { pwd in
+            salt.withUnsafeBufferPointer { slt in
+                CCKeyDerivationPBKDF(
+                    CCPBKDFAlgorithm(kCCPBKDF2),
+                    pwd.baseAddress!.withMemoryRebound(to: CChar.self, capacity: pwd.count) { $0 },
+                    pwd.count,
+                    slt.baseAddress!, slt.count,
+                    CCPseudoRandomAlgorithm(kCCPRFHmacAlgSHA256),
+                    600_000,
+                    &out, out.count
+                )
+            }
+        }
+        guard status == kCCSuccess else { return nil }
+        return out.map { String(format: "%02x", $0) }.joined()
     }
 
     static func fetch(token: String, now: Date = Date()) async throws -> CreditSample {

@@ -60,13 +60,26 @@ enum DiagLog {
     }
 
     /// The most recent `n` lines across both generations (oldest first).
+    /// Historical lines from before this build recorded credit totals and the
+    /// rendered menu amount; redact them on the way out so an upgraded install
+    /// can't paste an old spending history into a public issue.
     static func tail(_ n: Int) -> [String] {
         func lines(_ p: String) -> [String] {
             (try? String(contentsOfFile: p, encoding: .utf8))?
                 .split(separator: "\n", omittingEmptySubsequences: true).map(String.init) ?? []
         }
         let all = lines(rotatedPath) + lines(path)
-        return all.suffix(n)
+        return all.suffix(n).map(redactLegacyFigures)
+    }
+
+    /// Strips ` · total <n> cr` and ` · menu "<amount>"` from pre-existing lines.
+    static func redactLegacyFigures(_ line: String) -> String {
+        var out = line
+        for pattern in [#" · total [^·]*cr"#, #" · menu "[^"]*""#] {
+            out = out.replacingOccurrences(
+                of: pattern, with: " · [redacted]", options: .regularExpression)
+        }
+        return out
     }
 
     static func humanBytes(_ b: Int64) -> String {

@@ -69,14 +69,15 @@ struct CreditTimeline {
             }
         }
 
-        let totalIncrease = max(0, last.creditsUsed - first.creditsUsed)
-        if observed > totalIncrease {
-            // A late downward correction invalidates attribution already assigned
-            // to days. Preserve the cumulative chart, but keep all growth
-            // unallocated rather than trimming an arbitrary day.
-            byDay = [:]
-            observed = 0
-        }
+        // `observed` accumulates against a monotonic high-water mark, so compare
+        // it against the peak rather than the last sample. Using the last sample
+        // meant any downward correction (refund, adjustment, stale cached value,
+        // rollover lag) made observed > totalIncrease and discarded the whole
+        // cycle's per-day attribution — including days the correction cannot
+        // affect. Against the peak the invariant holds by construction and the
+        // residual lands in unallocatedCredits as intended.
+        let peak = ordered.map(\.creditsUsed).max() ?? first.creditsUsed
+        let totalIncrease = max(0, peak - first.creditsUsed)
         let daily = byDay.map {
             ObservedDayCredits(id: $0.key, day: $0.key, credits: $0.value)
         }
@@ -130,5 +131,19 @@ struct CreditTimeline {
         ])
         precondition(corrected.observedCredits == 60)
         precondition(corrected.unallocatedCredits == 0)
+
+        // A final sample BELOW the running peak must not discard days already
+        // attributed. The first two hours are provably spent regardless of a
+        // later downward correction.
+        let lateDrop = build(samples: [
+            CreditSample(capturedAtMs: start, serverAtMs: nil, resetAtMs: reset, creditsUsed: 100),
+            CreditSample(capturedAtMs: start + hour, serverAtMs: nil, resetAtMs: reset, creditsUsed: 150),
+            CreditSample(capturedAtMs: start + 2 * hour, serverAtMs: nil, resetAtMs: reset, creditsUsed: 190),
+            CreditSample(capturedAtMs: start + 3 * hour, serverAtMs: nil, resetAtMs: reset, creditsUsed: 120)
+        ])
+        precondition(lateDrop.observedCredits == 90,
+                     "a late downward correction must not wipe attributed days")
+        precondition(lateDrop.daily.first?.credits == 90)
+        precondition(lateDrop.unallocatedCredits == 0)
     }
 }

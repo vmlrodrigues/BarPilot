@@ -35,14 +35,29 @@ struct ReconciledUsage {
 enum CreditReconciliation {
     static let unclassifiedLabel = "Unclassified"
 
-    static func isCurrentCycle(_ sample: CreditSample, now: Date = Date()) -> Bool {
-        guard sample.resetAt > now else { return false }
+    /// The cycle a sample belongs to is `[resetAt - 1 month, resetAt)`. Copilot
+    /// resets are not always UTC midnight on the 1st — the account response
+    /// carries the reset in four different fields, two of which encode a
+    /// time-of-day, and anniversary-billed accounts never land on the 1st. So
+    /// this is deliberately interval containment, not calendar-month equality:
+    /// requiring alignment silently disabled the whole server dashboard for
+    /// those accounts. Callers that must line up with a locally aggregated
+    /// calendar-month range add that check themselves (`matchesCurrentCycle`).
+    static func cycleStart(for sample: CreditSample) -> Date? {
         var utc = Calendar(identifier: .gregorian)
         utc.timeZone = TimeZone(identifier: "UTC")!
-        guard let cycleStart = utc.date(byAdding: .month, value: -1, to: sample.resetAt),
-              let currentStart = utc.date(from: utc.dateComponents([.year, .month], from: now))
-        else { return false }
-        return cycleStart == currentStart
+        return utc.date(byAdding: .month, value: -1, to: sample.resetAt)
+    }
+
+    /// Guards against a nonsense reset far in the future being treated as the
+    /// current cycle; the longest real cycle is a 31-day month.
+    private static let maxCycleLength: TimeInterval = 40 * 24 * 60 * 60
+
+    static func isCurrentCycle(_ sample: CreditSample, now: Date = Date()) -> Bool {
+        guard sample.resetAt > now,
+              sample.resetAt.timeIntervalSince(now) <= maxCycleLength,
+              let start = cycleStart(for: sample) else { return false }
+        return start <= now
     }
 
     static func build(
@@ -75,11 +90,13 @@ enum CreditReconciliation {
         return out
     }
 
+    /// The legacy overlay sits on top of a locally aggregated calendar-month
+    /// report, so it additionally requires the cycle to line up with that range.
+    /// A non-calendar cycle simply falls back to the local report rather than
+    /// mixing two different windows.
     private static func matchesCurrentCycle(snapshot: CreditSample, report: Report, now: Date) -> Bool {
-        guard isCurrentCycle(snapshot, now: now) else { return false }
-        var utc = Calendar(identifier: .gregorian)
-        utc.timeZone = TimeZone(identifier: "UTC")!
-        guard let start = utc.date(byAdding: .month, value: -1, to: snapshot.resetAt) else { return false }
+        guard isCurrentCycle(snapshot, now: now),
+              let start = cycleStart(for: snapshot) else { return false }
         return Aggregator.utcDayStr(Int64(start.timeIntervalSince1970 * 1000)) == report.fromStr
             && Aggregator.utcDayStr(Int64(now.timeIntervalSince1970 * 1000)) == report.toStr
     }
@@ -136,6 +153,52 @@ enum CreditReconciliation {
                      "unclassified usage must remain a separated final bucket")
         precondition(!reconciled.daily.contains { $0.model == unclassifiedLabel },
                      "daily usage must remain classified-only")
+
+        // A reset that is not UTC midnight on the 1st must still count as the
+        // current cycle — otherwise the whole server dashboard goes blank for
+        // anniversary-billed and time-of-day resets, with no error shown.
+        func sample(resetISO: String) -> CreditSample {
+            let f = ISO8601DateFormatter()
+            f.formatOptions = [.withInternetDateTime]
+            let reset = f.date(from: resetISO)!
+            return CreditSample(capturedAtMs: 0, serverAtMs: nil,
+                                resetAtMs: Int64(reset.timeIntervalSince1970 * 1000),
+                                creditsUsed: 10)
+        }
+        let midCycle = ISO8601DateFormatter().date(from: "2030-01-20T12:00:00Z")!
+        precondition(isCurrentCycle(sample(resetISO: "2030-02-01T08:00:00Z"), now: midCycle),
+                     "a non-midnight reset must still be the current cycle")
+        precondition(isCurrentCycle(sample(resetISO: "2030-01-25T00:00:00Z"), now: midCycle),
+                     "an anniversary reset must still be the current cycle")
+        precondition(!isCurrentCycle(sample(resetISO: "2029-12-01T00:00:00Z"), now: midCycle),
+                     "an elapsed cycle must not be current")
+        precondition(!isCurrentCycle(sample(resetISO: "2030-06-01T00:00:00Z"), now: midCycle),
+                     "a reset beyond one cycle length must not be current")
+        precondition(!isCurrentCycle(sample(resetISO: "2030-01-21T00:00:00Z"), now:
+                        ISO8601DateFormatter().date(from: "2029-12-01T00:00:00Z")!),
+                     "a cycle that has not started must not be current")
+
+        // The legacy overlay still requires calendar alignment, so an
+        // anniversary cycle must fall back to the local calendar-month report
+        // rather than mix two different windows.
+        var offset = Report.empty
+        offset.fromStr = "2030-01-01"
+        offset.toStr = "2030-01-20"
+        offset.totalCredits = 80
+        let unaligned = build(
+            report: offset, periodKind: .thisMonth,
+            snapshot: sample(resetISO: "2030-01-25T00:00:00Z"), now: midCycle
+        )
+        precondition(!unaligned.isCurrentCycle && unaligned.totalCredits == 80,
+                     "an anniversary cycle must not overlay the calendar-month report")
+        // A same-day-aligned cycle with a time-of-day reset still overlays: the
+        // day keys match the local range, and the dashboard needs it to work.
+        let alignedWithTime = build(
+            report: offset, periodKind: .thisMonth,
+            snapshot: sample(resetISO: "2030-02-01T08:00:00Z"), now: midCycle
+        )
+        precondition(alignedWithTime.isCurrentCycle,
+                     "a time-of-day reset on an aligned day must still overlay")
         print("credit reconciliation verification passed")
     }
 }

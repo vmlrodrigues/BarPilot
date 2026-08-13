@@ -4,6 +4,71 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+### Added
+- **BarPilot now reads your credit total from GitHub itself, not from local
+  telemetry.** The old figure was assembled from Copilot's on-disk trace files,
+  which turned out to miss whole categories of billed calls — so it always read
+  low, sometimes by a lot. The window now opens on a compact current-cycle
+  dashboard: your credit total, its value in both USD and AUD, budget progress
+  with a projection, and a bar chart of daily usage built from saved counter
+  readings. (#33, #34)
+- **Connect GitHub.** The window asks you to connect the first time, rather than
+  hiding it behind a menu option, and explains that it's showing an incomplete
+  local figure until you do. Connect and Disconnect also live in the right-click
+  menu. Disconnecting removes only that credential — multi-machine sync and your
+  saved history are untouched. (#34)
+- **The menu-bar figure warns when it isn't authoritative.** The existing warning
+  glyph now also appears when GitHub is disconnected, stale, or erroring, so a
+  local fallback figure never quietly passes as the real one. (#34)
+- **Multi-machine sync now shares credit readings.** Your Macs fill in each
+  other's offline gaps. Readings are matched and de-duplicated, never added
+  together, because every Mac is watching the same account-wide number. (#34)
+
+### Changed
+- **The old Summary / Models / Daily / Sessions / Top interface is deprecated.**
+  It's still one click away under "Legacy telemetry", clearly marked as
+  incomplete, and will be removed in a future release. Nothing has been deleted:
+  the telemetry database and its tables are all still there. (#34)
+
+### Fixed
+- **The dashboard stayed blank for anyone whose billing cycle doesn't start at
+  midnight UTC on the 1st.** Connecting appeared to work, readings were saved,
+  and yet the chart, the daily table and the real total never showed up — with no
+  error to explain why. Anniversary-billed accounts were affected permanently.
+  (#34)
+- **A single odd response from GitHub could throw away a month of daily history.**
+  The saved readings were still on disk but nothing could reach them again. They
+  are now found by billing cycle, and a cycle is only treated as rolled over when
+  the reset moves forward and the counter actually drops. (#34)
+- **One corrected or lowered reading wiped every day on the chart.** A refund or
+  server-side adjustment late in the month erased weeks of daily figures it
+  couldn't possibly affect. Days already recorded now stay put. (#34)
+- **Chart bars were labelled one day earlier than the table below them** for
+  anyone west of UTC, even though that table is explicitly marked UTC. (#34)
+- **Disconnecting GitHub left its data on screen.** The headline dropped back to
+  the local figure while the reset date, chart and daily table carried on showing
+  GitHub's, so the two openly disagreed. (#34)
+- **The support report no longer contains your spending.** The reload log had
+  started recording your real credit total and dollar figure, and `--diagnose`
+  copies that log into a report the docs describe as safe to paste publicly. It
+  now records only whether the display is warning or drifting. (#34)
+- **Budget bar accuracy.** The budget figure now honours the currency you've
+  selected instead of always printing USD, the projected figure uses that same
+  currency so the two can be compared, an explicitly-set budget of zero survives
+  a restart, and the projection is shown as a percentage as well — the bar itself
+  saturates past about 143% of budget, so the number keeps large overruns
+  readable. (#34)
+
+### Security
+- **The account fingerprint shared between your Macs is no longer reversible.**
+  It has to be identical on every Mac to match them up, so it can't be salted per
+  install — and a plain hash of a GitHub account number can be reversed with a
+  precomputed table in seconds. It's now derived with a deliberately slow
+  function, which costs about 70ms once when you connect. (#34)
+- Credentials are verified after being written to and removed from the Keychain,
+  so a silent failure can't leave BarPilot believing it is connected when it
+  isn't. Sync and credit access use separate entries. (#34)
+
 ---
 
 ## [0.9.1] — 2026-08-07

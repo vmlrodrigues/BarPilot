@@ -218,10 +218,29 @@ overlay never mutates local aggregation.
 - **Multi-machine sync uses schema v2 counter observations.** Each Mac publishes
   only its first locally captured observation in each 15-minute UTC bucket. Pulled
   samples stay in the separate remote store and are
-  never re-published. An opaque account fingerprint gates merging; account-wide
-  counter values are never added across machines. Schema v2 retains legacy
+  never re-published. A PBKDF2-derived account fingerprint gates merging;
+  account-wide counter values are never added across machines. The fingerprint
+  must stay deterministic across Macs (no per-install salt), so a plain hash of
+  GitHub's small numeric id space would be reversible by a precomputed table —
+  hence the KDF. Schema v2 retains legacy
   aggregate rows only during deprecation. Truncated gist files are fetched through
   their authenticated `raw_url`.
+- **Cycle membership is interval containment, not calendar-month equality.**
+  `CreditReconciliation.isCurrentCycle` tests `resetAt - 1 month <= now < resetAt`.
+  Copilot resets are not always UTC midnight on the 1st — the account response
+  carries the reset in four fields, two of which encode a time-of-day, and
+  anniversary-billed accounts never land on the 1st. Requiring alignment silently
+  blanked the entire dashboard for those accounts with no error shown. The legacy
+  overlay (`matchesCurrentCycle`) keeps the extra day-key check because it sits on
+  top of a locally aggregated calendar-month range.
+- **Sample history is addressed by cycle, never by a mutable pointer alone.**
+  `Store.loadCycleSamples` reads by `resetAtMs`, using the persisted baseline only
+  as a lower bound with a fallback. Rollover is committed only when the reset moves
+  forward *and* the counter drops. Keying reloads off the baseline pointer alone
+  let one stray response orphan a whole cycle of stored samples permanently.
+- **`DiagLog` and `--diagnose` carry no monetary or credit figures.** The reload
+  line records a menu-state token and a drift flag, not the total, because
+  `--diagnose` output is documented as safe to paste into a public issue.
 - **Legacy retirement does not delete the application database.** `credit_samples`
   shares the existing SQLite file with `spans` and `meta`. Stop telemetry
   ingestion first; leave legacy tables intact for rollback, then remove them only

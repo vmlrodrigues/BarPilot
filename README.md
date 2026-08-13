@@ -92,8 +92,10 @@ Optional **Multi-Machine Sync** stores a compact versioned payload in a secret
 gist. Each Mac publishes only observations it captured itself: every counter
 cycle’s first observation captured in each 15-minute interval.
 Matching observations are unioned and de-duplicated, never summed, because every
-Mac is observing the same account-wide counter. An opaque account fingerprint
-prevents observations from different Copilot accounts being merged.
+Mac is observing the same account-wide counter. A key-derived account fingerprint
+prevents observations from different Copilot accounts being merged. It is
+deterministic (so Macs can match) but derived with PBKDF2, so it cannot be
+enumerated back to the account it identifies.
 
 ## Legacy telemetry sources
 

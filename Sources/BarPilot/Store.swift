@@ -52,6 +52,9 @@ final class UsageStore: ObservableObject {
     @Published private(set) var serverUsageSample: CreditSample?
     @Published private(set) var serverUsageError: String?
     @Published private(set) var isConnectingServerUsage = false
+    /// Cached in `recompute()` — see `buildCreditTimeline()`.
+    @Published private(set) var creditTimeline: CreditTimeline = .empty
+    @Published private(set) var counterSyncMachineCount = 1
     private var creditSamples: [CreditSample] = []
     private var serverUsageAccountFingerprint: String?
     private var serverUsageGeneration = 0
@@ -124,10 +127,12 @@ final class UsageStore: ObservableObject {
         serverUsageEnabled = !explicitlyDisconnected && CreditUsageKeychain.token() != nil
         UserDefaults.standard.set(serverUsageEnabled, forKey: Self.serverUsageKey)
         serverUsageAccountFingerprint = UserDefaults.standard.string(forKey: Self.serverUsageAccountKey)
-        if let baseline = Int64(UserDefaults.standard.string(forKey: Self.serverUsageBaselineKey) ?? ""),
-           let latest = CreditSampleStore.latest(from: baseline) {
+        // Hydrate from the cycle itself. Keying this off the baseline pointer
+        // alone meant a missing or advanced pointer left the dashboard blank
+        // even though the samples were sitting in the database.
+        if let latest = CreditSampleStore.latest() {
             serverUsageSample = latest
-            creditSamples = CreditSampleStore.load(resetAtMs: latest.resetAtMs, from: baseline)
+            creditSamples = Self.loadCycleSamples(resetAtMs: latest.resetAtMs)
         }
 
         Task { await reload() }
@@ -183,7 +188,7 @@ final class UsageStore: ObservableObject {
         recompute()
         // Rotating support log (#24): load cost + what the reload actually computed
         // vs the menu title it set — also the #13 display-vs-data drift diagnostic.
-        DiagLog.write("reload: \(loadMs)ms · scanned \(DiagLog.humanBytes(status.jsonlBytesScanned)) · +\(status.newRecords) new · \(allRecords.count) cached · period \(periodKind.rawValue) · total \(Fmt.credits(reconciled.totalCredits)) cr · menu \"\(menuBarTitle)\"")
+        DiagLog.write("reload: \(loadMs)ms · scanned \(DiagLog.humanBytes(status.jsonlBytesScanned)) · +\(status.newRecords) new · \(allRecords.count) cached · period \(periodKind.rawValue) · menu \(menuBarTitle.hasPrefix("⚠︎") ? "warn" : "ok")\(menuBarTitle.hasSuffix(costString(credits: compactTotalCredits)) ? "" : " · DRIFT")")
         if syncEnabled { Task { await self.syncNow() } }   // background push/pull
         if serverUsageEnabled { Task { await self.refreshServerUsage() } }
     }
@@ -230,6 +235,8 @@ final class UsageStore: ObservableObject {
             periodKind: periodKind,
             snapshot: serverUsageEnabled ? serverUsageSample : nil,
         )
+        creditTimeline = buildCreditTimeline()
+        counterSyncMachineCount = countCounterSyncMachines()
         // The menu-bar figure must signal when it is a local fallback rather than
         // the authoritative GitHub total. Reuse the existing warning glyph.
         let cost = costString(credits: compactTotalCredits)
@@ -400,11 +407,8 @@ final class UsageStore: ObservableObject {
         serverUsageEnabled = true
         UserDefaults.standard.set(true, forKey: Self.serverUsageKey)
         UserDefaults.standard.set(false, forKey: Self.serverUsageDisconnectedKey)
-        if previousFingerprint == fingerprint,
-           let baseline = Int64(previousBaseline ?? "") {
-            creditSamples = CreditSampleStore.load(
-                resetAtMs: sample.resetAtMs, from: baseline
-            )
+        if previousFingerprint == fingerprint, previousBaseline != nil {
+            creditSamples = Self.loadCycleSamples(resetAtMs: sample.resetAtMs)
         } else {
             creditSamples = [sample]
             UserDefaults.standard.set(
@@ -468,7 +472,7 @@ final class UsageStore: ObservableObject {
                 serverUsageAccountFingerprint = fingerprint
                 UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
             }
-            if creditSamples.isEmpty {
+            if creditSamples.isEmpty, UserDefaults.standard.string(forKey: Self.serverUsageBaselineKey) == nil {
                 UserDefaults.standard.set(String(sample.capturedAtMs), forKey: Self.serverUsageBaselineKey)
             }
             let saved = await Task.detached(priority: .utility) {
@@ -480,9 +484,22 @@ final class UsageStore: ObservableObject {
                 recompute()
                 return
             }
-            if serverUsageSample?.resetAtMs != sample.resetAtMs {
+            // Only treat this as a genuine rollover when the cycle actually moved
+            // FORWARD and the counter reset with it. Reacting to any change meant
+            // one response whose reset resolved from a different field discarded
+            // the cycle's history and pushed the baseline past every stored row.
+            let previous = serverUsageSample
+            let rolledOver = previous.map {
+                sample.resetAtMs > $0.resetAtMs && sample.creditsUsed < $0.creditsUsed
+            } ?? false
+            if rolledOver {
                 creditSamples = [sample]
                 UserDefaults.standard.set(String(sample.capturedAtMs), forKey: Self.serverUsageBaselineKey)
+            } else if previous == nil || sample.resetAtMs != previous?.resetAtMs {
+                // First sample of the session, or the reset instant shifted within
+                // the same cycle: re-read from storage instead of discarding.
+                creditSamples = Self.loadCycleSamples(resetAtMs: sample.resetAtMs)
+                if !creditSamples.contains(sample) { creditSamples.append(sample) }
             } else {
                 creditSamples.append(sample)
             }
@@ -515,9 +532,26 @@ final class UsageStore: ObservableObject {
         }
     }
 
+    /// Load the current cycle's persisted samples. Addressed by the cycle itself
+    /// rather than a mutable baseline pointer: the pointer used to be the only
+    /// route back to stored rows, so advancing it past them orphaned the whole
+    /// cycle's history permanently. The baseline is still honoured as a lower
+    /// bound so an explicit disconnect/reconnect boundary is respected, but it
+    /// can never hide rows belonging to the cycle it was taken in.
+    private static func loadCycleSamples(resetAtMs: Int64) -> [CreditSample] {
+        let baseline = Int64(UserDefaults.standard.string(forKey: serverUsageBaselineKey) ?? "")
+        let all = CreditSampleStore.load(resetAtMs: resetAtMs, from: 0)
+        guard let baseline else { return all }
+        let bounded = all.filter { $0.capturedAtMs >= baseline }
+        return bounded.isEmpty ? all : bounded
+    }
+
     var displayTotalCredits: Double { reconciled.totalCredits }
     var currentServerUsageSample: CreditSample? {
-        guard let sample = serverUsageSample,
+        // Gated on the connection too: a disconnect drops the headline to local
+        // telemetry, so leaving the reset date, chart and daily table rendering
+        // retained server data would contradict it on screen.
+        guard serverUsageEnabled, let sample = serverUsageSample,
               CreditReconciliation.isCurrentCycle(sample) else { return nil }
         return sample
     }
@@ -527,7 +561,11 @@ final class UsageStore: ObservableObject {
         }
         return max(sample.creditsUsed, currentMonthReport.totalCredits)
     }
-    var creditTimeline: CreditTimeline {
+
+    /// Built in `recompute()` rather than derived per access: with sync on this
+    /// opens SQLite and JSON-decodes every remote payload, and the dashboard
+    /// reads it several times per body evaluation on the main actor.
+    private func buildCreditTimeline() -> CreditTimeline {
         guard let current = currentServerUsageSample else { return .empty }
         guard let accountFingerprint = serverUsageAccountFingerprint else {
             return CreditTimeline.build(
@@ -535,15 +573,14 @@ final class UsageStore: ObservableObject {
             )
         }
         let remotes = syncEnabled ? currentRemoteAggregates() : []
-        let merged = SyncAggregate.mergedCreditSamples(
+        return CreditTimeline.build(samples: SyncAggregate.mergedCreditSamples(
             local: creditSamples, remotes: remotes,
             resetAtMs: current.resetAtMs,
             accountFingerprint: accountFingerprint
-        )
-        return CreditTimeline.build(samples: merged)
+        ))
     }
 
-    var counterSyncMachineCount: Int {
+    private func countCounterSyncMachines() -> Int {
         guard syncEnabled, let accountFingerprint = serverUsageAccountFingerprint else { return 1 }
         let matching = currentRemoteAggregates().filter {
             $0.accountFingerprint == accountFingerprint

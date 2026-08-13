@@ -352,7 +352,12 @@ private struct CompactBudgetBar: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 if let projection {
-                    Text("Projected \(store.displayCostString(credits: projection.projectedCredits))")
+                    // The bar clamps at the top of the overflow region (~143% of
+                    // budget), so past that every overrun looks identical. The
+                    // percentage keeps the saturated case quantified.
+                    Text(hasBudget
+                         ? "Projected \(store.displayCostString(credits: projection.projectedCredits)) · \(Int(projection.pctOfBudget.rounded()))% of budget"
+                         : "Projected \(store.displayCostString(credits: projection.projectedCredits))")
                         .foregroundStyle(projection.overBudget ? Color.red : Color.secondary)
                 }
             }
@@ -367,6 +372,19 @@ private struct CompactBudgetBar: View {
 private struct DailyCreditsBarChart: View {
     let points: [ObservedDayCredits]
 
+    /// The day keys are UTC and the table below is badged UTC, so the chart must
+    /// bin and label in UTC too. With the autoupdating calendar every bar sat one
+    /// day earlier than its table row for anyone west of UTC.
+    private static let utcCalendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        return calendar
+    }()
+
+    private static let axisDayFormat = Date.FormatStyle(
+        calendar: utcCalendar, timeZone: TimeZone(identifier: "UTC")!
+    ).day().month(.abbreviated)
+
     var body: some View {
         if points.isEmpty {
             Text("No complete observed daily increases yet")
@@ -376,7 +394,7 @@ private struct DailyCreditsBarChart: View {
         } else {
             Chart(points.sorted { $0.day < $1.day }) { point in
                 BarMark(
-                    x: .value("Day", point.date, unit: .day),
+                    x: .value("Day", point.date, unit: .day, calendar: Self.utcCalendar),
                     y: .value("Credits", point.credits)
                 )
                 .foregroundStyle(Color.accentColor.gradient)
@@ -386,7 +404,7 @@ private struct DailyCreditsBarChart: View {
                 AxisMarks(values: .automatic(desiredCount: 6)) {
                     AxisGridLine()
                     AxisTick()
-                    AxisValueLabel(format: .dateTime.day().month(.abbreviated))
+                    AxisValueLabel(format: Self.axisDayFormat)
                 }
             }
             .chartYAxis {
@@ -395,6 +413,8 @@ private struct DailyCreditsBarChart: View {
                     AxisValueLabel()
                 }
             }
+            .environment(\.calendar, Self.utcCalendar)
+            .environment(\.timeZone, TimeZone(identifier: "UTC")!)
         }
     }
 }
