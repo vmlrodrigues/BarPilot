@@ -695,6 +695,14 @@ final class UsageStore: ObservableObject {
         costString(credits: credits)
     }
 
+    /// Numeric cost in the display currency, for callers that need to plot or
+    /// compare it rather than print it (the daily chart). Kept alongside
+    /// `costString(credits:)` so a chart bar and its label can never disagree
+    /// about the rate: both go through `toDisplay`.
+    func displayCost(credits: Double) -> Double {
+        toDisplay(credits / 100.0)
+    }
+
     /// Cost from a USD amount, 2 dp, in the display currency.
     func costString(usd: Double) -> String {
         effectiveCurrency.symbol + String(format: "%.2f", toDisplay(usd))

@@ -201,7 +201,7 @@ struct CompactDashboard: View {
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Daily credit usage")
+                    Text("Daily cost")
                         .font(.subheadline.weight(.semibold))
                     Text(dailyChartSubtitle)
                         .font(.caption2)
@@ -214,8 +214,12 @@ struct CompactDashboard: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            DailyCreditsBarChart(points: timeline.daily)
-                .frame(height: 150)
+            DailyCostBarChart(
+                points: timeline.daily,
+                cost: { store.displayCost(credits: $0) },
+                symbol: store.effectiveCurrency.symbol
+            )
+            .frame(height: 150)
         }
     }
 
@@ -225,7 +229,7 @@ struct CompactDashboard: View {
             return "Waiting for saved GitHub counter samples."
         }
         if timeline.unallocatedCredits > 0 {
-            return "\(Fmt.credits(timeline.unallocatedCredits)) credits cannot be assigned to a day."
+            return "\(store.costString(credits: timeline.unallocatedCredits)) cannot be assigned to a day."
         }
         return "Observed increases between saved GitHub counter samples."
     }
@@ -423,8 +427,13 @@ private struct CompactBudgetBar: View {
     }
 }
 
-private struct DailyCreditsBarChart: View {
+private struct DailyCostBarChart: View {
     let points: [ObservedDayCredits]
+    /// Credits → cost in the display currency. Injected rather than reading the
+    /// store directly so the bar heights and the axis labels are guaranteed to
+    /// use one conversion, and the view stays previewable.
+    let cost: (Double) -> Double
+    let symbol: String
 
     /// The day keys are UTC and the table below is badged UTC, so the chart must
     /// bin and label in UTC too. With the autoupdating calendar every bar sat one
@@ -445,6 +454,20 @@ private struct DailyCreditsBarChart: View {
         max(1, Int(ceil(Double(points.count) / 6.0)))
     }
 
+    /// Axis labels are money, so they need the currency symbol and a sensible
+    /// number of decimals. The decision is made once from the chart's own scale,
+    /// never per value: judging each label alone renders a small-value axis as
+    /// "$0.50, $1, $1.50", where the whole tick loses its cents and looks wrong
+    /// next to its neighbours.
+    private var showsCents: Bool {
+        (points.map { cost($0.credits) }.max() ?? 0) < 10
+    }
+
+    private func axisLabel(_ value: Double) -> String {
+        if value == 0 { return symbol + "0" }
+        return symbol + String(format: showsCents ? "%.2f" : "%.0f", value)
+    }
+
     var body: some View {
         if points.isEmpty {
             Text("No complete observed daily increases yet")
@@ -455,7 +478,7 @@ private struct DailyCreditsBarChart: View {
             Chart(points.sorted { $0.day < $1.day }) { point in
                 BarMark(
                     x: .value("Day", point.date, unit: .day, calendar: Self.utcCalendar),
-                    y: .value("Credits", point.credits)
+                    y: .value("Cost", cost(point.credits))
                 )
                 .foregroundStyle(Color.accentColor.gradient)
                 .cornerRadius(3)
@@ -471,9 +494,13 @@ private struct DailyCreditsBarChart: View {
                 }
             }
             .chartYAxis {
-                AxisMarks(position: .leading, values: .automatic(desiredCount: 4)) {
+                AxisMarks(position: .leading, values: .automatic(desiredCount: 4)) { value in
                     AxisGridLine()
-                    AxisValueLabel()
+                    AxisValueLabel {
+                        if let amount = value.as(Double.self) {
+                            Text(axisLabel(amount))
+                        }
+                    }
                 }
             }
             .environment(\.calendar, Self.utcCalendar)
