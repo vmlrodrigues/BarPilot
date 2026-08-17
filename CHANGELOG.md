@@ -4,12 +4,21 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+## [0.10.2] — 2026-08-17
+
 ### Changed
 - **The daily bar chart now shows cost instead of credits**, in whichever currency
   is selected in Settings, so reading it no longer means dividing by 100 in your
   head. The heading becomes "Daily cost", the y-axis carries the currency symbol,
   and the chart follows a currency change without a relaunch. The table below it
   still shows credits alongside both currencies. (#36)
+
+### Fixed
+- **The daily chart's y-axis could label its gridlines with the wrong numbers.**
+  The axis now chooses its own scale, so every label matches the line it sits on,
+  keeps its cents when the step is fractional, and never repeats a value. VoiceOver
+  now reads each bar's date and amount with the currency rather than a bare
+  number. (#36)
 
 ## [0.10.1] — 2026-08-13
 
