@@ -379,6 +379,15 @@ enum Fmt {
         grouping.string(from: NSNumber(value: n)) ?? "\(n)"
     }
 
+    /// Money for a chart axis, in a caller-supplied currency and at a caller-
+    /// chosen precision. The precision must come from the axis' own tick step,
+    /// not from the value: a step of 2.5 formatted to whole dollars labels its
+    /// gridlines "$2" and "$8", which are simply the wrong numbers.
+    /// Separate from `money`/`dollars`, which are USD-only by construction.
+    static func axisMoney(_ amount: Double, symbol: String, decimals: Int) -> String {
+        symbol + String(format: "%.\(decimals)f", amount)
+    }
+
     /// Abbreviated token count: 1,397 → "1.4K", 86,264,060 → "86.3M",
     /// 2,100,000,000 → "2.1B". One decimal below 100, none at/above.
     static func tokens(_ n: Int) -> String {

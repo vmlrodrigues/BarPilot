@@ -228,7 +228,10 @@ struct CompactDashboard: View {
         guard timeline.firstAtMs != nil else {
             return "Waiting for saved GitHub counter samples."
         }
-        if timeline.unallocatedCredits > 0 {
+        // Gated on the *displayed* amount, not the raw residual: cost is 100x
+        // coarser than credits, and the residual is a difference of accumulated
+        // Doubles, so `> 0` was satisfied by values that render as "$0.00".
+        if store.displayCost(credits: timeline.unallocatedCredits) >= 0.005 {
             return "\(store.costString(credits: timeline.unallocatedCredits)) cannot be assigned to a day."
         }
         return "Observed increases between saved GitHub counter samples."
@@ -427,6 +430,52 @@ private struct CompactBudgetBar: View {
     }
 }
 
+/// A "nice" y-axis for money: explicit ticks plus the precision needed to label
+/// them truthfully.
+///
+/// Swift Charts' `.automatic` tick values are not constrained to whole units —
+/// it happily picks a 2.5 step — so any precision guessed from the *data* can
+/// contradict the *ticks*. At whole-dollar precision a 2.5 step labels its
+/// gridlines "$2" and "$8" (printf rounds half-to-even), which are evenly
+/// spaced lines carrying unevenly spaced, wrong numbers. Owning the ticks is
+/// what makes the label and the gridline the same fact.
+struct MoneyAxisScale {
+    let ticks: [Double]
+    let decimals: Int
+    let upperBound: Double
+
+    /// Money has no sub-cent granularity, so a step never goes below a cent —
+    /// otherwise a very light cycle yields ticks 0.005 apart and two adjacent
+    /// gridlines both label as "$0.01".
+    private static let minimumStep = 0.01
+
+    static func make(max: Double, desiredCount: Int = 4) -> MoneyAxisScale {
+        guard max.isFinite, max > 0 else {
+            return MoneyAxisScale(ticks: [0], decimals: 0, upperBound: 1)
+        }
+        let rough = max / Double(desiredCount)
+        let magnitude = pow(10, floor(log10(rough)))
+        let normalised = rough / magnitude
+        let niceNormalised: Double
+        switch normalised {
+        case ...1: niceNormalised = 1
+        case ...2: niceNormalised = 2
+        case ...2.5: niceNormalised = 2.5
+        case ...5: niceNormalised = 5
+        default: niceNormalised = 10
+        }
+        let step = Swift.max(niceNormalised * magnitude, minimumStep)
+        let count = Swift.max(1, Int((max / step).rounded(.up)))
+        let ticks = (0...count).map { Double($0) * step }
+        // Whole steps read as "$50"; a fractional step is money, so it takes
+        // cents rather than one decimal ("$2.50", never "$2.5").
+        let decimals = step == step.rounded() ? 0 : 2
+        return MoneyAxisScale(
+            ticks: ticks, decimals: decimals, upperBound: Double(count) * step
+        )
+    }
+}
+
 private struct DailyCostBarChart: View {
     let points: [ObservedDayCredits]
     /// Credits → cost in the display currency. Injected rather than reading the
@@ -448,24 +497,21 @@ private struct DailyCostBarChart: View {
         calendar: utcCalendar, timeZone: TimeZone(identifier: "UTC")!
     ).day().month(.abbreviated)
 
+    /// Spelled-out date for VoiceOver, where "11 Aug" is read poorly.
+    private static let accessibilityDayFormat = Date.FormatStyle(
+        calendar: utcCalendar, timeZone: TimeZone(identifier: "UTC")!
+    ).day().month(.wide).year()
+
     /// Keep the label count sane: one tick per day for a short cycle, thinning
     /// out as the month fills up.
     private var dayStride: Int {
         max(1, Int(ceil(Double(points.count) / 6.0)))
     }
 
-    /// Axis labels are money, so they need the currency symbol and a sensible
-    /// number of decimals. The decision is made once from the chart's own scale,
-    /// never per value: judging each label alone renders a small-value axis as
-    /// "$0.50, $1, $1.50", where the whole tick loses its cents and looks wrong
-    /// next to its neighbours.
-    private var showsCents: Bool {
-        (points.map { cost($0.credits) }.max() ?? 0) < 10
-    }
-
-    private func axisLabel(_ value: Double) -> String {
-        if value == 0 { return symbol + "0" }
-        return symbol + String(format: showsCents ? "%.2f" : "%.0f", value)
+    /// Computed once per body evaluation rather than inside the axis builder,
+    /// which runs for every tick.
+    private var scale: MoneyAxisScale {
+        MoneyAxisScale.make(max: points.map { cost($0.credits) }.max() ?? 0)
     }
 
     var body: some View {
@@ -475,6 +521,7 @@ private struct DailyCostBarChart: View {
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
+            let scale = self.scale
             Chart(points.sorted { $0.day < $1.day }) { point in
                 BarMark(
                     x: .value("Day", point.date, unit: .day, calendar: Self.utcCalendar),
@@ -482,6 +529,12 @@ private struct DailyCostBarChart: View {
                 )
                 .foregroundStyle(Color.accentColor.gradient)
                 .cornerRadius(3)
+                // Without this VoiceOver reads a bare number with no currency,
+                // which after this change is the whole point of the chart.
+                .accessibilityLabel(Self.accessibilityDayFormat.format(point.date))
+                .accessibilityValue(
+                    Fmt.axisMoney(cost(point.credits), symbol: symbol, decimals: 2)
+                )
             }
             .chartXAxis {
                 // Whole-day strides, never `.automatic`: with only a few days in
@@ -493,12 +546,16 @@ private struct DailyCostBarChart: View {
                     AxisValueLabel(format: Self.axisDayFormat)
                 }
             }
+            .chartYScale(domain: 0...scale.upperBound)
             .chartYAxis {
-                AxisMarks(position: .leading, values: .automatic(desiredCount: 4)) { value in
+                // Explicit ticks, never `.automatic`: see `MoneyAxisScale`.
+                AxisMarks(position: .leading, values: scale.ticks) { value in
                     AxisGridLine()
                     AxisValueLabel {
                         if let amount = value.as(Double.self) {
-                            Text(axisLabel(amount))
+                            Text(Fmt.axisMoney(
+                                amount, symbol: symbol, decimals: scale.decimals
+                            ))
                         }
                     }
                 }
