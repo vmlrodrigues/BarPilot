@@ -98,6 +98,14 @@ struct SettingsView: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+
+            Divider()
+
+            switchRow(
+                "Exclude weekends from the forecast",
+                "Projects month-end spend across working days only, so a five-day week isn't forecast as seven. Weekend spend you have already made still counts.",
+                isOn: $store.excludeWeekendsFromProjection
+            )
         }
     }
 

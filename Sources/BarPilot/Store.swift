@@ -28,6 +28,11 @@ final class UsageStore: ObservableObject {
     /// Monthly budget in USD. The per-period budget is derived from this by
     /// pro-rating across the days in the selected range (a per-day rate).
     @Published var monthlyBudget: Double { didSet { persistBudget() } }
+    /// Project the month-end forecast across working days only. Off by default,
+    /// so an existing install's forecast does not move on upgrade.
+    @Published var excludeWeekendsFromProjection: Bool {
+        didSet { UserDefaults.standard.set(excludeWeekendsFromProjection, forKey: Self.excludeWeekendsKey) }
+    }
 
     /// Currency the UI displays costs in. Internally everything stays USD.
     @Published var displayCurrency: Currency { didSet { persistCurrency(); recompute() } }
@@ -82,6 +87,7 @@ final class UsageStore: ObservableObject {
 
     private static let periodKey = "selectedPeriodKind"
     private static let budgetKey = "monthlyBudgetUSD"
+    private static let excludeWeekendsKey = "excludeWeekendsFromProjection"
     private static let currencyKey = "displayCurrency"
     private static let rateKey = "usdToAUDRate"
     private static let rateDateKey = "usdToAUDRateDate"
@@ -109,6 +115,7 @@ final class UsageStore: ObservableObject {
         }
 
         displayCurrency = Currency(rawValue: UserDefaults.standard.string(forKey: Self.currencyKey) ?? "") ?? .usd
+        excludeWeekendsFromProjection = UserDefaults.standard.bool(forKey: Self.excludeWeekendsKey)  // default false
         let cachedRate = UserDefaults.standard.double(forKey: Self.rateKey)
         usdToAUD = cachedRate > 0 ? cachedRate : nil
 
@@ -742,7 +749,8 @@ final class UsageStore: ObservableObject {
         displayReport.totalCredits = reconciled.totalCredits
         displayReport.todayCredits = reconciled.todayCredits
         return SpendProjection.compute(periodKind: periodKind, report: displayReport,
-                                monthlyBudgetUSD: monthlyBudget, now: Date())
+                                monthlyBudgetUSD: monthlyBudget, now: Date(),
+                                excludeWeekends: excludeWeekendsFromProjection)
     }
 
     var compactSpendProjection: SpendProjection? {
@@ -751,7 +759,8 @@ final class UsageStore: ObservableObject {
         return SpendProjection.compute(
             periodKind: .thisMonth, report: displayReport,
             monthlyBudgetUSD: monthlyBudget, now: Date(),
-            calendar: Self.utcCalendar)
+            calendar: Self.utcCalendar,
+            excludeWeekends: excludeWeekendsFromProjection)
     }
 
     // -----------------------------------------------------------------------

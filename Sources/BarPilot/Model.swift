@@ -260,6 +260,9 @@ struct SpendProjection {
     let daysElapsed: Int
     let daysInPeriod: Int
     let endLabel: String            // "Jul 31"
+    /// True when the run rate is per *working* day rather than per calendar day,
+    /// so `daysElapsed`/`daysInPeriod` count workdays.
+    let excludesWeekends: Bool
 
     var hasBudget: Bool  { budgetCredits > 0 }
     var overBudget: Bool { hasBudget && projectedCredits > budgetCredits }
@@ -269,23 +272,65 @@ struct SpendProjection {
         let f = DateFormatter(); f.dateFormat = "MMM d"; return f
     }()
 
+    /// Working days in the `days` calendar days starting at `start`.
+    ///
+    /// Weekend-ness comes from the calendar rather than a hardcoded Sat/Sun, so
+    /// a region with a Fri/Sat weekend gets its own working week.
+    private static func workdays(from start: Date, days: Int, calendar: Calendar) -> Int {
+        guard days > 0 else { return 0 }
+        var count = 0
+        for offset in 0..<days {
+            guard let day = calendar.date(byAdding: .day, value: offset, to: start) else { continue }
+            if !calendar.isDateInWeekend(day) { count += 1 }
+        }
+        return count
+    }
+
     /// Only projects an in-progress calendar month that has usage; nil otherwise.
+    ///
+    /// `excludeWeekends` swaps the run rate from per-calendar-day to per-working-
+    /// day and projects across the month's working days, for people who don't
+    /// work weekends and whose forecast would otherwise assume they do.
+    ///
+    /// Weekend spend that has *already happened* stays in the numerator and is
+    /// carried by the working-day rate. It was billed and cannot be un-spent, so
+    /// dropping it would forecast below the amount already owed. The setting
+    /// changes the assumption about future days, not the accounting of past ones.
     static func compute(periodKind: PeriodKind, report: Report,
                         monthlyBudgetUSD: Double, now: Date,
-                        calendar: Calendar = .current) -> SpendProjection? {
+                        calendar: Calendar = .current,
+                        excludeWeekends: Bool = false) -> SpendProjection? {
         guard periodKind == .thisMonth,
               let dayRange = calendar.range(of: .day, in: .month, for: now),
               let month = calendar.dateInterval(of: .month, for: now) else { return nil }
-        let daysInPeriod = dayRange.count
-        let elapsed = max(report.daysInRange, 1)
-        guard report.totalCredits > 0, elapsed < daysInPeriod else { return nil }
+        let calendarDays = dayRange.count
+        let calendarElapsed = max(report.daysInRange, 1)
+        guard report.totalCredits > 0, calendarElapsed < calendarDays else { return nil }
+
+        let daysInPeriod: Int
+        let elapsed: Int
+        if excludeWeekends {
+            daysInPeriod = workdays(from: month.start, days: calendarDays, calendar: calendar)
+            elapsed = workdays(from: month.start, days: calendarElapsed, calendar: calendar)
+            // `elapsed` is 0 when the month opens on a weekend and only weekend
+            // days have passed: there is no working-day rate to project with yet.
+            // `elapsed == daysInPeriod` means only weekend days remain, so there
+            // is nothing left to project — the same reason the all-days path
+            // stops on the last day of the month.
+            guard elapsed > 0, elapsed < daysInPeriod else { return nil }
+        } else {
+            daysInPeriod = calendarDays
+            elapsed = calendarElapsed
+        }
+
         let projected = report.totalCredits / Double(elapsed) * Double(daysInPeriod)
         let endDate = calendar.date(byAdding: .day, value: -1, to: month.end) ?? month.end
         return SpendProjection(
             projectedCredits: projected,
             budgetCredits: monthlyBudgetUSD * 100,
             daysElapsed: elapsed, daysInPeriod: daysInPeriod,
-            endLabel: endFormatter.string(from: endDate))
+            endLabel: endFormatter.string(from: endDate),
+            excludesWeekends: excludeWeekends)
     }
 
     // Headless regression check (--verify-projection): asserts compute() on
@@ -300,6 +345,8 @@ struct SpendProjection {
         }
         var cal = Calendar(identifier: .gregorian)
         cal.timeZone = TimeZone(identifier: "UTC") ?? cal.timeZone
+        // Pin the locale so weekend-ness is Sat/Sun regardless of where this runs.
+        cal.locale = Locale(identifier: "en_US_POSIX")
         let now = cal.date(from: DateComponents(year: 2025, month: 7, day: 15))!   // mid-July (31 days)
         func report(days: Int, credits: Double) -> Report {
             var r = Report.empty; r.daysInRange = days; r.totalCredits = credits; return r
@@ -325,6 +372,58 @@ struct SpendProjection {
         check("no usage -> nil", compute(periodKind: .thisMonth, report: report(days: 10, credits: 0), monthlyBudgetUSD: 150, now: now, calendar: cal) == nil)
         check("last day of month -> nil", compute(periodKind: .thisMonth, report: report(days: 31, credits: 300), monthlyBudgetUSD: 150, now: now, calendar: cal) == nil)
         check("non-thisMonth period -> nil", compute(periodKind: .previousMonth, report: report(days: 10, credits: 300), monthlyBudgetUSD: 150, now: now, calendar: cal) == nil)
+
+        // -- Weekend exclusion (#37) ----------------------------------------
+        // July 2025 opens on a Tuesday: 23 working days of 31. The first 10
+        // calendar days contain 8 working days (the 5th and 6th are a weekend).
+        if let p = compute(periodKind: .thisMonth, report: report(days: 10, credits: 300),
+                           monthlyBudgetUSD: 150, now: now, calendar: cal, excludeWeekends: true) {
+            check("workday run-rate projected (300/8*23 = 862.5cr)", abs(p.projectedCredits - 862.5) < 1e-6)
+            check("counts report workdays (8/23)", p.daysElapsed == 8 && p.daysInPeriod == 23)
+            check("flagged as excluding weekends", p.excludesWeekends)
+        } else { check("weekday mode returns a projection", false) }
+
+        // The whole point: a five-day week forecasts lower than a seven-day one.
+        if let all = compute(periodKind: .thisMonth, report: report(days: 10, credits: 300),
+                             monthlyBudgetUSD: 150, now: now, calendar: cal),
+           let week = compute(periodKind: .thisMonth, report: report(days: 10, credits: 300),
+                              monthlyBudgetUSD: 150, now: now, calendar: cal, excludeWeekends: true) {
+            check("excluding weekends lowers the forecast", week.projectedCredits < all.projectedCredits)
+            check("default is unchanged (930cr)", abs(all.projectedCredits - 930) < 1e-6)
+            check("all-days is not flagged", !all.excludesWeekends)
+        } else { check("both modes project mid-month", false) }
+
+        // Weekend spend already made is still carried: the same credits over the
+        // same elapsed days must project at least what has already been spent.
+        if let p = compute(periodKind: .thisMonth, report: report(days: 10, credits: 300),
+                           monthlyBudgetUSD: 150, now: now, calendar: cal, excludeWeekends: true) {
+            check("forecast never dips below spend to date", p.projectedCredits >= 300)
+        } else { check("weekend-spend case projects", false) }
+
+        // February 2025 opens on a Saturday: two days in, no working day has
+        // elapsed, so there is no working-day rate to project with.
+        let febOpening = cal.date(from: DateComponents(year: 2025, month: 2, day: 2))!
+        check("no workday elapsed yet -> nil",
+              compute(periodKind: .thisMonth, report: report(days: 2, credits: 300),
+                      monthlyBudgetUSD: 150, now: febOpening, calendar: cal, excludeWeekends: true) == nil)
+        check("...but all-days still projects then",
+              compute(periodKind: .thisMonth, report: report(days: 2, credits: 300),
+                      monthlyBudgetUSD: 150, now: febOpening, calendar: cal) != nil)
+
+        // August 2025 ends on a Sat/Sun: by the 29th every working day is gone,
+        // so there is nothing left to forecast even though the month has not ended.
+        let augTail = cal.date(from: DateComponents(year: 2025, month: 8, day: 29))!
+        check("only weekend days remain -> nil",
+              compute(periodKind: .thisMonth, report: report(days: 29, credits: 300),
+                      monthlyBudgetUSD: 150, now: augTail, calendar: cal, excludeWeekends: true) == nil)
+
+        // The guards that gate the all-days path must gate this one too.
+        check("weekday mode: no usage -> nil",
+              compute(periodKind: .thisMonth, report: report(days: 10, credits: 0),
+                      monthlyBudgetUSD: 150, now: now, calendar: cal, excludeWeekends: true) == nil)
+        check("weekday mode: non-thisMonth -> nil",
+              compute(periodKind: .previousMonth, report: report(days: 10, credits: 300),
+                      monthlyBudgetUSD: 150, now: now, calendar: cal, excludeWeekends: true) == nil)
 
         BudgetInput.verify(check)
 

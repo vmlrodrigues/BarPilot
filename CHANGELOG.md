@@ -4,6 +4,15 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Option to exclude weekends from the month-end forecast.** The projection
+  assumed spend continued every remaining day of the month, which overstates it
+  for anyone working a five-day week. Turn it on under Monthly budget and the
+  forecast runs at a per-working-day rate across the month's working days
+  instead. Off by default. Weekend spend you have already made still counts — it
+  was billed, so the forecast can never dip below it. The daily chart is
+  unchanged and weekend bars still appear. (#37)
+
 ## [0.10.2] — 2026-08-17
 
 ### Changed
