@@ -383,12 +383,16 @@ struct SpendProjection {
             check("flagged as excluding weekends", p.excludesWeekends)
         } else { check("weekday mode returns a projection", false) }
 
-        // The whole point: a five-day week forecasts lower than a seven-day one.
+        // Mid-month, once a representative share of weekends has elapsed, the
+        // five-day week forecasts lower. This is NOT a universal law: very early
+        // in a month that opens on a weekend, the working-day base is small and
+        // the weekday forecast can sit higher. The rate is corrected to a
+        // working-day basis, which is not the same as being reduced.
         if let all = compute(periodKind: .thisMonth, report: report(days: 10, credits: 300),
                              monthlyBudgetUSD: 150, now: now, calendar: cal),
            let week = compute(periodKind: .thisMonth, report: report(days: 10, credits: 300),
                               monthlyBudgetUSD: 150, now: now, calendar: cal, excludeWeekends: true) {
-            check("excluding weekends lowers the forecast", week.projectedCredits < all.projectedCredits)
+            check("mid-month, weekdays forecast lower than all-days", week.projectedCredits < all.projectedCredits)
             check("default is unchanged (930cr)", abs(all.projectedCredits - 930) < 1e-6)
             check("all-days is not flagged", !all.excludesWeekends)
         } else { check("both modes project mid-month", false) }
