@@ -4,6 +4,8 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+## [0.10.3] — 2026-08-19
+
 ### Added
 - **Option to exclude weekends from the month-end forecast.** The projection
   assumed spend continued every remaining day of the month, which overstates it
