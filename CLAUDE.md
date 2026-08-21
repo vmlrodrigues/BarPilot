@@ -275,7 +275,9 @@ overlay never mutates local aggregation.
   GitHub's small numeric id space would be reversible by a precomputed table —
   hence the KDF. Schema v2 retains legacy
   aggregate rows only during deprecation. Truncated gist files are fetched through
-  their authenticated `raw_url`.
+  their authenticated `raw_url`. Payloads also carry the public USD→AUD quote and
+  its provider update timestamp. The newest valid provider timestamp wins across
+  Macs; local fetch time is never used to decide freshness.
 - **Cycle membership is interval containment, not calendar-month equality.**
   `CreditReconciliation.isCurrentCycle` tests `resetAt - 1 month <= now < resetAt`.
   Copilot resets are not always UTC midnight on the 1st — the account response
@@ -327,9 +329,12 @@ overlay never mutates local aggregation.
 - **Currency (USD/AUD):** everything is computed/stored in USD; AUD is a
   display-time conversion via a live rate (`Currency.swift`, open.er-api.com,
   fetched on launch + every 24h, cached in UserDefaults for offline use). The
-  budget stays canonical USD (`monthlyBudgetUSD`); in AUD it's shown converted and
-  rounded to a whole dollar (`budgetMoneyString`), and the budget dialog reads/writes
-  in the displayed currency. `effectiveCurrency` falls back to USD if AUD is selected
+  provider update timestamp is persisted with the rate and propagated through
+  opt-in multi-machine sync, so a Mac automatically adopts a newer provider
+  vintage and never replaces it with an older CDN response. The budget stays
+  canonical USD (`monthlyBudgetUSD`); in AUD it's shown converted and rounded to a
+  whole dollar (`budgetMoneyString`), and the budget dialog reads/writes in the
+  displayed currency. `effectiveCurrency` falls back to USD if AUD is selected
   before a rate has loaded. All cost display goes through `Store.costString`.
 
 ## Gotchas

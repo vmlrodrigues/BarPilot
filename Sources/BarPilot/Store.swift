@@ -38,6 +38,7 @@ final class UsageStore: ObservableObject {
     @Published var displayCurrency: Currency { didSet { persistCurrency(); recompute() } }
     /// Latest USD→AUD rate (nil until fetched/cached); published so the UI updates.
     @Published private(set) var usdToAUD: Double?
+    private var exchangeRateSnapshot: ExchangeRateSnapshot?
 
     /// Multi-machine sync (opt-in, default OFF). The primary timeline unions
     /// account-counter observations; legacy aggregate tabs still combine rows.
@@ -91,6 +92,8 @@ final class UsageStore: ObservableObject {
     private static let currencyKey = "displayCurrency"
     private static let rateKey = "usdToAUDRate"
     private static let rateDateKey = "usdToAUDRateDate"
+    private static let rateProviderUpdatedKey = "usdToAUDProviderUpdatedAt"
+    private static let rateProviderNextKey = "usdToAUDProviderNextUpdateAt"
     private static let syncKey = "multiMachineSyncEnabled"
     private static let serverUsageKey = "serverCreditUsageEnabled"
     private static let serverUsageDisconnectedKey = "serverCreditUsageExplicitlyDisconnected"
@@ -118,6 +121,18 @@ final class UsageStore: ObservableObject {
         excludeWeekendsFromProjection = UserDefaults.standard.bool(forKey: Self.excludeWeekendsKey)  // default false
         let cachedRate = UserDefaults.standard.double(forKey: Self.rateKey)
         usdToAUD = cachedRate > 0 ? cachedRate : nil
+        let providerUpdated = (UserDefaults.standard.object(
+            forKey: Self.rateProviderUpdatedKey
+        ) as? NSNumber)?.int64Value ?? 0
+        let providerNext = (UserDefaults.standard.object(
+            forKey: Self.rateProviderNextKey
+        ) as? NSNumber)?.int64Value ?? 0
+        let cachedSnapshot = ExchangeRateSnapshot(
+            usdToAUD: cachedRate,
+            providerUpdatedAtUnix: providerUpdated,
+            providerNextUpdateAtUnix: providerNext > 0 ? providerNext : nil
+        )
+        exchangeRateSnapshot = cachedSnapshot.isValid() ? cachedSnapshot : nil
 
         syncEnabled = UserDefaults.standard.bool(forKey: Self.syncKey)   // default false
         syncLogin = UserDefaults.standard.string(forKey: "syncLogin")
@@ -316,6 +331,7 @@ final class UsageStore: ObservableObject {
         let mine = SyncAggregate.project(
             allRecords, creditSamples: creditSamples,
             accountFingerprint: serverUsageAccountFingerprint,
+            exchangeRateSnapshot: exchangeRateSnapshot,
             machineId: Self.machineId, label: nil, updatedAt: Self.nowISO()
         )
         let syncedSamples = mine.creditSamples ?? []
@@ -325,7 +341,9 @@ final class UsageStore: ObservableObject {
             "\(mine.rows.reduce(0) { $0 + $1.inTok + $1.outTok })",
             "\(syncedSamples.count)",
             "\(syncedSamples.first?.resetAtMs ?? 0)",
-            "\(mine.accountFingerprint ?? "")"
+            "\(mine.accountFingerprint ?? "")",
+            "\(mine.exchangeRateSnapshot?.providerUpdatedAtUnix ?? 0)",
+            "\(mine.exchangeRateSnapshot?.usdToAUD ?? 0)"
         ].joined(separator: ":")
         if !syncPushBlocked && (force || fp != UserDefaults.standard.string(forKey: Self.pushFPKey) || syncError != nil) {
             do {
@@ -344,6 +362,7 @@ final class UsageStore: ObservableObject {
         if let others = try? await backend.pullOthers(excluding: Self.machineId), !others.isEmpty {
             RemoteStore.clear()
             for o in others { RemoteStore.save(o) }
+            adoptNewestExchangeRate(from: others)
             recompute()
         }
     }
@@ -664,11 +683,36 @@ final class UsageStore: ObservableObject {
 
     /// Fetch the latest USD→AUD rate, cache it, and refresh the UI on success.
     func refreshRate() async {
-        guard let rate = await ExchangeRate.fetchUSDToAUD() else { return }
-        usdToAUD = rate
-        UserDefaults.standard.set(rate, forKey: Self.rateKey)
+        guard let snapshot = await ExchangeRate.fetchUSDToAUD() else { return }
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.rateDateKey)
+        let changed = adoptNewestExchangeRate(from: [snapshot])
+        if changed, syncEnabled { await syncNow() }
+    }
+
+    @discardableResult
+    private func adoptNewestExchangeRate(from payloads: [MachineSyncPayload]) -> Bool {
+        adoptNewestExchangeRate(from: payloads.map(\.exchangeRateSnapshot))
+    }
+
+    @discardableResult
+    private func adoptNewestExchangeRate(from candidates: [ExchangeRateSnapshot?]) -> Bool {
+        guard let newest = ExchangeRateSnapshot.newestValid(
+            [exchangeRateSnapshot] + candidates
+        ), newest.providerUpdatedAtUnix != exchangeRateSnapshot?.providerUpdatedAtUnix
+        else { return false }
+        exchangeRateSnapshot = newest
+        usdToAUD = newest.usdToAUD
+        UserDefaults.standard.set(newest.usdToAUD, forKey: Self.rateKey)
+        UserDefaults.standard.set(
+            Double(newest.providerUpdatedAtUnix), forKey: Self.rateProviderUpdatedKey
+        )
+        if let next = newest.providerNextUpdateAtUnix {
+            UserDefaults.standard.set(Double(next), forKey: Self.rateProviderNextKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: Self.rateProviderNextKey)
+        }
         recompute()
+        return true
     }
 
     // -----------------------------------------------------------------------

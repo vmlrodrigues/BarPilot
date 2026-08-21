@@ -4,6 +4,12 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Synced Macs now converge on the newest AUD exchange rate.** Sync payloads
+  carry the rate and the provider's update timestamp; a Mac automatically adopts
+  another Mac's quote only when that provider timestamp is newer. Direct fetching
+  remains the fallback, and USD remains the canonical stored currency. (#38)
+
 ## [0.10.3] — 2026-08-19
 
 ### Added

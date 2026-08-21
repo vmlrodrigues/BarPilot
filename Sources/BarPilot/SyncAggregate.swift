@@ -53,6 +53,7 @@ struct MachineSyncPayload: Codable {
     var rows: [AggregateRow]
     var accountFingerprint: String? = nil
     var creditSamples: [SyncedCreditSample]? = nil
+    var exchangeRateSnapshot: ExchangeRateSnapshot? = nil
 }
 
 enum SyncAggregate {
@@ -63,6 +64,7 @@ enum SyncAggregate {
     /// remote samples here.
     static func project(_ records: [UsageRecord], creditSamples: [CreditSample] = [],
                         accountFingerprint: String? = nil,
+                        exchangeRateSnapshot: ExchangeRateSnapshot? = nil,
                         machineId: String, label: String?, updatedAt: String) -> MachineSyncPayload {
         struct Key: Hashable { let day: String; let model: String; let level: String? }
         struct Acc {
@@ -91,7 +93,8 @@ enum SyncAggregate {
             accountFingerprint: accountFingerprint,
             creditSamples: accountFingerprint == nil
                 ? nil
-                : compactCreditSamples(creditSamples).map(SyncedCreditSample.init)
+                : compactCreditSamples(creditSamples).map(SyncedCreditSample.init),
+            exchangeRateSnapshot: exchangeRateSnapshot
         )
     }
 
@@ -172,23 +175,59 @@ enum SyncAggregate {
             CreditSample(capturedAtMs: sampleStart + 3_600_000, serverAtMs: nil, resetAtMs: reset, creditsUsed: 100),
             CreditSample(capturedAtMs: sampleStart + 3_660_000, serverAtMs: nil, resetAtMs: reset, creditsUsed: 110)
         ]
+        let rateFixture = ExchangeRateSnapshot(
+            usdToAUD: 1.405035,
+            providerUpdatedAtUnix: 1_900_000_000,
+            providerNextUpdateAtUnix: 1_900_086_400
+        )
         let agg = project(
             records, creditSamples: sampleFixture,
             accountFingerprint: "same-account",
+            exchangeRateSnapshot: rateFixture,
             machineId: "self", label: nil, updatedAt: ""
         )
         let data = try! JSONEncoder().encode(agg)
         let decoded = try! JSONDecoder().decode(MachineSyncPayload.self, from: data)
-        precondition(decoded.schemaVersion == 2 && decoded.creditSamples?.count == 2,
-                     "sync v2 must round-trip one immutable observation per 15 minutes")
+        precondition(decoded.schemaVersion == 2 && decoded.creditSamples?.count == 2
+                     && decoded.exchangeRateSnapshot == rateFixture,
+                     "sync v2 must round-trip counter observations and the exchange-rate snapshot")
         let legacyJSON = """
         {"schemaVersion":1,"machineId":"legacy","updatedAt":"","rows":[]}
         """
         let legacy = try! JSONDecoder().decode(
             MachineSyncPayload.self, from: Data(legacyJSON.utf8)
         )
-        precondition(legacy.accountFingerprint == nil && legacy.creditSamples == nil,
+        precondition(legacy.accountFingerprint == nil && legacy.creditSamples == nil
+                     && legacy.exchangeRateSnapshot == nil,
                      "schema v1 payloads must remain readable during migration")
+        let olderRate = ExchangeRateSnapshot(
+            usdToAUD: 1.39,
+            providerUpdatedAtUnix: rateFixture.providerUpdatedAtUnix - 86_400,
+            providerNextUpdateAtUnix: rateFixture.providerUpdatedAtUnix
+        )
+        let invalidFutureRate = ExchangeRateSnapshot(
+            usdToAUD: 9.99,
+            providerUpdatedAtUnix: rateFixture.providerUpdatedAtUnix + 7 * 86_400,
+            providerNextUpdateAtUnix: nil
+        )
+        precondition(
+            ExchangeRateSnapshot.newestValid(
+                [olderRate, invalidFutureRate, rateFixture],
+                nowUnix: rateFixture.providerUpdatedAtUnix + 60
+            ) == rateFixture,
+            "newest valid provider vintage must win and future-dated quotes must be rejected"
+        )
+        let providerJSON = """
+        {"result":"success","time_last_update_unix":1900000000,
+         "time_next_update_unix":1900086400,"rates":{"AUD":1.405035}}
+        """
+        precondition(
+            ExchangeRate.parseUSDToAUD(
+                Data(providerJSON.utf8),
+                now: Date(timeIntervalSince1970: 1_900_000_060)
+            ) == rateFixture,
+            "provider response must retain its rate vintage and next-update time"
+        )
         let merged = mergedCreditSamples(
             local: sampleFixture,
             remotes: [decoded],
@@ -279,6 +318,7 @@ enum SyncAggregate {
                 && reloaded.first?.machineId == agg.machineId
                 && reloaded.first?.rows.count == agg.rows.count
                 && reloaded.first?.creditSamples?.count == agg.creditSamples?.count
+                && reloaded.first?.exchangeRateSnapshot == agg.exchangeRateSnapshot
             err.write(Data((rtOK
                 ? "remote-store: PASS — aggregate persisted and reloaded intact (\(reloaded.first?.rows.count ?? 0) rows)\n"
                 : "remote-store: FAIL — persistence round-trip mismatch\n").utf8))
