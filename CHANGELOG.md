@@ -4,6 +4,8 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+## [0.10.4] — 2026-08-21
+
 ### Fixed
 - **Synced Macs now converge on the newest AUD exchange rate.** Sync payloads
   carry the rate and the provider's update timestamp; a Mac automatically adopts
