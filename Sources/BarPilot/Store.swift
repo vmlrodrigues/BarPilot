@@ -686,7 +686,9 @@ final class UsageStore: ObservableObject {
         guard let snapshot = await ExchangeRate.fetchUSDToAUD() else { return }
         UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.rateDateKey)
         let changed = adoptNewestExchangeRate(from: [snapshot])
-        if changed, syncEnabled { await syncNow() }
+        // reload() owns the initial sync. If the network wins the launch race,
+        // publishing here would replace this machine's gist rows with an empty set.
+        if changed, syncEnabled, lastUpdated != nil { await syncNow() }
     }
 
     @discardableResult
