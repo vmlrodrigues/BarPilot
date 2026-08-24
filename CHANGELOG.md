@@ -4,7 +4,7 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
-## [0.10.5] — 2026-08-24
+## [0.10.5] — 2026-08-25
 
 ### Fixed
 - **The GitHub credit total now refreshes promptly after the Mac wakes.** BarPilot
