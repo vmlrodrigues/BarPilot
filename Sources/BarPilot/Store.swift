@@ -66,7 +66,12 @@ final class UsageStore: ObservableObject {
     private var creditSamples: [CreditSample] = []
     private var serverUsageAccountFingerprint: String?
     private var serverUsageGeneration = 0
-    private var activeServerRefreshes: Set<Int> = []
+    private struct ActiveServerRefresh {
+        let id: UUID
+        let startedAt: Date
+        let task: Task<ServerUsageRefreshOutcome, Never>
+    }
+    private var activeServerRefreshes: [Int: ActiveServerRefresh] = [:]
 
     /// Text shown in the menu bar (the compact current-month total cost).
     @Published private(set) var menuBarTitle: String = "—"
@@ -499,30 +504,83 @@ final class UsageStore: ObservableObject {
 
     /// Fetch one cumulative counter observation. A failed request never writes a
     /// zero or replaces the last good sample.
-    func refreshServerUsage() async {
+    @discardableResult
+    func refreshServerUsage() async -> ServerUsageRefreshOutcome {
         let generation = serverUsageGeneration
-        guard serverUsageEnabled, !activeServerRefreshes.contains(generation) else { return }
+        guard serverUsageEnabled else { return .notNeeded }
+        if let active = activeServerRefreshes[generation] {
+            return await finishServerRefresh(active, generation: generation)
+        }
+        let active = ActiveServerRefresh(
+            id: UUID(),
+            startedAt: Date(),
+            task: Task { @MainActor [weak self] in
+                guard let self else { return .notNeeded }
+                return await self.performServerUsageRefresh(generation: generation)
+            }
+        )
+        activeServerRefreshes[generation] = active
+        return await finishServerRefresh(active, generation: generation)
+    }
+
+    private func finishServerRefresh(
+        _ active: ActiveServerRefresh,
+        generation: Int
+    ) async -> ServerUsageRefreshOutcome {
+        let outcome = await active.task.value
+        if activeServerRefreshes[generation]?.id == active.id {
+            activeServerRefreshes.removeValue(forKey: generation)
+        }
+        return outcome
+    }
+
+    private func cancelServerRefreshStarted(
+        before cutoff: Date,
+        generation: Int
+    ) async {
+        guard let active = activeServerRefreshes[generation],
+              active.startedAt < cutoff else {
+            return
+        }
+        active.task.cancel()
+        _ = await finishServerRefresh(active, generation: generation)
+    }
+
+    private func performServerUsageRefresh(
+        generation: Int
+    ) async -> ServerUsageRefreshOutcome {
+        guard serverUsageEnabled, generation == serverUsageGeneration,
+              !Task.isCancelled else {
+            return .notNeeded
+        }
         guard let token = CreditUsageKeychain.token() else {
             serverUsageError = "GitHub is disconnected. Connect again from the usage window."
             serverUsageEnabled = false
             UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
             UserDefaults.standard.set(true, forKey: Self.serverUsageDisconnectedKey)
             recompute()
-            return
+            return .notNeeded
         }
-        activeServerRefreshes.insert(generation)
-        defer { activeServerRefreshes.remove(generation) }
         do {
             let sample = try await CreditUsageAPI.fetch(token: token)
-            guard serverUsageEnabled, generation == serverUsageGeneration else { return }
+            guard serverUsageEnabled, generation == serverUsageGeneration,
+                  !Task.isCancelled else {
+                return .notNeeded
+            }
             if serverUsageAccountFingerprint == nil {
                 guard let fingerprint = await CreditUsageAPI.accountFingerprint(token: token) else {
-                    guard serverUsageEnabled, generation == serverUsageGeneration else { return }
+                    guard serverUsageEnabled, generation == serverUsageGeneration,
+                          !Task.isCancelled else {
+                        return .notNeeded
+                    }
                     serverUsageError = "GitHub authenticated, but BarPilot couldn’t verify the account for safe multi-Mac history."
                     recompute()
-                    return
+                    return .retryableFailure
                 }
-                guard serverUsageEnabled, generation == serverUsageGeneration else { return }
+                guard serverUsageEnabled, generation == serverUsageGeneration,
+                      !Task.isCancelled else {
+                    return .notNeeded
+                }
                 serverUsageAccountFingerprint = fingerprint
                 UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
             }
@@ -531,11 +589,14 @@ final class UsageStore: ObservableObject {
                 if let account { CreditSampleStore.adoptUnattributed(account: account) }
                 return CreditSampleStore.save(sample, account: account)
             }.value
-            guard serverUsageEnabled, generation == serverUsageGeneration else { return }
+            guard serverUsageEnabled, generation == serverUsageGeneration,
+                  !Task.isCancelled else {
+                return .notNeeded
+            }
             guard saved else {
                 serverUsageError = "The GitHub total was received but couldn’t be saved locally."
                 recompute()
-                return
+                return .notNeeded
             }
             // Only treat this as a genuine rollover when the cycle actually moved
             // FORWARD and the counter reset with it. Reacting to any change meant
@@ -560,8 +621,12 @@ final class UsageStore: ObservableObject {
             serverUsageSample = sample
             serverUsageError = nil
             recompute()
+            return .refreshed
         } catch {
-            guard serverUsageEnabled, generation == serverUsageGeneration else { return }
+            guard !Task.isCancelled else { return .notNeeded }
+            guard serverUsageEnabled, generation == serverUsageGeneration else {
+                return .notNeeded
+            }
             serverUsageError = Self.serverUsageErrorMessage(error)
             if case .unauthorized = error as? CreditUsageError {
                 serverUsageEnabled = false
@@ -570,7 +635,46 @@ final class UsageStore: ObservableObject {
                 _ = CreditUsageKeychain.deleteToken()
             }
             recompute()
+            if case .network = error as? CreditUsageError {
+                return .retryableFailure
+            }
+            return .notNeeded
         }
+    }
+
+    /// A visible screen wake should not wait for the next 60-second reload. The
+    /// caller already allows networking to settle; replace any request that began
+    /// before that point, then retry once only after a transient failure.
+    func refreshServerUsageAfterWake(wokeAt: Date) async {
+        let settledAt = wokeAt.addingTimeInterval(
+            WakeRefreshPolicy.networkSettleDelaySeconds
+        )
+        await cancelServerRefreshStarted(
+            before: settledAt,
+            generation: serverUsageGeneration
+        )
+        let outcome = await refreshServerUsage()
+        guard WakeRefreshPolicy.shouldRetry(
+            outcome: outcome,
+            latestCapturedAt: serverUsageSample?.capturedAt,
+            wokeAt: wokeAt
+        ) else {
+            return
+        }
+
+        do {
+            try await Task.sleep(nanoseconds: WakeRefreshPolicy.retryDelayNanoseconds)
+        } catch {
+            return
+        }
+        guard serverUsageEnabled,
+              !WakeRefreshPolicy.hasPostWakeSample(
+                capturedAt: serverUsageSample?.capturedAt,
+                wokeAt: wokeAt
+              ) else {
+            return
+        }
+        await refreshServerUsage()
     }
 
     private static func serverUsageErrorMessage(_ error: Error) -> String {

@@ -47,6 +47,11 @@ struct AppMain {
             CreditReconciliation.verify()
             exit(0)
         }
+        // Dev-only: post-wake refresh coalescing and retry rules (#39).
+        if CommandLine.arguments.contains("--verify-wake-refresh") {
+            WakeRefreshPolicy.verify()
+            exit(0)
+        }
         // Support report — state, a timed load, and the recent reload log (#24).
         if CommandLine.arguments.contains("--diagnose") {
             Diagnose.run()
@@ -87,6 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // ensures clicks in other apps still close the popover in that case.
     private var outsideClickMonitor: Any?
     private var settingsWindow: NSWindow?
+    private var wakeRefreshTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(CommandLine.arguments.contains("--regular") ? .regular : .accessory)
@@ -128,6 +134,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
 
         updater.start()
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(screensDidWake),
+            name: NSWorkspace.screensDidWakeNotification,
+            object: nil
+        )
         Task.detached(priority: .background) {
             SpanCache.prune()
             CreditSampleStore.prune()
@@ -136,6 +148,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // A crowded menu bar (or a notch) can push the status item somewhere the
         // user can't reach, which would otherwise make settings unreachable too.
         if CommandLine.arguments.contains("--settings") { openSettings() }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        wakeRefreshTask?.cancel()
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
     /// Left-click toggles the window; right-click (or control-click) shows a menu.
@@ -247,6 +264,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func refreshNow() {
         Task { await store.reload() }
+    }
+
+    @objc private func screensDidWake(_ notification: Notification) {
+        guard wakeRefreshTask == nil else { return }
+        let wokeAt = Date()
+        wakeRefreshTask = Task { [weak self] in
+            do {
+                try await Task.sleep(
+                    nanoseconds: WakeRefreshPolicy.networkSettleDelayNanoseconds
+                )
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            await self.store.refreshServerUsageAfterWake(wokeAt: wokeAt)
+            self.wakeRefreshTask = nil
+        }
     }
 
     /// The primary GitHub connection is separate from gist sync, so disconnecting

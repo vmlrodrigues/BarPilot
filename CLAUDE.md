@@ -73,6 +73,7 @@ Other headless modes — run the relevant ones after touching their area:
 | `--verify-projection` | spend-projection run-rate math + guards (#18) |
 | `--verify-sync` | v2 sync payload, account isolation, remote gap-fill, legacy fit |
 | `--verify-credits` | server-counter parsing, current-cycle guards, and unclassified reconciliation (#33) |
+| `--verify-wake-refresh` | visible-wake freshness and bounded retry rules (#39) |
 | `--sync-preview` | combined multi-machine view vs a simulated second machine |
 | `--diagnose` | support report: state, a timed load, recent reload log |
 
