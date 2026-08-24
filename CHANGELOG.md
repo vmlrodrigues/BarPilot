@@ -4,6 +4,14 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+## [0.10.5] — 2026-08-24
+
+### Fixed
+- **The GitHub credit total now refreshes promptly after the Mac wakes.** BarPilot
+  waits briefly for networking to recover, replaces any request that began too
+  early during wake, and retries once after a transient failure. The stale
+  warning no longer waits for the next minute timer to clear. (#39)
+
 ## [0.10.4] — 2026-08-21
 
 ### Fixed
