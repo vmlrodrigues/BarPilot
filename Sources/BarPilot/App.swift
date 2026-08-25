@@ -98,8 +98,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var outsideClickMonitor: Any?
     private var settingsWindow: NSWindow?
     private var wakeRefreshTask: Task<Void, Never>?
+    private weak var shortcutPreviousWindow: NSWindow?
+    private var shortcutPreviousApplication: NSRunningApplication?
     private lazy var shortcutController = GlobalShortcutController { [weak self] in
-        self?.showPopover()
+        self?.togglePopoverFromShortcut()
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -517,6 +519,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func togglePopoverFromShortcut() {
+        if popover.isShown {
+            let previousWindow = shortcutPreviousWindow
+            let previousApplication = shortcutPreviousApplication
+            clearShortcutFocusTarget()
+            popover.performClose(nil)
+
+            if let previousWindow, previousWindow.isVisible {
+                NSApp.activate(ignoringOtherApps: true)
+                previousWindow.makeKeyAndOrderFront(nil)
+            } else if let previousApplication, !previousApplication.isTerminated {
+                previousApplication.activate(options: [.activateIgnoringOtherApps])
+            }
+            return
+        }
+
+        shortcutPreviousWindow = NSApp.isActive ? NSApp.keyWindow : nil
+        let frontmost = NSWorkspace.shared.frontmostApplication
+        shortcutPreviousApplication = frontmost?.processIdentifier
+            == ProcessInfo.processInfo.processIdentifier ? nil : frontmost
+        showPopover()
+    }
+
+    private func clearShortcutFocusTarget() {
+        shortcutPreviousWindow = nil
+        shortcutPreviousApplication = nil
+    }
+
     private func showPopover() {
         guard let button = statusItem.button else { return }
         if popover.isShown {
@@ -566,6 +596,7 @@ extension AppDelegate: NSPopoverDelegate {
     /// monitor, or the status-bar button toggle). Always clean up the monitor.
     func popoverDidClose(_ notification: Notification) {
         removeOutsideClickMonitor()
+        clearShortcutFocusTarget()
     }
 }
 

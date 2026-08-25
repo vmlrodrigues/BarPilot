@@ -247,6 +247,8 @@ overlay never mutates local aggregation.
   after the user presses it again and BarPilot receives the global event; otherwise
   an eight-second timeout restores the old shortcut. At least two modifiers are
   required so common single-modifier app commands are not captured system-wide.
+  The shortcut toggles the popover; closing it restores the application or
+  Settings window that held keyboard focus before the popover opened.
 - **The budget field is AppKit-backed (`BudgetField`), and its parsing is pure
   (`BudgetInput`).** SwiftUI's `TextField` places the click's caret *after* it
   reports focus, so a typed figure gets appended to the existing one — 1000

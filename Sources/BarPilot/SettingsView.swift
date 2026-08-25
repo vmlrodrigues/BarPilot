@@ -211,7 +211,7 @@ struct SettingsView: View {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Usage window shortcut")
-                    Text("Open BarPilot from any app. Use at least two modifiers.")
+                    Text("Show or hide BarPilot from any app. Use at least two modifiers.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

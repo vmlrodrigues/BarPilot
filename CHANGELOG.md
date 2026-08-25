@@ -6,10 +6,12 @@ All notable changes to BarPilot are documented here.
 
 ### Added
 - **Configurable global shortcut for the usage window.** Record an optional
-  system-wide key combination under Settings → General to open or focus BarPilot
-  without reaching for the menu bar. A confirmation press proves BarPilot receives
-  the combination; intercepted shortcuts time out and restore the previous one.
-  No Accessibility or Input Monitoring permission is required. (#40)
+  system-wide key combination under Settings → General to toggle BarPilot without
+  reaching for the menu bar. Press it again to close the popover and return
+  keyboard focus to the app or Settings window you were using. A confirmation
+  press proves BarPilot receives the combination; intercepted shortcuts time out
+  and restore the previous one. No Accessibility or Input Monitoring permission
+  is required. (#40)
 
 ## [0.10.5] — 2026-08-25
 
