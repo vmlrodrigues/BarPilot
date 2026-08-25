@@ -4,6 +4,8 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+## [0.10.6] — 2026-08-26
+
 ### Added
 - **Configurable global shortcut for the usage window.** Record an optional
   system-wide key combination under Settings → General to toggle BarPilot without
