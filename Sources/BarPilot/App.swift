@@ -52,6 +52,11 @@ struct AppMain {
             WakeRefreshPolicy.verify()
             exit(0)
         }
+        // Dev-only: global shortcut validation and persistence encoding (#40).
+        if CommandLine.arguments.contains("--verify-shortcut") {
+            GlobalShortcut.verify()
+            exit(0)
+        }
         // Support report — state, a timed load, and the recent reload log (#24).
         if CommandLine.arguments.contains("--diagnose") {
             Diagnose.run()
@@ -93,6 +98,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var outsideClickMonitor: Any?
     private var settingsWindow: NSWindow?
     private var wakeRefreshTask: Task<Void, Never>?
+    private lazy var shortcutController = GlobalShortcutController { [weak self] in
+        self?.showPopover()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(CommandLine.arguments.contains("--regular") ? .regular : .accessory)
@@ -134,6 +142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
 
         updater.start()
+        shortcutController.start()
         NSWorkspace.shared.notificationCenter.addObserver(
             self,
             selector: #selector(screensDidWake),
@@ -152,6 +161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         wakeRefreshTask?.cancel()
+        shortcutController.stop()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
@@ -224,7 +234,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             saveDiagnostics: { [weak self] in self?.saveDiagnostics() }
         )
         let host = NSHostingController(
-            rootView: SettingsView(actions: actions).environmentObject(store)
+            rootView: SettingsView(
+                actions: actions,
+                shortcutController: shortcutController
+            )
+            .environmentObject(store)
         )
         let window = SettingsWindow(contentViewController: host)
         window.title = "BarPilot Settings"
@@ -235,8 +249,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // size isn't known at construction, so centring first would centre a
         // near-empty window and then grow it from that wrong origin.
         host.view.layoutSubtreeIfNeeded()
-        window.setContentSize(host.view.fittingSize)
-        if !window.setFrameUsingName(Self.settingsFrameName) { Self.trueCenter(window) }
+        let contentSize = host.view.fittingSize
+        window.setContentSize(contentSize)
+        if window.setFrameUsingName(Self.settingsFrameName) {
+            // Frame autosave includes the old content size. Preserve its
+            // top-left position, but always use the current SwiftUI fitting size
+            // so a newly added setting cannot be clipped after an upgrade.
+            let savedTopLeft = NSPoint(x: window.frame.minX, y: window.frame.maxY)
+            window.setContentSize(contentSize)
+            window.setFrameTopLeftPoint(savedTopLeft)
+            window.setFrame(
+                window.constrainFrameRect(window.frame, to: window.screen),
+                display: false
+            )
+        } else {
+            Self.trueCenter(window)
+        }
         window.setFrameAutosaveName(Self.settingsFrameName)
         settingsWindow = window
         NSApp.activate(ignoringOtherApps: true)
@@ -259,7 +287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openWindow() {
-        if !popover.isShown { togglePopover(nil) }
+        showPopover()
     }
 
     @objc private func refreshNow() {
@@ -482,19 +510,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func togglePopover(_ sender: Any?) {
-        guard let button = statusItem.button else { return }
         if popover.isShown {
             popover.performClose(sender)
         } else {
-            // Re-clamp to the current screen so the window always fits below the
-            // menu bar (the status item sits at the very top of the screen).
-            popover.contentSize = desiredContentSize()
-            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            showPopover()
+        }
+    }
+
+    private func showPopover() {
+        guard let button = statusItem.button else { return }
+        if popover.isShown {
             NSApp.activate(ignoringOtherApps: true)
             popover.contentViewController?.view.window?.makeKey()
-            installOutsideClickMonitor()
-            Task { await store.reload() }   // freshen on open
+            return
         }
+        // Re-clamp to the current screen so the window always fits below the
+        // menu bar (the status item sits at the very top of the screen).
+        popover.contentSize = desiredContentSize()
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        NSApp.activate(ignoringOtherApps: true)
+        popover.contentViewController?.view.window?.makeKey()
+        installOutsideClickMonitor()
+        Task { await store.reload() }   // freshen on open
     }
 
     private func installOutsideClickMonitor() {
@@ -538,6 +575,7 @@ extension AppDelegate: NSWindowDelegate {
     /// re-show a window whose SwiftUI state no longer reflects the store.
     func windowWillClose(_ notification: Notification) {
         guard let closing = notification.object as? NSWindow, closing === settingsWindow else { return }
+        shortcutController.cancelEditing()
         settingsWindow = nil
         // The app is an accessory agent: without a visible window it should not
         // keep the Dock/menu-bar focus it took to show settings.
@@ -560,6 +598,10 @@ final class SettingsWindow: NSWindow {
     override var canBecomeMain: Bool { true }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if let recorder = firstResponder as? ShortcutRecorderButton,
+           recorder.capture(event) {
+            return true
+        }
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         guard mods == .command, let key = event.charactersIgnoringModifiers?.lowercased() else {
             return super.performKeyEquivalent(with: event)

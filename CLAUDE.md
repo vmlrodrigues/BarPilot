@@ -74,6 +74,7 @@ Other headless modes — run the relevant ones after touching their area:
 | `--verify-sync` | v2 sync payload, account isolation, remote gap-fill, legacy fit |
 | `--verify-credits` | server-counter parsing, current-cycle guards, and unclassified reconciliation (#33) |
 | `--verify-wake-refresh` | visible-wake freshness and bounded retry rules (#39) |
+| `--verify-shortcut` | global shortcut validation and persistence encoding (#40) |
 | `--sync-preview` | combined multi-machine view vs a simulated second machine |
 | `--diagnose` | support report: state, a timed load, recent reload log |
 
@@ -181,6 +182,7 @@ Sources/BarPilot/
   DetailView.swift   Window UI: header, sparkline, budget bar.
   CompactDashboard.swift  Primary server-first dashboard and chart.
   SettingsView.swift  Settings window (budget, currency, GitHub, sync, general).
+  GlobalShortcut.swift  Persisted shortcut + Carbon hot-key registration/recorder.
   Tabs.swift         Summary / Models / Daily / Sessions / Top tables.
   Setup.swift        TelemetrySetup — opt-in native OTel enablement.
   Updater.swift      Silent GitHub-Releases auto-updater (Developer ID-gated).
@@ -237,6 +239,14 @@ overlay never mutates local aggregation.
   true)` — no `ScrollView` and no min/max height, or the window pads itself out
   with dead space. Switch rows go through `switchRow`, which puts the switch after
   a `Spacer` so switches align on the right regardless of label length.
+- **The usage-window shortcut uses Carbon `RegisterEventHotKey`, not an event
+  tap.** It therefore works globally without Accessibility or Input Monitoring
+  permission. Recording temporarily unregisters the current combination; cancel,
+  focus loss, or an unconfirmed replacement restores it. Carbon does not report
+  conflicts owned by another process, so a new combination is persisted only
+  after the user presses it again and BarPilot receives the global event; otherwise
+  an eight-second timeout restores the old shortcut. At least two modifiers are
+  required so common single-modifier app commands are not captured system-wide.
 - **The budget field is AppKit-backed (`BudgetField`), and its parsing is pure
   (`BudgetInput`).** SwiftUI's `TextField` places the click's caret *after* it
   reports focus, so a typed figure gets appended to the existing one — 1000

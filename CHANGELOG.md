@@ -4,6 +4,13 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Configurable global shortcut for the usage window.** Record an optional
+  system-wide key combination under Settings → General to open or focus BarPilot
+  without reaching for the menu bar. A confirmation press proves BarPilot receives
+  the combination; intercepted shortcuts time out and restore the previous one.
+  No Accessibility or Input Monitoring permission is required. (#40)
+
 ## [0.10.5] — 2026-08-25
 
 ### Fixed

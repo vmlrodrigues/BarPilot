@@ -25,6 +25,7 @@ struct SettingsActions {
 struct SettingsView: View {
     @EnvironmentObject var store: UsageStore
     let actions: SettingsActions
+    @ObservedObject var shortcutController: GlobalShortcutController
 
     @State private var budgetText: String = ""
     @State private var budgetError: String?
@@ -207,6 +208,44 @@ struct SettingsView: View {
 
     private var generalSection: some View {
         section("General", nil) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Usage window shortcut")
+                    Text("Open BarPilot from any app. Use at least two modifiers.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 12)
+                ShortcutRecorder(
+                    shortcut: shortcutController.pendingShortcut
+                        ?? shortcutController.shortcut,
+                    isRecording: shortcutController.isRecording,
+                    beginRecording: shortcutController.beginRecording,
+                    cancelRecording: shortcutController.cancelRecording,
+                    assign: shortcutController.assign,
+                    reportInvalid: shortcutController.reportInvalidCombination
+                )
+                .frame(width: 132, height: 24)
+                Button("Clear") { shortcutController.clear() }
+                    .disabled(
+                        shortcutController.shortcut == nil
+                            || shortcutController.isRecording
+                    )
+            }
+            Group {
+                if let message = shortcutController.confirmationMessage {
+                    Text(message).foregroundStyle(.blue)
+                } else if let error = shortcutController.errorMessage {
+                    Text(error).foregroundStyle(.orange)
+                } else {
+                    Text("Shortcut status").hidden()
+                }
+            }
+                    .font(.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+
+            Divider()
+
             switchRow("Start at login", "Open BarPilot automatically when you log in.",
                       isOn: Binding(
                           get: { startAtLogin },
