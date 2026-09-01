@@ -4,6 +4,12 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+### Fixed
+- **Previous billing cycles remain available after rollover.** The primary
+  GitHub-backed dashboard can now move between stored cycles while keeping the
+  menu-bar amount on the current cycle. Completed cycles show their final saved
+  counter and daily observations without a forward projection. (#41)
+
 ## [0.10.6] — 2026-08-26
 
 ### Added

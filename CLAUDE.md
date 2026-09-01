@@ -271,11 +271,14 @@ overlay never mutates local aggregation.
   account endpoint every 60 seconds and stores samples in the local span-cache
   database. The credentials use separate Keychain entries, so disconnecting one
   feature cannot silently disable the other. (#33)
-- **The primary UI is server-first and current-cycle only.** It shows credits,
+- **The primary UI is server-first and billing-cycle based.** It shows credits,
   USD + AUD, monthly budget progress, a daily usage bar chart, and daily
   observed counter deltas. Long gaps within one UTC day can be assigned safely;
-  unsampled growth crossing a UTC day boundary remains unallocated. The telemetry
-  tabs remain temporarily accessible behind a deprecated legacy-view control. (#34)
+  unsampled growth crossing a UTC day boundary remains unallocated. Stored
+  completed billing cycles remain navigable in this primary view; the menu bar
+  stays on the current cycle and historical cycles never project forward. The
+  telemetry tabs remain temporarily accessible behind a deprecated legacy-view
+  control. (#34, #41)
 - **The menu-bar figure warns when GitHub is not authoritative.** Reuse the
   existing warning glyph while disconnected, reconnect-required, stale, or in
   error; the amount remains the local fallback rather than disappearing.
@@ -301,8 +304,10 @@ overlay never mutates local aggregation.
   top of a locally aggregated calendar-month range.
 - **Sample history is addressed by cycle and account, never by a mutable pointer.**
   `credit_samples.account` records which account observed each row, and
-  `Store.loadCycleSamples` reads by `resetAtMs` + account. Rollover is committed
-  only when the reset moves forward *and* the counter drops. The former baseline
+  `Store.loadCycleSamples` reads by UTC reset day + account. Exact reset instants
+  remain stored, but same-day variants are coalesced for navigation because the
+  API's reset fields can disagree on time-of-day. Rollover is committed only when
+  the reset day moves forward *and* the counter drops. The former baseline
   pointer is **deleted, not repurposed** — it was the only account-isolation
   mechanism, so it had to be shoved forward on every reconnect, and any change to
   fingerprint derivation made the *same* account look new and hid the whole cycle.

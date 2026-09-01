@@ -137,9 +137,12 @@ enum SyncAggregate {
             .filter { $0.accountFingerprint == accountFingerprint }
             .flatMap { $0.creditSamples ?? [] }
             .map(\.creditSample)
+        let resetDay = CreditCycleSummary.dayStart(for: resetAtMs)
         var seen: Set<Key> = []
         return (local + remote)
-            .filter { $0.resetAtMs == resetAtMs }
+            .filter {
+                CreditCycleSummary.dayStart(for: $0.resetAtMs) == resetDay
+            }
             .filter { sample in
                 seen.insert(Key(
                     capturedAtMs: sample.capturedAtMs,
@@ -236,6 +239,17 @@ enum SyncAggregate {
         )
         precondition(merged.count == sampleFixture.count,
                      "remote observations must union with exact local duplicates, not sum")
+        let shiftedReset = reset + 8 * 60 * 60 * 1000
+        let coalesced = mergedCreditSamples(
+            local: sampleFixture + [CreditSample(
+                capturedAtMs: sampleStart + 7_200_000, serverAtMs: nil,
+                resetAtMs: shiftedReset, creditsUsed: 115
+            )],
+            remotes: [], resetAtMs: reset,
+            accountFingerprint: "same-account"
+        )
+        precondition(coalesced.count == sampleFixture.count + 1,
+                     "same-day reset variants must merge into one synced cycle")
         var otherAccount = decoded
         otherAccount.accountFingerprint = "different-account"
         otherAccount.creditSamples = [

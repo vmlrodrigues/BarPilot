@@ -227,6 +227,8 @@ enum CreditReconciliation {
             }
             precondition(CreditSampleStore.load(resetAtMs: reset, account: old).count == 3,
                          "pre-attribution rows must be visible to the connected account")
+            precondition(CreditSampleStore.latest(account: nil)?.creditsUsed == 30,
+                         "nil-account latest must read only unattributed rows")
 
             // Reconnecting under a *different-looking* fingerprint for the same
             // account must adopt, not discard.
@@ -250,6 +252,43 @@ enum CreditReconciliation {
                          "another account's writes must not appear in this account's cycle")
             precondition(CreditSampleStore.load(resetAtMs: reset, account: other).count == 1,
                          "an account must see its own writes")
+            precondition(CreditSampleStore.load(resetAtMs: reset, account: nil).isEmpty,
+                         "nil-account loads must not expose attributed rows")
+            precondition(CreditSampleStore.cycles(account: nil).isEmpty,
+                         "nil-account cycle lists must not expose attributed rows")
+
+            let priorReset = Aggregator.utcMidnightMs("2030-03-01")
+            CreditSampleStore.save(
+                CreditSample(capturedAtMs: base - 2_000_000, serverAtMs: nil,
+                             resetAtMs: priorReset, creditsUsed: 40),
+                account: new)
+            CreditSampleStore.save(
+                CreditSample(capturedAtMs: base - 1_000_000, serverAtMs: nil,
+                             resetAtMs: priorReset, creditsUsed: 75),
+                account: new)
+            let cycles = CreditSampleStore.cycles(account: new)
+            precondition(cycles.map(\.resetAtMs) == [reset, priorReset],
+                         "stored billing cycles must be newest first")
+            precondition(cycles.last?.latestSample.creditsUsed == 75,
+                         "a completed cycle must expose its final saved counter")
+            precondition(!cycles.contains { $0.latestSample.creditsUsed == 90 },
+                         "cycle navigation must not expose another account")
+
+            let shiftedReset = reset + 8 * 60 * 60 * 1000
+            CreditSampleStore.save(
+                CreditSample(capturedAtMs: base + 700_000, serverAtMs: nil,
+                             resetAtMs: shiftedReset, creditsUsed: 95),
+                account: new)
+            let coalesced = CreditSampleStore.cycles(account: new)
+            precondition(coalesced.count == 2
+                         && coalesced.first?.latestSample.creditsUsed == 95,
+                         "same-day reset variants must remain one billing cycle")
+            precondition(
+                CreditSampleStore.loadCycle(
+                    resetDayMs: CreditCycleSummary.dayStart(for: reset),
+                    account: new
+                ).count == 4,
+                "a coalesced cycle must load every same-day reset variant")
         }
     }
 }

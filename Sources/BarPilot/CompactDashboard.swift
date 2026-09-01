@@ -110,27 +110,59 @@ struct CompactDashboard: View {
 
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("This billing cycle")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    HStack(spacing: 5) {
+                        Button {
+                            store.selectOlderCreditCycle()
+                        } label: {
+                            Image(systemName: "chevron.left")
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(!store.canSelectOlderCreditCycle || store.isLoadingCreditCycle)
+                        .help("Older billing cycle")
+                        Text(cycleRangeLabel)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                        Button {
+                            store.selectNewerCreditCycle()
+                        } label: {
+                            Image(systemName: "chevron.right")
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(!store.canSelectNewerCreditCycle || store.isLoadingCreditCycle)
+                        .help("Newer billing cycle")
+                        if store.isLoadingCreditCycle {
+                            ProgressView().controlSize(.mini)
+                        }
+                    }
                     Text("\(Fmt.credits(store.compactTotalCredits)) credits")
                         .font(.system(size: 32, weight: .bold, design: .rounded))
                         .monospacedDigit()
                 }
                 Spacer()
-                if let sample = store.currentServerUsageSample {
+                if let cycle = store.selectedCreditCycle {
                     VStack(alignment: .trailing, spacing: 2) {
-                        Text("Resets")
+                        Text(store.isViewingCurrentCreditCycle ? "Resets" : "Ended")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
-                        Text(Self.resetFormatter.string(from: sample.resetAt))
+                        Text(Self.resetFormatter.string(from: cycle.resetAt))
                             .font(.caption.weight(.medium))
                     }
                 }
+
             }
         }
+
         .padding(.horizontal, 16)
         .padding(.vertical, 14)
+    }
+
+    private var cycleRangeLabel: String {
+        guard let cycle = store.selectedCreditCycle,
+              let start = cycle.startAt else {
+            return "Billing cycle"
+        }
+        return "\(Self.cycleDateFormatter.string(from: start)) – \(Self.cycleDateFormatter.string(from: cycle.resetAt))"
     }
 
     /// Clicking a card selects the currency shown in the menu bar (and across
@@ -355,6 +387,12 @@ struct CompactDashboard: View {
         formatter.dateFormat = "d MMM, h a"
         return formatter
     }()
+
+    private static let cycleDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "d MMM"
+        return formatter
+    }()
 }
 
 private struct CompactBudgetBar: View {
@@ -373,7 +411,8 @@ private struct CompactBudgetBar: View {
 
         VStack(alignment: .leading, spacing: 7) {
             HStack {
-                Text("This month’s spend")
+                Text(store.isViewingCurrentCreditCycle
+                     ? "This cycle’s spend" : "Selected cycle’s spend")
                     .font(.subheadline.weight(.semibold))
                 Spacer()
                 Text(hasBudget

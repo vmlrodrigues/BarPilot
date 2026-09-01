@@ -45,7 +45,8 @@ struct CreditTimeline {
             for index in 1..<ordered.count {
                 let previous = ordered[index - 1]
                 let current = ordered[index]
-                guard current.resetAtMs == previous.resetAtMs else {
+                guard CreditCycleSummary.dayStart(for: current.resetAtMs)
+                        == CreditCycleSummary.dayStart(for: previous.resetAtMs) else {
                     highWater = current.creditsUsed
                     continue
                 }
@@ -145,5 +146,16 @@ struct CreditTimeline {
                      "a late downward correction must not wipe attributed days")
         precondition(lateDrop.daily.first?.credits == 90)
         precondition(lateDrop.unallocatedCredits == 0)
+
+        let resetTimeVariant = build(samples: [
+            CreditSample(capturedAtMs: start, serverAtMs: nil,
+                         resetAtMs: reset, creditsUsed: 100),
+            CreditSample(capturedAtMs: start + hour, serverAtMs: nil,
+                         resetAtMs: reset + 8 * hour, creditsUsed: 120)
+        ])
+        precondition(resetTimeVariant.observedCredits == 20
+                     && resetTimeVariant.daily.first?.credits == 20
+                     && resetTimeVariant.unallocatedCredits == 0,
+                     "same-day reset variants must retain assignable deltas")
     }
 }

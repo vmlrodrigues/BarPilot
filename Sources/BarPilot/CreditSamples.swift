@@ -3,6 +3,27 @@ import SQLite3
 
 private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
+struct CreditCycleSummary: Identifiable, Equatable {
+    static let dayMs: Int64 = 24 * 60 * 60 * 1000
+
+    let resetDayMs: Int64
+    let latestSample: CreditSample
+
+    init(latestSample: CreditSample) {
+        self.resetDayMs = Self.dayStart(for: latestSample.resetAtMs)
+        self.latestSample = latestSample
+    }
+
+    var id: Int64 { resetDayMs }
+    var resetAtMs: Int64 { latestSample.resetAtMs }
+    var resetAt: Date { latestSample.resetAt }
+    var startAt: Date? { CreditReconciliation.cycleStart(for: latestSample) }
+
+    static func dayStart(for resetAtMs: Int64) -> Int64 {
+        resetAtMs / dayMs * dayMs
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CreditSampleStore — cumulative server-counter observations.
 //
@@ -45,6 +66,10 @@ enum CreditSampleStore {
         // switch that almost never happens. An unattributed row predates this
         // column; `adoptUnattributed` claims those exactly once.
         sqlite3_exec(db, "ALTER TABLE credit_samples ADD COLUMN account TEXT", nil, nil, nil)
+        sqlite3_exec(db, """
+        CREATE INDEX IF NOT EXISTS idx_credit_samples_account_cycle
+            ON credit_samples(account, reset_at_ms, captured_at_ms);
+        """, nil, nil, nil)
         return db
     }
 
@@ -111,6 +136,16 @@ enum CreditSampleStore {
         load(whereClause: "", limit: 1).first
     }
 
+    /// Latest row visible to one account. With no fingerprint, only legacy
+    /// unattributed rows are safe to hydrate; attributed rows may belong to a
+    /// different account and are restored once identity is verified.
+    static func latest(account: String?) -> CreditSample? {
+        let clause = account.map {
+            "WHERE account IS NULL OR account = '\(escape($0))'"
+        } ?? "WHERE account IS NULL"
+        return load(whereClause: clause, limit: 1).first
+    }
+
     static func latest(from capturedAtMs: Int64) -> CreditSample? {
         load(whereClause: "WHERE captured_at_ms >= \(capturedAtMs)", limit: 1).first
     }
@@ -124,8 +159,82 @@ enum CreditSampleStore {
         var clause = "WHERE reset_at_ms = \(resetAtMs)"
         if let account {
             clause += " AND (account IS NULL OR account = '\(escape(account))')"
+        } else {
+            clause += " AND account IS NULL"
         }
         return Array(load(whereClause: clause, limit: nil).reversed())
+    }
+
+    /// Samples whose exact reset timestamps fall on one UTC reset day. GitHub
+    /// can expose the same cycle through fields with different times-of-day, so
+    /// history navigation coalesces those shapes without rewriting stored rows.
+    static func loadCycle(resetDayMs: Int64, account: String?) -> [CreditSample] {
+        let end = resetDayMs + CreditCycleSummary.dayMs
+        var clause = "WHERE reset_at_ms >= \(resetDayMs) AND reset_at_ms < \(end)"
+        if let account {
+            clause += " AND (account IS NULL OR account = '\(escape(account))')"
+        } else {
+            clause += " AND account IS NULL"
+        }
+        return Array(load(whereClause: clause, limit: nil).reversed())
+    }
+
+    /// One latest observation per stored billing cycle, newest cycle first.
+    /// Reset instants on the same UTC day are one cycle: the API has several
+    /// reset fields and their time-of-day can differ within a real cycle.
+    static func cycles(account: String?) -> [CreditCycleSummary] {
+        guard let db = open() else { return [] }
+        defer { sqlite3_close(db) }
+        let accountClause = account.map {
+            "(account IS NULL OR account = '\(escape($0))')"
+        } ?? "account IS NULL"
+        let daysSQL = """
+        SELECT DISTINCT (reset_at_ms / \(CreditCycleSummary.dayMs))
+        FROM credit_samples
+        WHERE \(accountClause)
+        ORDER BY 1 DESC
+        """
+        var daysStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, daysSQL, -1, &daysStmt, nil) == SQLITE_OK else {
+            return []
+        }
+        defer { sqlite3_finalize(daysStmt) }
+        var resetDays: [Int64] = []
+        while sqlite3_step(daysStmt) == SQLITE_ROW {
+            resetDays.append(
+                sqlite3_column_int64(daysStmt, 0) * CreditCycleSummary.dayMs
+            )
+        }
+
+        var out: [CreditCycleSummary] = []
+        for resetDay in resetDays {
+            let end = resetDay + CreditCycleSummary.dayMs
+            let latestSQL = """
+            SELECT captured_at_ms, server_at_ms, reset_at_ms, credits_used
+            FROM credit_samples
+            WHERE reset_at_ms >= \(resetDay) AND reset_at_ms < \(end)
+              AND \(accountClause)
+            ORDER BY captured_at_ms DESC
+            LIMIT 1
+            """
+            var latestStmt: OpaquePointer?
+            guard sqlite3_prepare_v2(
+                db, latestSQL, -1, &latestStmt, nil
+            ) == SQLITE_OK else {
+                continue
+            }
+            if sqlite3_step(latestStmt) == SQLITE_ROW {
+                out.append(CreditCycleSummary(latestSample: CreditSample(
+                    capturedAtMs: sqlite3_column_int64(latestStmt, 0),
+                    serverAtMs: sqlite3_column_type(latestStmt, 1) == SQLITE_NULL
+                        ? nil : sqlite3_column_int64(latestStmt, 1),
+                    resetAtMs: sqlite3_column_int64(latestStmt, 2),
+                    creditsUsed: sqlite3_column_double(latestStmt, 3)
+                )))
+            }
+            sqlite3_finalize(latestStmt)
+        }
+        return out
     }
 
     /// Fingerprints are hex, but never build SQL from unvalidated text.
