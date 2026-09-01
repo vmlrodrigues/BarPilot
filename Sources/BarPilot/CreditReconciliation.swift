@@ -214,6 +214,33 @@ enum CreditReconciliation {
         let old = "fingerprint-before-derivation-change"
         let new = "fingerprint-after-derivation-change"
         let other = "a-genuinely-different-account"
+        let oldCycle = CreditCycleSummary(latestSample: CreditSample(
+            capturedAtMs: base, serverAtMs: nil,
+            resetAtMs: reset + 8 * 60 * 60 * 1000, creditsUsed: 75
+        ))
+        let nextReset = Aggregator.utcMidnightMs("2030-05-01") + 8 * 60 * 60 * 1000
+        let newCycle = CreditCycleSummary(latestSample: CreditSample(
+            capturedAtMs: reset + 9 * 60 * 60 * 1000, serverAtMs: nil,
+            resetAtMs: nextReset, creditsUsed: 10
+        ))
+        let march31 = Date(
+            timeIntervalSince1970:
+                Double(Aggregator.utcMidnightMs("2030-03-31")) / 1000
+        )
+        let april1 = Date(
+            timeIntervalSince1970:
+                Double(Aggregator.utcMidnightMs("2030-04-01")) / 1000
+        )
+        precondition(
+            CreditCycleSummary.cycle(
+                containingUTCDate: march31, in: [newCycle, oldCycle]
+            ) == oldCycle,
+            "a calendar day before reset must select the completing cycle")
+        precondition(
+            CreditCycleSummary.cycle(
+                containingUTCDate: april1, in: [newCycle, oldCycle]
+            ) == newCycle,
+            "a split reset day must select the cycle owning most of that UTC day")
 
         CreditSampleStore.withTemporaryStore {
             // History captured before rows carried an account.

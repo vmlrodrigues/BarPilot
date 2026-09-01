@@ -66,12 +66,16 @@ final class UsageStore: ObservableObject {
     @Published private(set) var selectedCreditCycleDayMs: Int64?
     @Published private(set) var isLoadingCreditCycle = false
     @Published private(set) var selectedHistoricalTotalCredits: Double?
+    @Published private(set) var spendCalendarDailyCredits: [String: Double] = [:]
+    @Published private(set) var spendCalendarMonthKey: String?
+    @Published private(set) var isLoadingSpendCalendar = false
     @Published private(set) var counterSyncMachineCount = 1
     private var creditSamples: [CreditSample] = []
     private var selectedCreditCycleSamples: [CreditSample] = []
     private var serverUsageAccountFingerprint: String?
     private var serverUsageGeneration = 0
     private var creditCycleLoadGeneration = 0
+    private var spendCalendarLoadGeneration = 0
     private struct ActiveServerRefresh {
         let id: UUID
         let startedAt: Date
@@ -468,6 +472,7 @@ final class UsageStore: ObservableObject {
         cycles: [CreditCycleSummary]
     ) -> Bool {
         resetCreditCycleSelection()
+        resetSpendCalendar()
         serverUsageAccountFingerprint = fingerprint
         UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
         serverUsageEnabled = true
@@ -495,6 +500,13 @@ final class UsageStore: ObservableObject {
         selectedCreditCycleSamples = creditSamples
         selectedHistoricalTotalCredits = nil
         isLoadingCreditCycle = false
+    }
+
+    private func resetSpendCalendar() {
+        spendCalendarLoadGeneration += 1
+        spendCalendarDailyCredits = [:]
+        spendCalendarMonthKey = nil
+        isLoadingSpendCalendar = false
     }
 
     private func upsertCreditCycle(_ sample: CreditSample) {
@@ -537,6 +549,7 @@ final class UsageStore: ObservableObject {
         serverUsageGeneration += 1
         serverUsageEnabled = false
         resetCreditCycleSelection()
+        resetSpendCalendar()
         UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
         UserDefaults.standard.set(true, forKey: Self.serverUsageDisconnectedKey)
         let removed = CreditUsageKeychain.deleteToken()
@@ -625,6 +638,7 @@ final class UsageStore: ObservableObject {
             serverUsageError = "GitHub is disconnected. Connect again from the usage window."
             serverUsageEnabled = false
             resetCreditCycleSelection()
+            resetSpendCalendar()
             UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
             UserDefaults.standard.set(true, forKey: Self.serverUsageDisconnectedKey)
             recompute()
@@ -716,6 +730,7 @@ final class UsageStore: ObservableObject {
             if case .unauthorized = error as? CreditUsageError {
                 serverUsageEnabled = false
                 resetCreditCycleSelection()
+                resetSpendCalendar()
                 UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
                 UserDefaults.standard.set(true, forKey: Self.serverUsageDisconnectedKey)
                 _ = CreditUsageKeychain.deleteToken()
@@ -868,6 +883,83 @@ final class UsageStore: ObservableObject {
             updateCreditCycleView()
         } else {
             selectCreditCycle(newer.resetDayMs)
+        }
+    }
+
+    @discardableResult
+    func selectCreditCycle(containingUTCDate date: Date) -> Bool {
+        guard !isLoadingCreditCycle,
+              let target = CreditCycleSummary.cycle(
+                  containingUTCDate: date, in: creditCycles
+              ) else {
+            return false
+        }
+        let currentDay = currentServerUsageSample.map {
+            CreditCycleSummary.dayStart(for: $0.resetAtMs)
+        }
+        if target.resetDayMs == currentDay {
+            resetCreditCycleSelection()
+            updateCreditCycleView()
+        } else {
+            selectCreditCycle(target.resetDayMs)
+        }
+        return true
+    }
+
+    func loadSpendCalendar(containing month: Date) {
+        spendCalendarLoadGeneration += 1
+        let loadGeneration = spendCalendarLoadGeneration
+        let serverGeneration = serverUsageGeneration
+        let account = serverUsageAccountFingerprint
+        let monthKey = CreditCycleSummary.utcMonthKey(for: month)
+        let cycles = creditCycles.filter {
+            CreditCycleSummary.overlapsUTCMonth($0, containing: month)
+        }
+        spendCalendarDailyCredits = [:]
+        spendCalendarMonthKey = nil
+        guard serverUsageEnabled, !cycles.isEmpty else {
+            isLoadingSpendCalendar = false
+            return
+        }
+        isLoadingSpendCalendar = true
+        Task {
+            let stored = await Task.detached(priority: .utility) {
+                cycles.map { cycle in
+                    (
+                        cycle,
+                        CreditSampleStore.loadCycle(
+                            resetDayMs: cycle.resetDayMs, account: account
+                        )
+                    )
+                }
+            }.value
+            guard serverUsageEnabled,
+                  serverGeneration == serverUsageGeneration,
+                  account == serverUsageAccountFingerprint,
+                  loadGeneration == spendCalendarLoadGeneration else {
+                return
+            }
+
+            let remotes = syncEnabled ? currentRemoteAggregates() : []
+            var samplesByCycle: [[CreditSample]] = []
+            for (cycle, local) in stored {
+                let samples: [CreditSample]
+                if let account {
+                    samples = SyncAggregate.mergedCreditSamples(
+                        local: local, remotes: remotes,
+                        resetAtMs: cycle.resetAtMs,
+                        accountFingerprint: account
+                    )
+                } else {
+                    samples = local
+                }
+                samplesByCycle.append(samples)
+            }
+            spendCalendarDailyCredits = CreditTimeline.combinedDaily(
+                samplesByCycle: samplesByCycle, monthKey: monthKey
+            )
+            spendCalendarMonthKey = monthKey
+            isLoadingSpendCalendar = false
         }
     }
 

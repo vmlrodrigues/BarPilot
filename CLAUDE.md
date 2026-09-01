@@ -275,8 +275,11 @@ overlay never mutates local aggregation.
   USD + AUD, monthly budget progress, a daily usage bar chart, and daily
   observed counter deltas. Long gaps within one UTC day can be assigned safely;
   unsampled growth crossing a UTC day boundary remains unallocated. Stored
-  completed billing cycles remain navigable in this primary view; the menu bar
-  stays on the current cycle and historical cycles never project forward. The
+  completed billing cycles remain navigable by arrows or a UTC daily-spend
+  calendar. The calendar combines safely observed spend from both cycles when a
+  non-midnight reset splits one UTC day, and never invents values for unallocated
+  dates. The menu bar stays on the current cycle and historical cycles never
+  project forward. The
   telemetry tabs remain temporarily accessible behind a deprecated legacy-view
   control. (#34, #41)
 - **The menu-bar figure warns when GitHub is not authoritative.** Reuse the

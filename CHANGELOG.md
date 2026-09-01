@@ -4,6 +4,13 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Daily-spend calendar for billing history.** Open the calendar from the
+  billing-cycle range to jump directly to an available UTC date while retaining
+  the previous/next cycle arrows. Calendar cells show safely observed spend,
+  combine both sides of non-midnight reset days, and leave unallocated dates
+  blank rather than estimating them. (#41)
+
 ### Fixed
 - **Previous billing cycles remain available after rollover.** The primary
   GitHub-backed dashboard can now move between stored cycles while keeping the

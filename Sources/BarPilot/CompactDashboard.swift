@@ -6,25 +6,36 @@ struct CompactDashboard: View {
     let connectGitHub: () -> Void
     let openSettings: () -> Void
     let showLegacy: () -> Void
+    @State private var showingSpendCalendar = false
+    @State private var selectedSpendDay: String?
+    @State private var selectedSpendCredits: Double?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            header
-            Divider()
-            ScrollView {
-                VStack(alignment: .leading, spacing: 16) {
-                    if !store.serverUsageEnabled {
-                        connectionCard
+        ZStack(alignment: .topLeading) {
+            VStack(alignment: .leading, spacing: 0) {
+                header
+                Divider()
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        if !store.serverUsageEnabled {
+                            connectionCard
+                        }
+                        valueCards
+                        CompactBudgetBar()
+                        if selectedSpendDay != nil {
+                            selectedDayCard
+                        }
+                        dailyChartSection
+                        dailySection
                     }
-                    valueCards
-                    CompactBudgetBar()
-                    dailyChartSection
-                    dailySection
+                    .padding(16)
                 }
-                .padding(16)
+                Divider()
+                footer
             }
-            Divider()
-            footer
+            if showingSpendCalendar {
+                spendCalendarOverlay
+            }
         }
         .frame(width: 600)
         .frame(minHeight: 480, maxHeight: .infinity)
@@ -112,6 +123,9 @@ struct CompactDashboard: View {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 5) {
                         Button {
+                            selectedSpendDay = nil
+                            selectedSpendCredits = nil
+                            showingSpendCalendar = false
                             store.selectOlderCreditCycle()
                         } label: {
                             Image(systemName: "chevron.left")
@@ -119,11 +133,23 @@ struct CompactDashboard: View {
                         .buttonStyle(.borderless)
                         .disabled(!store.canSelectOlderCreditCycle || store.isLoadingCreditCycle)
                         .help("Older billing cycle")
-                        Text(cycleRangeLabel)
+                        Button {
+                            showingSpendCalendar.toggle()
+                        } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: "calendar")
+                                Text(cycleRangeLabel).monospacedDigit()
+                            }
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                            .monospacedDigit()
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(store.selectedCreditCycle == nil)
+                        .help("Choose a date and inspect observed daily spend")
                         Button {
+                            selectedSpendDay = nil
+                            selectedSpendCredits = nil
+                            showingSpendCalendar = false
                             store.selectNewerCreditCycle()
                         } label: {
                             Image(systemName: "chevron.right")
@@ -163,6 +189,93 @@ struct CompactDashboard: View {
             return "Billing cycle"
         }
         return "\(Self.cycleDateFormatter.string(from: start)) – \(Self.cycleDateFormatter.string(from: cycle.resetAt))"
+    }
+
+    private var spendCalendarOverlay: some View {
+        ZStack(alignment: .topLeading) {
+            Color.black.opacity(0.12)
+                .contentShape(Rectangle())
+                .onTapGesture { showingSpendCalendar = false }
+            SpendHistoryCalendar(
+                initialMonth: calendarInitialDate,
+                selectedDay: selectedSpendDay,
+                selectDay: { date in
+                    guard store.selectCreditCycle(containingUTCDate: date) else {
+                        return
+                    }
+                    let day = CreditCycleSummary.utcDayString(for: date)
+                    selectedSpendDay = day
+                    selectedSpendCredits = store.spendCalendarDailyCredits[day]
+                    showingSpendCalendar = false
+                },
+                close: { showingSpendCalendar = false }
+            )
+            .environmentObject(store)
+            .frame(width: 420)
+            .padding(14)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .strokeBorder(Color.secondary.opacity(0.2))
+            )
+            .shadow(color: .black.opacity(0.22), radius: 18, y: 8)
+            .offset(x: 16, y: 72)
+        }
+        .zIndex(10)
+    }
+
+    private var calendarInitialDate: Date {
+        if let selectedSpendDay {
+            return Date(
+                timeIntervalSince1970:
+                    Double(Aggregator.utcMidnightMs(selectedSpendDay)) / 1000
+            )
+        }
+        return store.selectedCreditCycle?.startAt ?? Date()
+    }
+
+    private var selectedDayCard: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "calendar.badge.checkmark")
+                .foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(selectedSpendDayLabel)
+                    .font(.subheadline.weight(.semibold))
+                if store.isLoadingCreditCycle {
+                    Text("Loading billing-cycle history…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if let selectedSpendCredits {
+                    Text("\(Fmt.credits(selectedSpendCredits)) credits · \(store.costString(credits: selectedSpendCredits)) observed")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("No spend could be assigned to this UTC day.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Button {
+                selectedSpendDay = nil
+                selectedSpendCredits = nil
+            } label: {
+                Image(systemName: "xmark")
+            }
+            .buttonStyle(.borderless)
+            .help("Clear selected day")
+        }
+        .padding(10)
+        .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var selectedSpendDayLabel: String {
+        guard let selectedSpendDay else { return "Selected day" }
+        let date = Date(
+            timeIntervalSince1970:
+                Double(Aggregator.utcMidnightMs(selectedSpendDay)) / 1000
+        )
+        return "\(Self.selectedDayFormatter.string(from: date)) · UTC"
     }
 
     /// Clicking a card selects the currency shown in the menu bar (and across
@@ -319,6 +432,13 @@ struct CompactDashboard: View {
                         }
                         .font(.callout)
                         .padding(.vertical, 5)
+                        .padding(.horizontal, 5)
+                        .background(
+                            selectedSpendDay == row.day
+                                ? Color.accentColor.opacity(0.10)
+                                : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 6)
+                        )
                     }
                 }
             }
@@ -391,6 +511,288 @@ struct CompactDashboard: View {
     private static let cycleDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "d MMM"
+        return formatter
+    }()
+
+    private static let selectedDayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "d MMMM yyyy"
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        return formatter
+    }()
+}
+
+private struct SpendHistoryCalendar: View {
+    @EnvironmentObject private var store: UsageStore
+    let initialMonth: Date
+    let selectedDay: String?
+    let selectDay: (Date) -> Void
+    let close: () -> Void
+    @State private var displayedMonth: Date
+
+    init(
+        initialMonth: Date,
+        selectedDay: String?,
+        selectDay: @escaping (Date) -> Void,
+        close: @escaping () -> Void
+    ) {
+        self.initialMonth = initialMonth
+        self.selectedDay = selectedDay
+        self.selectDay = selectDay
+        self.close = close
+        _displayedMonth = State(initialValue: Self.monthStart(initialMonth))
+    }
+
+    var body: some View {
+        VStack(spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Daily spend calendar")
+                        .font(.headline)
+                    Text("Observed spend · UTC")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if store.isLoadingSpendCalendar {
+                    ProgressView().controlSize(.mini)
+                }
+                Button(action: close) {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.borderless)
+                .help("Close calendar")
+            }
+
+            HStack {
+                Button {
+                    moveMonth(by: -1)
+                } label: {
+                    Image(systemName: "chevron.left")
+                }
+                .buttonStyle(.borderless)
+                .disabled(previousMonth == nil || store.isLoadingSpendCalendar)
+                .help("Previous available month")
+
+                Spacer()
+                Menu {
+                    ForEach(Array(availableMonths.reversed()), id: \.self) { month in
+                        Button(Self.monthFormatter.string(from: month)) {
+                            showMonth(month)
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text(Self.monthFormatter.string(from: displayedMonth))
+                            .font(.subheadline.weight(.semibold))
+                        Image(systemName: "chevron.down")
+                            .font(.caption2)
+                    }
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .disabled(store.isLoadingSpendCalendar)
+                .help("Choose an available month")
+                Spacer()
+
+                Button {
+                    moveMonth(by: 1)
+                } label: {
+                    Image(systemName: "chevron.right")
+                }
+                .buttonStyle(.borderless)
+                .disabled(nextMonth == nil || store.isLoadingSpendCalendar)
+                .help("Next available month")
+            }
+
+            LazyVGrid(columns: columns, spacing: 4) {
+                ForEach(Self.weekdays, id: \.self) { weekday in
+                    Text(weekday)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity)
+                }
+                ForEach(Array(calendarDates.enumerated()), id: \.offset) { _, date in
+                    if let date {
+                        dayCell(date)
+                    } else {
+                        Color.clear.frame(height: 44)
+                    }
+                }
+            }
+
+            HStack(spacing: 6) {
+                Circle().fill(Color.accentColor.opacity(0.28))
+                    .frame(width: 8, height: 8)
+                Text("Darker days cost more; — means no spend was safely assignable.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+        }
+        .contentShape(RoundedRectangle(cornerRadius: 12))
+        .onAppear {
+            let normalized = nearestAvailableMonth(to: displayedMonth) ?? displayedMonth
+            displayedMonth = normalized
+            store.loadSpendCalendar(containing: normalized)
+        }
+    }
+
+    private var columns: [GridItem] {
+        Array(repeating: GridItem(.flexible(), spacing: 4), count: 7)
+    }
+
+    private var availableMonths: [Date] {
+        var months: Set<Date> = []
+        let today = Self.monthStart(Date())
+        for cycle in store.creditCycles {
+            guard let start = cycle.startAt else { continue }
+            var month = Self.monthStart(start)
+            let last = Self.monthStart(
+                cycle.resetAt.addingTimeInterval(-0.001)
+            )
+            var count = 0
+            while month <= last && month <= today && count < 240 {
+                months.insert(month)
+                guard let next = Self.utcCalendar.date(
+                    byAdding: .month, value: 1, to: month
+                ) else { break }
+                month = next
+                count += 1
+            }
+        }
+        return months.sorted()
+    }
+
+    private var previousMonth: Date? {
+        availableMonths.last { $0 < displayedMonth }
+    }
+
+    private var nextMonth: Date? {
+        availableMonths.first { $0 > displayedMonth }
+    }
+
+    private func moveMonth(by direction: Int) {
+        guard let month = direction < 0 ? previousMonth : nextMonth else { return }
+        showMonth(month)
+    }
+
+    private func showMonth(_ month: Date) {
+        displayedMonth = month
+        store.loadSpendCalendar(containing: month)
+    }
+
+    private func nearestAvailableMonth(to month: Date) -> Date? {
+        availableMonths.min {
+            abs($0.timeIntervalSince(month)) < abs($1.timeIntervalSince(month))
+        }
+    }
+
+    private var calendarDates: [Date?] {
+        let calendar = Self.utcCalendar
+        guard let days = calendar.range(of: .day, in: .month, for: displayedMonth)
+        else { return [] }
+        let weekday = calendar.component(.weekday, from: displayedMonth)
+        let leading = (weekday + 5) % 7
+        var dates = Array<Date?>(repeating: nil, count: leading)
+        dates += days.compactMap {
+            calendar.date(byAdding: .day, value: $0 - 1, to: displayedMonth)
+        }
+        while dates.count % 7 != 0 { dates.append(nil) }
+        return dates
+    }
+
+    @ViewBuilder
+    private func dayCell(_ date: Date) -> some View {
+        let day = CreditCycleSummary.utcDayString(for: date)
+        let todayStart = CreditCycleSummary.dayStart(
+            for: Int64(Date().timeIntervalSince1970 * 1000)
+        )
+        let dateStart = CreditCycleSummary.dayStart(
+            for: Int64(date.timeIntervalSince1970 * 1000)
+        )
+        let isAvailable = dateStart <= todayStart
+            && CreditCycleSummary.cycle(
+                containingUTCDate: date, in: store.creditCycles
+            ) != nil
+        let credits = store.spendCalendarMonthKey
+            == CreditCycleSummary.utcMonthKey(for: displayedMonth)
+            ? store.spendCalendarDailyCredits[day]
+            : nil
+        let maximum = store.spendCalendarDailyCredits.values.max() ?? 0
+        let heat = credits.map {
+            maximum > 0 ? min(max($0 / maximum, 0), 1) : 0
+        } ?? 0
+        let isSelected = selectedDay == day
+
+        Button {
+            selectDay(date)
+        } label: {
+            VStack(spacing: 2) {
+                Text("\(Self.utcCalendar.component(.day, from: date))")
+                    .font(.caption.weight(isSelected ? .bold : .medium))
+                if let credits {
+                    Text(store.costString(credits: credits))
+                        .font(.system(size: 8, weight: .medium))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.65)
+                } else {
+                    Text("—")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .foregroundStyle(isAvailable ? Color.primary : Color.secondary.opacity(0.35))
+            .frame(maxWidth: .infinity, minHeight: 40)
+            .background(
+                isSelected
+                    ? Color.accentColor.opacity(0.32)
+                    : Color.accentColor.opacity(credits == nil ? 0 : 0.07 + heat * 0.21),
+                in: RoundedRectangle(cornerRadius: 7)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 7)
+                    .strokeBorder(
+                        isSelected ? Color.accentColor : Color.clear,
+                        lineWidth: 1
+                    )
+            )
+            .contentShape(RoundedRectangle(cornerRadius: 7))
+        }
+        .buttonStyle(.plain)
+        .disabled(!isAvailable || store.isLoadingSpendCalendar)
+        .help(dayCellHelp(day: day, credits: credits, available: isAvailable))
+    }
+
+    private func dayCellHelp(
+        day: String, credits: Double?, available: Bool
+    ) -> String {
+        guard available else { return "No stored billing cycle for \(day)" }
+        guard let credits else {
+            return "\(day): no safely assignable observed spend"
+        }
+        return "\(day): \(store.costString(credits: credits)) observed"
+    }
+
+    private static func monthStart(_ date: Date) -> Date {
+        utcCalendar.date(
+            from: utcCalendar.dateComponents([.year, .month], from: date)
+        ) ?? date
+    }
+
+    private static var utcCalendar: Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        return calendar
+    }
+
+    private static let weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+    private static let monthFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMMM yyyy"
+        formatter.timeZone = TimeZone(identifier: "UTC")
         return formatter
     }()
 }

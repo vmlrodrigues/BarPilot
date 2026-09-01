@@ -22,6 +22,67 @@ struct CreditCycleSummary: Identifiable, Equatable {
     static func dayStart(for resetAtMs: Int64) -> Int64 {
         resetAtMs / dayMs * dayMs
     }
+
+    /// A UTC calendar day can straddle a non-midnight billing reset. Choose the
+    /// cycle owning the largest part of that day; ties prefer the newer cycle
+    /// because summaries are ordered newest first.
+    static func cycle(
+        containingUTCDate date: Date,
+        in cycles: [CreditCycleSummary]
+    ) -> CreditCycleSummary? {
+        let dateMs = Int64(date.timeIntervalSince1970 * 1000)
+        let dayStartMs = dayStart(for: dateMs)
+        let dayEndMs = dayStartMs + dayMs
+        var best: (cycle: CreditCycleSummary, overlap: Int64)?
+        for cycle in cycles {
+            guard let start = cycle.startAt else { continue }
+            let startMs = Int64(start.timeIntervalSince1970 * 1000)
+            let endMs = cycle.resetAtMs
+            let overlap = max(
+                0,
+                min(dayEndMs, endMs) - max(dayStartMs, startMs)
+            )
+            if overlap > (best?.overlap ?? 0) {
+                best = (cycle, overlap)
+            }
+        }
+        return best?.cycle
+    }
+
+    static func overlapsUTCMonth(
+        _ cycle: CreditCycleSummary,
+        containing date: Date
+    ) -> Bool {
+        guard let start = cycle.startAt else { return false }
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        guard let monthStart = calendar.date(
+            from: calendar.dateComponents([.year, .month], from: date)
+        ), let monthEnd = calendar.date(byAdding: .month, value: 1, to: monthStart)
+        else { return false }
+        return start < monthEnd && cycle.resetAt > monthStart
+    }
+
+    static func utcMonthKey(for date: Date) -> String {
+        let ms = Int64(date.timeIntervalSince1970 * 1000)
+        let day = utcDayString(for: ms)
+        return String(day.prefix(7))
+    }
+
+    static func utcDayString(for date: Date) -> String {
+        utcDayString(for: Int64(date.timeIntervalSince1970 * 1000))
+    }
+
+    private static func utcDayString(for ms: Int64) -> String {
+        let date = Date(timeIntervalSince1970: Double(ms) / 1000)
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        let parts = calendar.dateComponents([.year, .month, .day], from: date)
+        return String(
+            format: "%04d-%02d-%02d",
+            parts.year ?? 0, parts.month ?? 0, parts.day ?? 0
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------

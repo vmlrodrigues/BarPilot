@@ -100,6 +100,19 @@ struct CreditTimeline {
         return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
     }
 
+    static func combinedDaily(
+        samplesByCycle: [[CreditSample]], monthKey: String
+    ) -> [String: Double] {
+        var byDay: [String: Double] = [:]
+        for samples in samplesByCycle {
+            for row in build(samples: samples).daily
+                where row.day.hasPrefix(monthKey) {
+                byDay[row.day, default: 0] += row.credits
+            }
+        }
+        return byDay
+    }
+
     static func verify() {
         let hour: Int64 = 60 * 60 * 1000
         let reset = Aggregator.utcMidnightMs("2030-02-01")
@@ -157,5 +170,29 @@ struct CreditTimeline {
                      && resetTimeVariant.daily.first?.credits == 20
                      && resetTimeVariant.unallocatedCredits == 0,
                      "same-day reset variants must retain assignable deltas")
+
+        let splitResetDay = combinedDaily(
+            samplesByCycle: [
+                [
+                    CreditSample(capturedAtMs: start + 24 * hour + 6 * hour,
+                                 serverAtMs: nil,
+                                 resetAtMs: reset + 8 * hour, creditsUsed: 100),
+                    CreditSample(capturedAtMs: start + 24 * hour + 7 * hour,
+                                 serverAtMs: nil, resetAtMs: reset + 8 * hour,
+                                 creditsUsed: 110)
+                ],
+                [
+                    CreditSample(capturedAtMs: start + 24 * hour + 9 * hour,
+                                 serverAtMs: nil, resetAtMs: reset + 28 * 24 * hour + 8 * hour,
+                                 creditsUsed: 0),
+                    CreditSample(capturedAtMs: start + 24 * hour + 10 * hour,
+                                 serverAtMs: nil, resetAtMs: reset + 28 * 24 * hour + 8 * hour,
+                                 creditsUsed: 20)
+                ]
+            ],
+            monthKey: "2030-01"
+        )
+        precondition(splitResetDay["2030-01-11"] == 30,
+                     "calendar spend must sum both sides of a reset-day boundary")
     }
 }
