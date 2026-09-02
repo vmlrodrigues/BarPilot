@@ -937,6 +937,9 @@ final class UsageStore: ObservableObject {
                   serverGeneration == serverUsageGeneration,
                   account == serverUsageAccountFingerprint,
                   loadGeneration == spendCalendarLoadGeneration else {
+                if loadGeneration == spendCalendarLoadGeneration {
+                    isLoadingSpendCalendar = false
+                }
                 return
             }
 
@@ -985,6 +988,9 @@ final class UsageStore: ObservableObject {
             guard generation == serverUsageGeneration,
                   account == serverUsageAccountFingerprint,
                   loadGeneration == creditCycleLoadGeneration else {
+                if loadGeneration == creditCycleLoadGeneration {
+                    isLoadingCreditCycle = false
+                }
                 return
             }
             selectedCreditCycleDayMs = resetDayMs
