@@ -4,6 +4,8 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+## [0.10.7] — 2026-09-02
+
 ### Added
 - **Daily-spend calendar for billing history.** Open the calendar from the
   billing-cycle range to jump directly to an available UTC date while retaining
