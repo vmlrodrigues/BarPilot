@@ -511,6 +511,7 @@ struct CompactDashboard: View {
     private static let cycleDateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "d MMM"
+        formatter.timeZone = TimeZone(identifier: "UTC")
         return formatter
     }()
 

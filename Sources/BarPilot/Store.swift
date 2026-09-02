@@ -874,10 +874,10 @@ final class UsageStore: ObservableObject {
             return
         }
         let newer = creditCycles[index - 1]
-        let currentDay = currentServerUsageSample.map {
-            CreditCycleSummary.dayStart(for: $0.resetAtMs)
-        }
-        if newer.resetDayMs == currentDay {
+        let liveDay = CreditCycleSummary.liveCycleDay(
+            currentSample: currentServerUsageSample, cycles: creditCycles
+        )
+        if newer.resetDayMs == liveDay {
             selectedCreditCycleDayMs = nil
             selectedCreditCycleSamples = creditSamples
             updateCreditCycleView()
@@ -894,10 +894,10 @@ final class UsageStore: ObservableObject {
               ) else {
             return false
         }
-        let currentDay = currentServerUsageSample.map {
-            CreditCycleSummary.dayStart(for: $0.resetAtMs)
-        }
-        if target.resetDayMs == currentDay {
+        let liveDay = CreditCycleSummary.liveCycleDay(
+            currentSample: currentServerUsageSample, cycles: creditCycles
+        )
+        if target.resetDayMs == liveDay {
             resetCreditCycleSelection()
             updateCreditCycleView()
         } else {
@@ -964,10 +964,10 @@ final class UsageStore: ObservableObject {
     }
 
     private func selectCreditCycle(_ resetDayMs: Int64) {
-        let currentDay = currentServerUsageSample.map {
-            CreditCycleSummary.dayStart(for: $0.resetAtMs)
-        }
-        guard resetDayMs != currentDay,
+        let liveDay = CreditCycleSummary.liveCycleDay(
+            currentSample: currentServerUsageSample, cycles: creditCycles
+        )
+        guard resetDayMs != liveDay,
               !isLoadingCreditCycle else {
             return
         }

@@ -241,6 +241,17 @@ enum CreditReconciliation {
                 containingUTCDate: april1, in: [newCycle, oldCycle]
             ) == newCycle,
             "a split reset day must select the cycle owning most of that UTC day")
+        precondition(
+            CreditCycleSummary.liveCycleDay(
+                currentSample: nil, cycles: [newCycle, oldCycle]
+            ) == newCycle.resetDayMs,
+            "the newest stored cycle must remain live while the current sample is unavailable")
+        precondition(
+            CreditCycleSummary.liveCycleDay(
+                currentSample: oldCycle.latestSample,
+                cycles: [newCycle, oldCycle]
+            ) == oldCycle.resetDayMs,
+            "a valid current sample must remain authoritative for live-cycle identity")
 
         CreditSampleStore.withTemporaryStore {
             // History captured before rows carried an account.

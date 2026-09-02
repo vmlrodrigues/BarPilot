@@ -23,6 +23,14 @@ struct CreditCycleSummary: Identifiable, Equatable {
         resetAtMs / dayMs * dayMs
     }
 
+    static func liveCycleDay(
+        currentSample: CreditSample?,
+        cycles: [CreditCycleSummary]
+    ) -> Int64? {
+        currentSample.map { dayStart(for: $0.resetAtMs) }
+            ?? cycles.first?.resetDayMs
+    }
+
     /// A UTC calendar day can straddle a non-midnight billing reset. Choose the
     /// cycle owning the largest part of that day; ties prefer the newer cycle
     /// because summaries are ordered newest first.
