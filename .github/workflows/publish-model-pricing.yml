@@ -1,0 +1,76 @@
+name: Publish model pricing catalogue
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/publish-model-pricing.yml
+      - Scripts/model_pricing_catalog.py
+      - Tests/model_pricing_catalog/**
+      - catalog/model-pricing-v1.schema.json
+  pull_request:
+    paths:
+      - .github/workflows/publish-model-pricing.yml
+      - Scripts/model_pricing_catalog.py
+      - Tests/model_pricing_catalog/**
+      - catalog/model-pricing-v1.schema.json
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: model-pricing-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Validate and build catalogue
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run catalogue tests
+        run: python3 -m unittest discover -s Tests/model_pricing_catalog -p 'test_*.py'
+
+      - name: Fetch and normalize public pricing data
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >-
+          python3 Scripts/model_pricing_catalog.py fetch
+          --output _site/model-pricing/v1/catalog.json
+          --minimum-model-count 20
+
+      - name: Validate generated catalogue
+        run: >-
+          python3 Scripts/model_pricing_catalog.py validate
+          --input _site/model-pricing/v1/catalog.json
+          --minimum-model-count 20
+
+      - name: Add the versioned schema
+        run: install -m 0644 catalog/model-pricing-v1.schema.json _site/model-pricing/v1/schema.json
+
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: _site
+
+  deploy:
+    name: Deploy last validated catalogue
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1

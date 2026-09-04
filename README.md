@@ -171,7 +171,12 @@ Sources/BarPilot/
   Dump.swift         Headless --dump output path
 Info.plist           LSUIElement (menu-bar-only) agent bundle metadata
 build-app.sh         Build + assemble the .app bundle
+Scripts/model_pricing_catalog.py  Validates and publishes the model-price contract
+.github/workflows/publish-model-pricing.yml  Daily GitHub Pages catalogue pipeline
 ```
+
+Pipeline details and local verification commands are documented in
+[docs/model-pricing-catalog.md](docs/model-pricing-catalog.md).
 
 ## Can't find the menu-bar icon?
 

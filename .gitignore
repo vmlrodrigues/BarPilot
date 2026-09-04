@@ -1,5 +1,7 @@
 .build/
 .swiftpm/
+__pycache__/
+*.pyc
 BarPilot.app/
 *.xcodeproj
 .DS_Store

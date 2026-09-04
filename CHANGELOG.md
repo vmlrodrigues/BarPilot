@@ -4,6 +4,12 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+### Added
+- **Validated daily model-pricing catalogue pipeline.** GitHub Actions now
+  normalizes the public Copilot pricing source into a versioned JSON contract,
+  rejects malformed or unexpectedly incomplete updates, and preserves the last
+  successful GitHub Pages deployment when validation fails. (#52)
+
 ## [0.10.7] — 2026-09-02
 
 ### Added
