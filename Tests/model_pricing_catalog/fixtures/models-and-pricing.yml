@@ -30,6 +30,14 @@
   output: $10.00
   cache_write: $2.50
 
+- model: Claude Haiku 4.5
+  provider: anthropic
+  release_status: GA
+  category: Lightweight
+  input: $1.00
+  cached_input: $0.10
+  output: $5.00
+
 - model: Gemini 3.8 Flash
   provider: google
   release_status: Public preview

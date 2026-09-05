@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "BarPilot model pricing catalogue v1",
+  "title": "BarPilot model pricing and community-preference catalogue v2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -8,11 +8,12 @@
     "generatedAt",
     "pricingUnit",
     "source",
+    "communityPreferenceSource",
     "modelCount",
     "models"
   ],
   "properties": {
-    "schemaVersion": { "const": 1 },
+    "schemaVersion": { "const": 2 },
     "generatedAt": { "type": "string", "format": "date-time" },
     "pricingUnit": { "const": "USD per 1 million tokens" },
     "source": {
@@ -27,6 +28,7 @@
         "url": { "type": "string", "format": "uri" }
       }
     },
+    "communityPreferenceSource": { "$ref": "#/$defs/communityPreferenceSource" },
     "modelCount": { "type": "integer", "minimum": 1 },
     "models": {
       "type": "array",
@@ -35,6 +37,70 @@
     }
   },
   "$defs": {
+    "communityPreferenceSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "publisher",
+        "dataset",
+        "configuration",
+        "split",
+        "category",
+        "revision",
+        "snapshotDate",
+        "license",
+        "licenseURL",
+        "url"
+      ],
+      "properties": {
+        "publisher": { "const": "LM Arena" },
+        "dataset": { "const": "lmarena-ai/leaderboard-dataset" },
+        "configuration": { "const": "text_style_control" },
+        "split": { "const": "latest" },
+        "category": { "const": "overall" },
+        "revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "snapshotDate": { "type": "string", "format": "date" },
+        "license": { "const": "CC BY 4.0" },
+        "licenseURL": { "const": "https://creativecommons.org/licenses/by/4.0/" },
+        "url": { "const": "https://huggingface.co/datasets/lmarena-ai/leaderboard-dataset" }
+      }
+    },
+    "communityPreference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bestRank", "worstRank", "variants"],
+      "properties": {
+        "bestRank": { "type": "integer", "minimum": 1 },
+        "worstRank": { "type": "integer", "minimum": 1 },
+        "variants": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/communityPreferenceVariant" }
+        }
+      }
+    },
+    "communityPreferenceVariant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "arenaModel",
+        "label",
+        "rank",
+        "rating",
+        "ratingLower",
+        "ratingUpper",
+        "voteCount"
+      ],
+      "properties": {
+        "arenaModel": { "type": "string", "minLength": 1 },
+        "label": { "type": "string", "minLength": 1 },
+        "rank": { "type": "integer", "minimum": 1 },
+        "rating": { "type": "number", "minimum": 0 },
+        "ratingLower": { "type": "number", "minimum": 0 },
+        "ratingUpper": { "type": "number", "minimum": 0 },
+        "voteCount": { "type": "integer", "minimum": 0 }
+      }
+    },
     "model": {
       "type": "object",
       "additionalProperties": false,
@@ -64,6 +130,7 @@
           "items": { "type": "string", "minLength": 1 }
         },
         "notes": { "type": "string", "minLength": 1 },
+        "communityPreference": { "$ref": "#/$defs/communityPreference" },
         "tiers": {
           "type": "array",
           "minItems": 1,

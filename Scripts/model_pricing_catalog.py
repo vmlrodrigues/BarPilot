@@ -4,7 +4,8 @@
 The upstream file is intentionally parsed with a small, strict YAML subset
 instead of a third-party package. The source is a flat list of scalar mappings;
 any new YAML structure or field fails closed so a format change cannot silently
-publish incorrect prices.
+publish incorrect prices. Community-preference data is taken from the official
+LM Arena leaderboard dataset and joined only through an explicit, reviewed map.
 """
 
 from __future__ import annotations
@@ -31,7 +32,19 @@ SOURCE_REPOSITORY = "github/docs"
 SOURCE_PATH = "data/tables/copilot/models-and-pricing.yml"
 SOURCE_API_URL = "https://api.github.com/repos/github/docs/commits"
 PRODUCTION_MINIMUM_MODELS = 20
+PRODUCTION_MINIMUM_PREFERENCE_MODELS = 5
 REQUIRED_PROVIDERS = {"openai", "anthropic", "google"}
+ARENA_DATASET = "lmarena-ai/leaderboard-dataset"
+ARENA_CONFIGURATION = "text_style_control"
+ARENA_SPLIT = "latest"
+ARENA_CATEGORY = "overall"
+ARENA_METADATA_URL = f"https://huggingface.co/api/datasets/{ARENA_DATASET}"
+ARENA_ROWS_URL = "https://datasets-server.huggingface.co/rows"
+ARENA_DATASET_URL = f"https://huggingface.co/datasets/{ARENA_DATASET}"
+CC_BY_4_URL = "https://creativecommons.org/licenses/by/4.0/"
+ARENA_PAGE_SIZE = 100
+ARENA_MAX_PAGES = 10
+ARENA_MINIMUM_OVERALL_ROWS = 100
 ALLOWED_SOURCE_FIELDS = {
     "model",
     "provider",
@@ -64,6 +77,56 @@ PROVIDER_ORDER = {
     "moonshot_ai": 6,
 }
 
+# Deliberately explicit: similar-looking names are not assumed to be the same
+# model. A catalogue model may map to multiple published reasoning modes; the
+# UI presents those modes independently and never averages their scores.
+ARENA_MODEL_MAP: dict[str, tuple[tuple[str, str], ...]] = {
+    "openai:gpt-5.4": (("gpt-5.4-high", "High"), ("gpt-5.4", "Default")),
+    "openai:gpt-5.4-mini": (("gpt-5.4-mini-high", "High"),),
+    "openai:gpt-5.5": (("gpt-5.5-high", "High"), ("gpt-5.5", "Default")),
+    "openai:gpt-5.6-luna": (("gpt-5.6-luna-xhigh", "xHigh"),),
+    "openai:gpt-5.6-sol": (("gpt-5.6-sol-xhigh", "xHigh"),),
+    "openai:gpt-5.6-terra": (("gpt-5.6-terra-xhigh", "xHigh"),),
+    "anthropic:claude-fable-5": (("claude-fable-5", "Default"),),
+    "anthropic:claude-haiku-4.5": (("claude-haiku-4-5-20251001", "Default"),),
+    "anthropic:claude-opus-4.5": (
+        ("claude-opus-4-5-20251101-high-32k", "High"),
+        ("claude-opus-4-5-20251101", "Default"),
+    ),
+    "anthropic:claude-opus-4.6": (
+        ("claude-opus-4-6-high", "High"),
+        ("claude-opus-4-6", "Default"),
+    ),
+    "anthropic:claude-opus-4.7": (
+        ("claude-opus-4-7-high", "High"),
+        ("claude-opus-4-7", "Default"),
+    ),
+    "anthropic:claude-opus-4.8": (
+        ("claude-opus-4-8-high", "High"),
+        ("claude-opus-4-8", "Default"),
+    ),
+    "anthropic:claude-opus-5": (
+        ("claude-opus-5-high", "High"),
+        ("claude-opus-5-max", "Max"),
+    ),
+    "anthropic:claude-sonnet-4.5": (
+        ("claude-sonnet-4-5-20250929-high-32k", "High"),
+        ("claude-sonnet-4-5-20250929", "Default"),
+    ),
+    "anthropic:claude-sonnet-4.6": (("claude-sonnet-4-6", "Default"),),
+    "anthropic:claude-sonnet-5": (("claude-sonnet-5-high", "High"),),
+    "google:gemini-3.1-pro": (("gemini-3.1-pro-preview", "Preview"),),
+    "google:gemini-3.5-flash": (
+        ("gemini-3.5-flash-high", "High"),
+        ("gemini-3.5-flash-medium", "Medium"),
+    ),
+    "google:gemini-3.6-flash": (("gemini-3.6-flash-high", "High"),),
+    "google:gemini-3.7-flash": (("gemini-3.7-flash-high", "High"),),
+    "xai:grok-4.5": (("grok-4.5", "Default"),),
+    "xai:grok-4.6": (("grok-4.6-high", "High"),),
+    "moonshot_ai:kimi-k3": (("kimi-k3-max", "Max"),),
+}
+
 FOOTNOTE_RE = re.compile(r"\[\^([^\]]+)\]")
 KEY_VALUE_RE = re.compile(r"^([a-z_]+):(?:\s*(.*))?$")
 MONEY_RE = re.compile(r"^\$(\d+(?:\.\d+)?)$")
@@ -71,6 +134,7 @@ THRESHOLD_RE = re.compile(r"^(≤|<=|>)\s*(\d+(?:\.\d+)?)\s*K$", re.IGNORECASE)
 IDENTIFIER_RE = re.compile(r"^[a-z0-9_]+:[a-z0-9][a-z0-9.-]*$")
 HEX_40_RE = re.compile(r"^[0-9a-f]{40}$")
 HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 class CatalogError(ValueError):
@@ -310,7 +374,7 @@ def build_catalog(
 
     digest = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
     catalog = {
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "generatedAt": generated_at,
         "pricingUnit": "USD per 1 million tokens",
         "source": {
@@ -323,8 +387,176 @@ def build_catalog(
         "modelCount": len(models),
         "models": models,
     }
-    validate_catalog(catalog, minimum_model_count=1)
     return catalog
+
+
+def _arena_number(value: Any, field: str) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CatalogError(f"LM Arena {field} must be numeric")
+    if not math.isfinite(float(value)):
+        raise CatalogError(f"LM Arena {field} must be finite")
+    return value
+
+
+def _arena_integer(value: Any, field: str, *, minimum: int) -> int:
+    number = _arena_number(value, field)
+    if float(number) != int(number) or number < minimum:
+        raise CatalogError(f"LM Arena {field} must be a whole number of at least {minimum}")
+    return int(number)
+
+
+def _arena_date(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not DATE_RE.fullmatch(value):
+        raise CatalogError(f"LM Arena {field} must be an ISO calendar date")
+    try:
+        datetime.strptime(value, "%Y-%m-%d")
+    except ValueError as error:
+        raise CatalogError(f"LM Arena {field} must be a valid calendar date") from error
+    return value
+
+
+def normalize_arena_rows(payload_rows: list[Any]) -> list[dict[str, Any]]:
+    """Validate and project the official dataset viewer's overall rows."""
+    normalized: list[dict[str, Any]] = []
+    seen_models: set[str] = set()
+
+    for index, entry in enumerate(payload_rows, start=1):
+        if not isinstance(entry, dict) or not isinstance(entry.get("row"), dict):
+            raise CatalogError(f"LM Arena row {index} has an invalid envelope")
+        if entry.get("truncated_cells") not in (None, []):
+            raise CatalogError(f"LM Arena row {index} contains truncated data")
+        row = entry["row"]
+        if row.get("category") != ARENA_CATEGORY:
+            raise CatalogError(f"LM Arena row {index} is not in the overall category")
+
+        model_name = row.get("model_name")
+        if not isinstance(model_name, str) or not model_name.strip():
+            raise CatalogError(f"LM Arena row {index} has no model name")
+        if model_name in seen_models:
+            raise CatalogError(f"LM Arena model {model_name!r} is duplicated")
+        rank = _arena_integer(row.get("rank"), f"rank for {model_name}", minimum=1)
+        votes = _arena_integer(row.get("vote_count"), f"vote count for {model_name}", minimum=0)
+        snapshot_date = _arena_date(
+            row.get("leaderboard_publish_date"), f"snapshot date for {model_name}"
+        )
+        rating = _arena_number(row.get("rating"), f"rating for {model_name}")
+        lower = _arena_number(row.get("rating_lower"), f"lower rating for {model_name}")
+        upper = _arena_number(row.get("rating_upper"), f"upper rating for {model_name}")
+        if lower > rating or rating > upper:
+            raise CatalogError(f"LM Arena row {model_name!r} has an invalid rating interval")
+
+        seen_models.add(model_name)
+        normalized.append(
+            {
+                "arenaModel": model_name,
+                "rank": rank,
+                "rating": rating,
+                "ratingLower": lower,
+                "ratingUpper": upper,
+                "voteCount": votes,
+                "snapshotDate": snapshot_date,
+            }
+        )
+
+    dates = {row["snapshotDate"] for row in normalized}
+    if len(dates) > 1:
+        raise CatalogError("LM Arena overall rows contain multiple snapshot dates")
+    return normalized
+
+
+def validate_arena_metadata(metadata: Any) -> str:
+    if not isinstance(metadata, dict):
+        raise CatalogError("LM Arena dataset metadata is not an object")
+    revision = metadata.get("sha")
+    card_data = metadata.get("cardData")
+    if not isinstance(revision, str) or not HEX_40_RE.fullmatch(revision):
+        raise CatalogError("LM Arena returned an invalid dataset revision")
+    if metadata.get("private") is not False or metadata.get("gated") not in (False, None):
+        raise CatalogError("LM Arena dataset is no longer public and ungated")
+    if metadata.get("disabled") is True:
+        raise CatalogError("LM Arena dataset is disabled")
+    if not isinstance(card_data, dict) or card_data.get("license") != "cc-by-4.0":
+        raise CatalogError("LM Arena dataset is not published under CC BY 4.0")
+
+    configurations = card_data.get("configs")
+    if not isinstance(configurations, list) or not any(
+        isinstance(item, dict) and item.get("config_name") == ARENA_CONFIGURATION
+        for item in configurations
+    ):
+        raise CatalogError(f"LM Arena dataset has no {ARENA_CONFIGURATION!r} configuration")
+    return revision
+
+
+def arena_source(revision: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    if not HEX_40_RE.fullmatch(revision):
+        raise CatalogError("LM Arena source revision is invalid")
+    if not rows:
+        raise CatalogError("LM Arena overall leaderboard is empty")
+    snapshot_dates = {row["snapshotDate"] for row in rows}
+    if len(snapshot_dates) != 1:
+        raise CatalogError("LM Arena overall rows contain multiple snapshot dates")
+    return {
+        "publisher": "LM Arena",
+        "dataset": ARENA_DATASET,
+        "configuration": ARENA_CONFIGURATION,
+        "split": ARENA_SPLIT,
+        "category": ARENA_CATEGORY,
+        "revision": revision,
+        "snapshotDate": next(iter(snapshot_dates)),
+        "license": "CC BY 4.0",
+        "licenseURL": CC_BY_4_URL,
+        "url": ARENA_DATASET_URL,
+    }
+
+
+def enrich_catalog_with_arena(
+    catalog: dict[str, Any],
+    *,
+    source: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Attach exact LM Arena matches without inferring aliases or model families."""
+    validate_arena_model_map()
+    by_name = {row["arenaModel"]: row for row in rows}
+    catalog["communityPreferenceSource"] = source
+
+    for model in catalog["models"]:
+        variants = []
+        for arena_model, label in ARENA_MODEL_MAP.get(model["id"], ()):
+            row = by_name.get(arena_model)
+            if row is None:
+                continue
+            variants.append(
+                {
+                    "arenaModel": arena_model,
+                    "label": label,
+                    "rank": row["rank"],
+                    "rating": row["rating"],
+                    "ratingLower": row["ratingLower"],
+                    "ratingUpper": row["ratingUpper"],
+                    "voteCount": row["voteCount"],
+                }
+            )
+        if variants:
+            variants.sort(key=lambda item: (item["rank"], item["arenaModel"]))
+            model["communityPreference"] = {
+                "bestRank": min(item["rank"] for item in variants),
+                "worstRank": max(item["rank"] for item in variants),
+                "variants": variants,
+            }
+
+    return catalog
+
+
+def validate_arena_model_map() -> None:
+    seen_arena_models: set[str] = set()
+    for catalog_model, mappings in ARENA_MODEL_MAP.items():
+        if not IDENTIFIER_RE.fullmatch(catalog_model) or not mappings:
+            raise CatalogError(f"invalid LM Arena catalogue mapping for {catalog_model!r}")
+        for arena_model, label in mappings:
+            if not arena_model or not label or arena_model in seen_arena_models:
+                raise CatalogError(f"invalid or duplicate LM Arena mapping for {arena_model!r}")
+            seen_arena_models.add(arena_model)
 
 
 def expect_exact_keys(value: dict[str, Any], expected: set[str], context: str) -> None:
@@ -349,14 +581,20 @@ def validate_price(value: Any, context: str, *, optional: bool = False) -> None:
         raise CatalogError(f"{context} must be finite and non-negative")
 
 
-def validate_catalog(catalog: dict[str, Any], *, minimum_model_count: int) -> None:
-    expect_exact_keys(
-        catalog,
-        {"schemaVersion", "generatedAt", "pricingUnit", "source", "modelCount", "models"},
-        "catalog",
-    )
-    if catalog["schemaVersion"] != 1:
-        raise CatalogError("catalog schemaVersion must be 1")
+def validate_catalog(
+    catalog: dict[str, Any],
+    *,
+    minimum_model_count: int,
+    minimum_preference_model_count: int = 0,
+) -> None:
+    validate_arena_model_map()
+    required_catalog_keys = {
+        "schemaVersion", "generatedAt", "pricingUnit", "source",
+        "communityPreferenceSource", "modelCount", "models",
+    }
+    expect_exact_keys(catalog, required_catalog_keys, "catalog")
+    if catalog["schemaVersion"] != 2:
+        raise CatalogError("catalog schemaVersion must be 2")
     if catalog["pricingUnit"] != "USD per 1 million tokens":
         raise CatalogError("catalog pricingUnit is unsupported")
     try:
@@ -377,6 +615,32 @@ def validate_catalog(catalog: dict[str, Any], *, minimum_model_count: int) -> No
     if not HEX_64_RE.fullmatch(str(source["sha256"])):
         raise CatalogError("catalog source digest is invalid")
 
+    preference_source = catalog["communityPreferenceSource"]
+    if not isinstance(preference_source, dict):
+        raise CatalogError("catalog communityPreferenceSource must be an object")
+    expect_exact_keys(
+        preference_source,
+        {
+            "publisher", "dataset", "configuration", "split", "category", "revision",
+            "snapshotDate", "license", "licenseURL", "url",
+        },
+        "catalog communityPreferenceSource",
+    )
+    if (
+        preference_source["publisher"] != "LM Arena"
+        or preference_source["dataset"] != ARENA_DATASET
+        or preference_source["configuration"] != ARENA_CONFIGURATION
+        or preference_source["split"] != ARENA_SPLIT
+        or preference_source["category"] != ARENA_CATEGORY
+        or preference_source["license"] != "CC BY 4.0"
+        or preference_source["licenseURL"] != CC_BY_4_URL
+        or preference_source["url"] != ARENA_DATASET_URL
+    ):
+        raise CatalogError("catalog community-preference source is unsupported")
+    if not HEX_40_RE.fullmatch(str(preference_source["revision"])):
+        raise CatalogError("catalog community-preference revision is invalid")
+    _arena_date(preference_source["snapshotDate"], "catalogue snapshot date")
+
     models = catalog["models"]
     if not isinstance(models, list):
         raise CatalogError("catalog models must be an array")
@@ -387,14 +651,17 @@ def validate_catalog(catalog: dict[str, Any], *, minimum_model_count: int) -> No
 
     seen_ids: set[str] = set()
     providers: set[str] = set()
+    preference_model_count = 0
     for model_index, model in enumerate(models):
         context = f"model {model_index + 1}"
         if not isinstance(model, dict):
             raise CatalogError(f"{context} must be an object")
         required = {"id", "name", "provider", "releaseStatus", "category", "sourceAnnotations", "tiers"}
-        allowed = required | {"notes"}
+        allowed = required | {"notes", "communityPreference"}
         if not required.issubset(model) or not set(model).issubset(allowed):
-            expect_exact_keys(model, required if "notes" not in model else allowed, context)
+            expected = required | ({"notes"} if "notes" in model else set())
+            expected |= ({"communityPreference"} if "communityPreference" in model else set())
+            expect_exact_keys(model, expected, context)
 
         model_id = model["id"]
         provider = model["provider"]
@@ -419,6 +686,64 @@ def validate_catalog(catalog: dict[str, Any], *, minimum_model_count: int) -> No
             raise CatalogError(f"{context} sourceAnnotations contains duplicates")
         if "notes" in model and (not isinstance(model["notes"], str) or not model["notes"].strip()):
             raise CatalogError(f"{context} notes must be a non-empty string")
+
+        preference = model.get("communityPreference")
+        if preference is not None:
+            if not isinstance(preference, dict):
+                raise CatalogError(f"{context} communityPreference must be an object")
+            expect_exact_keys(
+                preference, {"bestRank", "worstRank", "variants"}, f"{context} communityPreference"
+            )
+            variants = preference["variants"]
+            if not isinstance(variants, list) or not variants:
+                raise CatalogError(f"{context} communityPreference must have variants")
+            seen_arena_models: set[str] = set()
+            ranks: list[int] = []
+            expected_mappings = dict(ARENA_MODEL_MAP.get(model_id, ()))
+            for variant_index, variant in enumerate(variants, start=1):
+                variant_context = f"{context} communityPreference variant {variant_index}"
+                if not isinstance(variant, dict):
+                    raise CatalogError(f"{variant_context} must be an object")
+                expect_exact_keys(
+                    variant,
+                    {
+                        "arenaModel", "label", "rank", "rating", "ratingLower", "ratingUpper",
+                        "voteCount",
+                    },
+                    variant_context,
+                )
+                arena_model = variant["arenaModel"]
+                if (
+                    not isinstance(arena_model, str)
+                    or not arena_model
+                    or arena_model in seen_arena_models
+                ):
+                    raise CatalogError(f"{variant_context} has an invalid or duplicate model name")
+                seen_arena_models.add(arena_model)
+                if not isinstance(variant["label"], str) or not variant["label"].strip():
+                    raise CatalogError(f"{variant_context} has an invalid label")
+                if expected_mappings.get(arena_model) != variant["label"]:
+                    raise CatalogError(f"{variant_context} is not in the reviewed exact-name map")
+                rank = variant["rank"]
+                votes = variant["voteCount"]
+                if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
+                    raise CatalogError(f"{variant_context} has an invalid rank")
+                if isinstance(votes, bool) or not isinstance(votes, int) or votes < 0:
+                    raise CatalogError(f"{variant_context} has an invalid vote count")
+                rating = variant["rating"]
+                lower = variant["ratingLower"]
+                upper = variant["ratingUpper"]
+                validate_price(rating, f"{variant_context} rating")
+                validate_price(lower, f"{variant_context} ratingLower")
+                validate_price(upper, f"{variant_context} ratingUpper")
+                if lower > rating or rating > upper:
+                    raise CatalogError(f"{variant_context} has an invalid rating interval")
+                ranks.append(rank)
+            if preference["bestRank"] != min(ranks) or preference["worstRank"] != max(ranks):
+                raise CatalogError(f"{context} communityPreference rank range is inconsistent")
+            if variants != sorted(variants, key=lambda item: (item["rank"], item["arenaModel"])):
+                raise CatalogError(f"{context} communityPreference variants are not rank-sorted")
+            preference_model_count += 1
 
         tiers = model["tiers"]
         if not isinstance(tiers, list) or not tiers:
@@ -472,16 +797,27 @@ def validate_catalog(catalog: dict[str, Any], *, minimum_model_count: int) -> No
     missing_providers = REQUIRED_PROVIDERS - providers
     if missing_providers:
         raise CatalogError(f"catalog is missing required providers: {', '.join(sorted(missing_providers))}")
+    if preference_model_count < minimum_preference_model_count:
+        raise CatalogError(
+            f"catalog has community-preference data for {preference_model_count} models; "
+            f"expected at least {minimum_preference_model_count}"
+        )
+
+
+def request_headers(url: str, *, accept: str) -> dict[str, str]:
+    headers = {
+        "Accept": accept,
+        "User-Agent": "BarPilot-model-pricing-catalog/2",
+    }
+    host = urllib.parse.urlparse(url).hostname
+    token = os.environ.get("GITHUB_TOKEN")
+    if token and host in {"api.github.com", "raw.githubusercontent.com"}:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
 
 
 def request_bytes(url: str, *, accept: str, attempts: int = 3) -> bytes:
-    headers = {
-        "Accept": accept,
-        "User-Agent": "BarPilot-model-pricing-catalog/1",
-    }
-    token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
+    headers = request_headers(url, accept=accept)
 
     last_error: Exception | None = None
     for attempt in range(attempts):
@@ -495,7 +831,7 @@ def request_bytes(url: str, *, accept: str, attempts: int = 3) -> bytes:
             last_error = error
             if attempt + 1 < attempts:
                 time.sleep(2**attempt)
-    raise CatalogError(f"unable to fetch the public pricing source after {attempts} attempts: {last_error}")
+    raise CatalogError(f"unable to fetch public catalogue data after {attempts} attempts: {last_error}")
 
 
 def fetch_source() -> tuple[str, str]:
@@ -515,6 +851,72 @@ def fetch_source() -> tuple[str, str]:
         return source_bytes.decode("utf-8"), revision
     except UnicodeDecodeError as error:
         raise CatalogError("pricing source is not valid UTF-8") from error
+
+
+def fetch_arena() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    metadata_payload = request_bytes(ARENA_METADATA_URL, accept="application/json")
+    try:
+        metadata = json.loads(metadata_payload)
+    except json.JSONDecodeError as error:
+        raise CatalogError("LM Arena returned invalid dataset metadata") from error
+    revision = validate_arena_metadata(metadata)
+
+    overall_entries: list[Any] = []
+    reached_next_category = False
+    for page in range(ARENA_MAX_PAGES):
+        query = urllib.parse.urlencode(
+            {
+                "dataset": ARENA_DATASET,
+                "config": ARENA_CONFIGURATION,
+                "split": ARENA_SPLIT,
+                "offset": page * ARENA_PAGE_SIZE,
+                "length": ARENA_PAGE_SIZE,
+            }
+        )
+        payload = request_bytes(f"{ARENA_ROWS_URL}?{query}", accept="application/json")
+        try:
+            page_data = json.loads(payload)
+            entries = page_data["rows"]
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise CatalogError("LM Arena returned invalid leaderboard rows") from error
+        if not isinstance(entries, list) or not entries:
+            raise CatalogError("LM Arena returned an empty leaderboard page")
+
+        for entry in entries:
+            row = entry.get("row") if isinstance(entry, dict) else None
+            category = row.get("category") if isinstance(row, dict) else None
+            if category == ARENA_CATEGORY:
+                if reached_next_category:
+                    raise CatalogError("LM Arena overall rows are no longer contiguous")
+                overall_entries.append(entry)
+            elif overall_entries:
+                reached_next_category = True
+                break
+            else:
+                raise CatalogError("LM Arena no longer publishes overall rows first")
+        if reached_next_category:
+            break
+
+    if not reached_next_category:
+        raise CatalogError("LM Arena overall leaderboard exceeded the safe page limit")
+    if len(overall_entries) < ARENA_MINIMUM_OVERALL_ROWS:
+        raise CatalogError(
+            f"LM Arena returned {len(overall_entries)} overall rows; "
+            f"expected at least {ARENA_MINIMUM_OVERALL_ROWS}"
+        )
+    rows = normalize_arena_rows(overall_entries)
+
+    # Detect a repository update while the paginated viewer response is being
+    # read. The rows carry their own snapshot date; this second check ensures the
+    # observed dataset revision and licence remained stable for the whole fetch.
+    final_metadata_payload = request_bytes(ARENA_METADATA_URL, accept="application/json")
+    try:
+        final_metadata = json.loads(final_metadata_payload)
+    except json.JSONDecodeError as error:
+        raise CatalogError("LM Arena returned invalid final dataset metadata") from error
+    if validate_arena_metadata(final_metadata) != revision:
+        raise CatalogError("LM Arena dataset changed during the paginated fetch; retry later")
+    return arena_source(revision, rows), rows
 
 
 def write_catalog(path: Path, catalog: dict[str, Any]) -> None:
@@ -541,17 +943,32 @@ def build_parser() -> argparse.ArgumentParser:
     fetch = subparsers.add_parser("fetch", help="fetch, normalize, validate, and write the live source")
     fetch.add_argument("--output", type=Path, required=True)
     fetch.add_argument("--minimum-model-count", type=int, default=PRODUCTION_MINIMUM_MODELS)
+    fetch.add_argument(
+        "--minimum-preference-model-count",
+        type=int,
+        default=PRODUCTION_MINIMUM_PREFERENCE_MODELS,
+    )
 
-    generate = subparsers.add_parser("generate", help="generate a catalogue from a local source fixture")
+    generate = subparsers.add_parser(
+        "generate", help="generate a catalogue from local pricing and LM Arena fixtures"
+    )
     generate.add_argument("--input", type=Path, required=True)
+    generate.add_argument("--arena-input", type=Path, required=True)
+    generate.add_argument("--arena-revision", required=True)
     generate.add_argument("--output", type=Path, required=True)
     generate.add_argument("--source-revision", required=True)
     generate.add_argument("--generated-at", default=utc_now())
     generate.add_argument("--minimum-model-count", type=int, default=1)
+    generate.add_argument("--minimum-preference-model-count", type=int, default=1)
 
     validate = subparsers.add_parser("validate", help="validate an already-generated catalogue")
     validate.add_argument("--input", type=Path, required=True)
     validate.add_argument("--minimum-model-count", type=int, default=PRODUCTION_MINIMUM_MODELS)
+    validate.add_argument(
+        "--minimum-preference-model-count",
+        type=int,
+        default=PRODUCTION_MINIMUM_PREFERENCE_MODELS,
+    )
     return parser
 
 
@@ -561,9 +978,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "fetch":
             source_text, revision = fetch_source()
             catalog = build_catalog(source_text, source_revision=revision, generated_at=utc_now())
-            validate_catalog(catalog, minimum_model_count=args.minimum_model_count)
+            preference_source, arena_rows = fetch_arena()
+            enrich_catalog_with_arena(catalog, source=preference_source, rows=arena_rows)
+            validate_catalog(
+                catalog,
+                minimum_model_count=args.minimum_model_count,
+                minimum_preference_model_count=args.minimum_preference_model_count,
+            )
             write_catalog(args.output, catalog)
-            print(f"wrote {catalog['modelCount']} models from source revision {revision[:12]}")
+            preference_count = sum("communityPreference" in model for model in catalog["models"])
+            print(
+                f"wrote {catalog['modelCount']} models with {preference_count} LM Arena matches "
+                f"from pricing revision {revision[:12]}"
+            )
         elif args.command == "generate":
             source_text = args.input.read_text(encoding="utf-8")
             catalog = build_catalog(
@@ -571,14 +998,31 @@ def main(argv: list[str] | None = None) -> int:
                 source_revision=args.source_revision,
                 generated_at=args.generated_at,
             )
-            validate_catalog(catalog, minimum_model_count=args.minimum_model_count)
+            arena_payload = json.loads(args.arena_input.read_text(encoding="utf-8"))
+            if not isinstance(arena_payload, dict) or not isinstance(arena_payload.get("rows"), list):
+                raise CatalogError("local LM Arena fixture must contain a rows array")
+            arena_rows = normalize_arena_rows(arena_payload["rows"])
+            enrich_catalog_with_arena(
+                catalog,
+                source=arena_source(args.arena_revision, arena_rows),
+                rows=arena_rows,
+            )
+            validate_catalog(
+                catalog,
+                minimum_model_count=args.minimum_model_count,
+                minimum_preference_model_count=args.minimum_preference_model_count,
+            )
             write_catalog(args.output, catalog)
             print(f"wrote {catalog['modelCount']} models")
         else:
             catalog = load_catalog(args.input)
-            validate_catalog(catalog, minimum_model_count=args.minimum_model_count)
+            validate_catalog(
+                catalog,
+                minimum_model_count=args.minimum_model_count,
+                minimum_preference_model_count=args.minimum_preference_model_count,
+            )
             print(f"validated {catalog['modelCount']} models")
-    except (CatalogError, OSError) as error:
+    except (CatalogError, OSError, json.JSONDecodeError) as error:
         print(f"catalogue error: {error}", file=sys.stderr)
         return 1
     return 0

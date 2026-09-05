@@ -7,13 +7,13 @@ on:
       - .github/workflows/publish-model-pricing.yml
       - Scripts/model_pricing_catalog.py
       - Tests/model_pricing_catalog/**
-      - catalog/model-pricing-v1.schema.json
+      - catalog/model-pricing-v2.schema.json
   pull_request:
     paths:
       - .github/workflows/publish-model-pricing.yml
       - Scripts/model_pricing_catalog.py
       - Tests/model_pricing_catalog/**
-      - catalog/model-pricing-v1.schema.json
+      - catalog/model-pricing-v2.schema.json
   schedule:
     - cron: "17 4 * * *"
   workflow_dispatch:
@@ -36,22 +36,24 @@ jobs:
       - name: Run catalogue tests
         run: python3 -m unittest discover -s Tests/model_pricing_catalog -p 'test_*.py'
 
-      - name: Fetch and normalize public pricing data
+      - name: Fetch and normalize public pricing and preference data
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: >-
           python3 Scripts/model_pricing_catalog.py fetch
-          --output _site/model-pricing/v1/catalog.json
+          --output _site/model-pricing/v2/catalog.json
           --minimum-model-count 20
+          --minimum-preference-model-count 5
 
       - name: Validate generated catalogue
         run: >-
           python3 Scripts/model_pricing_catalog.py validate
-          --input _site/model-pricing/v1/catalog.json
+          --input _site/model-pricing/v2/catalog.json
           --minimum-model-count 20
+          --minimum-preference-model-count 5
 
       - name: Add the versioned schema
-        run: install -m 0644 catalog/model-pricing-v1.schema.json _site/model-pricing/v1/schema.json
+        run: install -m 0644 catalog/model-pricing-v2.schema.json _site/model-pricing/v2/schema.json
 
       - name: Upload Pages artifact
         if: github.event_name != 'pull_request'
