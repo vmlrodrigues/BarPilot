@@ -10,6 +10,28 @@ import AppKit
 // cached records, so the menu-bar total and detail window update instantly.
 // ---------------------------------------------------------------------------
 
+/// Serialises budget snapshots and rejects a late-arriving obsolete write.
+/// This keeps the database aligned with the newest value even when a user
+/// changes the field repeatedly while SQLite work is still queued.
+private actor CycleBudgetWriter {
+    private var newestRevision = 0
+
+    func persist(
+        revision: Int,
+        resetDayMs: Int64,
+        account: String?,
+        budgetUSD: Double
+    ) -> Bool {
+        guard revision >= newestRevision else { return true }
+        newestRevision = revision
+        return CreditSampleStore.setCycleBudget(
+            resetDayMs: resetDayMs,
+            account: account,
+            budgetUSD: budgetUSD
+        )
+    }
+}
+
 @MainActor
 final class UsageStore: ObservableObject {
     @Published private(set) var report: Report = .empty
@@ -28,6 +50,7 @@ final class UsageStore: ObservableObject {
     /// Monthly budget in USD. The per-period budget is derived from this by
     /// pro-rating across the days in the selected range (a per-day rate).
     @Published var monthlyBudget: Double { didSet { persistBudget() } }
+    @Published private(set) var budgetPersistenceError: String?
     /// Project the month-end forecast across working days only. Off by default,
     /// so an existing install's forecast does not move on upgrade.
     @Published var excludeWeekendsFromProjection: Bool {
@@ -66,6 +89,8 @@ final class UsageStore: ObservableObject {
     @Published private(set) var selectedCreditCycleDayMs: Int64?
     @Published private(set) var isLoadingCreditCycle = false
     @Published private(set) var selectedHistoricalTotalCredits: Double?
+    @Published private(set) var selectedHistoricalBudgetUSD: Double?
+    @Published private(set) var budgetMigrationCycleDayMs: Int64?
     @Published private(set) var spendCalendarDailyCredits: [String: Double] = [:]
     @Published private(set) var spendCalendarMonthKey: String?
     @Published private(set) var isLoadingSpendCalendar = false
@@ -76,6 +101,9 @@ final class UsageStore: ObservableObject {
     private var serverUsageGeneration = 0
     private var creditCycleLoadGeneration = 0
     private var spendCalendarLoadGeneration = 0
+    private let cycleBudgetWriter = CycleBudgetWriter()
+    private var budgetWriteRevision = 0
+    private var budgetPersistenceTask: Task<Void, Never>?
     private struct ActiveServerRefresh {
         let id: UUID
         let startedAt: Date
@@ -429,6 +457,7 @@ final class UsageStore: ObservableObject {
             return false
         }
         guard generation == serverUsageGeneration else { return false }
+        let budgetUSD = monthlyBudget
 
         guard CreditUsageKeychain.saveToken(token) else {
             serverUsageError = "GitHub authenticated, but the credential couldn’t be saved securely."
@@ -439,7 +468,9 @@ final class UsageStore: ObservableObject {
             // Claim pre-attribution rows before the first attributed write, so
             // the opening sample and the existing history share one account.
             CreditSampleStore.adoptUnattributed(account: fingerprint)
-            let didSave = CreditSampleStore.save(sample, account: fingerprint)
+            let didSave = CreditSampleStore.save(
+                sample, account: fingerprint, budgetUSD: budgetUSD
+            )
             return (
                 didSave,
                 CreditSampleStore.cycles(account: fingerprint)
@@ -491,6 +522,7 @@ final class UsageStore: ObservableObject {
         serverUsageSample = sample
         serverUsageError = nil
         recompute()
+        Task { await refreshBudgetMigrationCycle() }
         return true
     }
 
@@ -499,6 +531,7 @@ final class UsageStore: ObservableObject {
         selectedCreditCycleDayMs = nil
         selectedCreditCycleSamples = creditSamples
         selectedHistoricalTotalCredits = nil
+        selectedHistoricalBudgetUSD = nil
         isLoadingCreditCycle = false
     }
 
@@ -543,11 +576,13 @@ final class UsageStore: ObservableObject {
             resetCreditCycleSelection()
         }
         recompute()
+        await refreshBudgetMigrationCycle()
     }
 
     func disableServerUsage() {
         serverUsageGeneration += 1
         serverUsageEnabled = false
+        budgetMigrationCycleDayMs = nil
         resetCreditCycleSelection()
         resetSpendCalendar()
         UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
@@ -669,9 +704,12 @@ final class UsageStore: ObservableObject {
                 UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
             }
             let account = serverUsageAccountFingerprint
+            let budgetUSD = monthlyBudget
             let persisted = await Task.detached(priority: .utility) {
                 if let account { CreditSampleStore.adoptUnattributed(account: account) }
-                let saved = CreditSampleStore.save(sample, account: account)
+                let saved = CreditSampleStore.save(
+                    sample, account: account, budgetUSD: budgetUSD
+                )
                 let cycles = resolvedAccountDuringRefresh
                     ? CreditSampleStore.cycles(account: account)
                     : nil
@@ -686,6 +724,7 @@ final class UsageStore: ObservableObject {
                 recompute()
                 return .notNeeded
             }
+            budgetPersistenceError = nil
             if let cycles = persisted.1 { creditCycles = cycles }
             upsertCreditCycle(sample)
             // Only treat this as a genuine rollover when the cycle actually moved
@@ -720,6 +759,7 @@ final class UsageStore: ObservableObject {
             serverUsageSample = sample
             serverUsageError = nil
             recompute()
+            await refreshBudgetMigrationCycle()
             return .refreshed
         } catch {
             guard !Task.isCancelled else { return .notNeeded }
@@ -842,6 +882,74 @@ final class UsageStore: ObservableObject {
         selectedCreditCycleDayMs == nil
     }
 
+    /// The target belonging to the cycle rendered by the primary dashboard.
+    /// Historical nil is not replaced with today's preference: it means the
+    /// cycle predates budget snapshots and its target is unknown.
+    var compactBudgetUSD: Double? {
+        isViewingCurrentCreditCycle ? monthlyBudget : selectedHistoricalBudgetUSD
+    }
+
+    /// The sole historical write affordance is a migration repair for the one
+    /// cycle that completed before snapshots existed.
+    var canAssignMissingBudgetForSelectedCreditCycle: Bool {
+        selectedHistoricalBudgetUSD == nil
+            && selectedCreditCycleDayMs != nil
+            && selectedCreditCycleDayMs == budgetMigrationCycleDayMs
+    }
+
+    @discardableResult
+    func assignMissingBudgetForSelectedCreditCycle(
+        _ budgetUSD: Double
+    ) async -> Bool {
+        guard budgetUSD.isFinite, budgetUSD >= 0,
+              canAssignMissingBudgetForSelectedCreditCycle,
+              let resetDayMs = selectedCreditCycleDayMs else {
+            return false
+        }
+        let account = serverUsageAccountFingerprint
+        let saved = await Task.detached(priority: .utility) {
+            let saved = CreditSampleStore.assignCycleBudgetIfMissing(
+                resetDayMs: resetDayMs,
+                account: account,
+                budgetUSD: budgetUSD
+            )
+            if saved { CreditSampleStore.completeBudgetMigration(account: account) }
+            return saved
+        }.value
+        guard saved, selectedCreditCycleDayMs == resetDayMs,
+              serverUsageAccountFingerprint == account else {
+            return false
+        }
+        selectedHistoricalBudgetUSD = budgetUSD
+        budgetMigrationCycleDayMs = nil
+        return true
+    }
+
+    private func refreshBudgetMigrationCycle() async {
+        guard serverUsageEnabled,
+              let account = serverUsageAccountFingerprint,
+              let current = currentServerUsageSample else {
+            budgetMigrationCycleDayMs = nil
+            return
+        }
+        let liveResetDayMs = CreditCycleSummary.dayStart(for: current.resetAtMs)
+        let cycles = creditCycles
+        let generation = serverUsageGeneration
+        let candidate = await Task.detached(priority: .utility) {
+            CreditSampleStore.budgetMigrationCycle(
+                liveResetDayMs: liveResetDayMs,
+                cycles: cycles,
+                account: account
+            )
+        }.value
+        guard serverUsageEnabled,
+              generation == serverUsageGeneration,
+              account == serverUsageAccountFingerprint else {
+            return
+        }
+        budgetMigrationCycleDayMs = candidate
+    }
+
     var canSelectOlderCreditCycle: Bool {
         guard let selectedCreditCycle,
               let index = creditCycles.firstIndex(of: selectedCreditCycle) else {
@@ -880,6 +988,7 @@ final class UsageStore: ObservableObject {
         if newer.resetDayMs == liveDay {
             selectedCreditCycleDayMs = nil
             selectedCreditCycleSamples = creditSamples
+            selectedHistoricalBudgetUSD = nil
             updateCreditCycleView()
         } else {
             selectCreditCycle(newer.resetDayMs)
@@ -980,9 +1089,14 @@ final class UsageStore: ObservableObject {
         let loadGeneration = creditCycleLoadGeneration
         isLoadingCreditCycle = true
         Task {
-            let samples = await Task.detached(priority: .utility) {
-                CreditSampleStore.loadCycle(
-                    resetDayMs: resetDayMs, account: account
+            let stored = await Task.detached(priority: .utility) {
+                (
+                    CreditSampleStore.loadCycle(
+                        resetDayMs: resetDayMs, account: account
+                    ),
+                    CreditSampleStore.cycleBudget(
+                        resetDayMs: resetDayMs, account: account
+                    )
                 )
             }.value
             guard generation == serverUsageGeneration,
@@ -994,7 +1108,8 @@ final class UsageStore: ObservableObject {
                 return
             }
             selectedCreditCycleDayMs = resetDayMs
-            selectedCreditCycleSamples = samples
+            selectedCreditCycleSamples = stored.0
+            selectedHistoricalBudgetUSD = stored.1
             updateCreditCycleView()
             isLoadingCreditCycle = false
         }
@@ -1007,6 +1122,7 @@ final class UsageStore: ObservableObject {
         guard let selected = selectedCreditCycle else {
             creditTimeline = .empty
             selectedHistoricalTotalCredits = nil
+            selectedHistoricalBudgetUSD = nil
             return
         }
         let local = selectedCreditCycleDayMs == nil
@@ -1076,6 +1192,38 @@ final class UsageStore: ObservableObject {
 
     private func persistBudget() {
         UserDefaults.standard.set(monthlyBudget, forKey: Self.budgetKey)
+        budgetPersistenceError = nil
+        guard serverUsageEnabled, let sample = currentServerUsageSample else {
+            return
+        }
+        let resetDayMs = CreditCycleSummary.dayStart(for: sample.resetAtMs)
+        let account = serverUsageAccountFingerprint
+        let budgetUSD = monthlyBudget
+        budgetWriteRevision += 1
+        let revision = budgetWriteRevision
+        let writer = cycleBudgetWriter
+        let task = Task { [weak self] in
+            let saved = await writer.persist(
+                revision: revision,
+                resetDayMs: resetDayMs,
+                account: account,
+                budgetUSD: budgetUSD
+            )
+            guard let self, revision == self.budgetWriteRevision else { return }
+            self.budgetPersistenceTask = nil
+            if !saved {
+                self.budgetPersistenceError =
+                    "The target is saved for this Mac, but the billing-cycle snapshot couldn’t be updated."
+                DiagLog.write("budget: cycle snapshot persist failed")
+            }
+        }
+        budgetPersistenceTask = task
+    }
+
+    var hasPendingBudgetPersistence: Bool { budgetPersistenceTask != nil }
+
+    func flushPendingBudgetPersistence() async {
+        await budgetPersistenceTask?.value
     }
 
     private func persistCurrency() {

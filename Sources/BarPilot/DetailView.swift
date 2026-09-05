@@ -10,6 +10,8 @@ struct DetailView: View {
     @EnvironmentObject var store: UsageStore
     let connectGitHub: () -> Void
     let openSettings: () -> Void
+    let closePopover: () -> Void
+    @ObservedObject var presentationState: PopoverPresentationState
     @State private var showingUTCInfo = false
     @State private var showingSyncInfo = false
     @State private var showingCreditInfo = false
@@ -23,7 +25,9 @@ struct DetailView: View {
                 CompactDashboard(
                     connectGitHub: connectGitHub,
                     openSettings: openSettings,
-                    showLegacy: { showingLegacyTelemetry = true }
+                    showLegacy: { showingLegacyTelemetry = true },
+                    closePopover: closePopover,
+                    presentationState: presentationState
                 )
             }
         }

@@ -548,6 +548,46 @@ def enrich_catalog_with_arena(
     return catalog
 
 
+def strip_community_preferences(catalog: dict[str, Any]) -> None:
+    """Return a price-only catalogue after a failed or stale enrichment attempt."""
+    catalog.pop("communityPreferenceSource", None)
+    for model in catalog.get("models", []):
+        if isinstance(model, dict):
+            model.pop("communityPreference", None)
+
+
+def reuse_community_preferences(
+    catalog: dict[str, Any], previous_catalog: dict[str, Any]
+) -> int:
+    """Copy a previously validated Arena snapshot onto newly fetched prices.
+
+    Pricing fields always come from ``catalog``. Only the independent Arena
+    source description and exact per-model matches are reused, by stable model
+    identifier, so an Arena outage cannot freeze GitHub's prices.
+    """
+    strip_community_preferences(catalog)
+    source = previous_catalog.get("communityPreferenceSource")
+    if not isinstance(source, dict):
+        raise CatalogError("previous catalogue has no community-preference source")
+    previous_models = previous_catalog.get("models")
+    if not isinstance(previous_models, list):
+        raise CatalogError("previous catalogue has no models array")
+
+    by_id = {
+        model.get("id"): model.get("communityPreference")
+        for model in previous_models
+        if isinstance(model, dict) and isinstance(model.get("id"), str)
+    }
+    catalog["communityPreferenceSource"] = source
+    copied = 0
+    for model in catalog["models"]:
+        preference = by_id.get(model["id"])
+        if isinstance(preference, dict):
+            model["communityPreference"] = preference
+            copied += 1
+    return copied
+
+
 def validate_arena_model_map() -> None:
     seen_arena_models: set[str] = set()
     for catalog_model, mappings in ARENA_MODEL_MAP.items():
@@ -586,13 +626,18 @@ def validate_catalog(
     *,
     minimum_model_count: int,
     minimum_preference_model_count: int = 0,
+    allow_missing_preferences: bool = False,
 ) -> None:
     validate_arena_model_map()
     required_catalog_keys = {
-        "schemaVersion", "generatedAt", "pricingUnit", "source",
-        "communityPreferenceSource", "modelCount", "models",
+        "schemaVersion", "generatedAt", "pricingUnit", "source", "modelCount", "models",
     }
-    expect_exact_keys(catalog, required_catalog_keys, "catalog")
+    allowed_catalog_keys = required_catalog_keys | {"communityPreferenceSource"}
+    if not required_catalog_keys.issubset(catalog) or not set(catalog).issubset(allowed_catalog_keys):
+        expected = required_catalog_keys | (
+            {"communityPreferenceSource"} if "communityPreferenceSource" in catalog else set()
+        )
+        expect_exact_keys(catalog, expected, "catalog")
     if catalog["schemaVersion"] != 2:
         raise CatalogError("catalog schemaVersion must be 2")
     if catalog["pricingUnit"] != "USD per 1 million tokens":
@@ -615,31 +660,35 @@ def validate_catalog(
     if not HEX_64_RE.fullmatch(str(source["sha256"])):
         raise CatalogError("catalog source digest is invalid")
 
-    preference_source = catalog["communityPreferenceSource"]
-    if not isinstance(preference_source, dict):
-        raise CatalogError("catalog communityPreferenceSource must be an object")
-    expect_exact_keys(
-        preference_source,
-        {
-            "publisher", "dataset", "configuration", "split", "category", "revision",
-            "snapshotDate", "license", "licenseURL", "url",
-        },
-        "catalog communityPreferenceSource",
-    )
-    if (
-        preference_source["publisher"] != "LM Arena"
-        or preference_source["dataset"] != ARENA_DATASET
-        or preference_source["configuration"] != ARENA_CONFIGURATION
-        or preference_source["split"] != ARENA_SPLIT
-        or preference_source["category"] != ARENA_CATEGORY
-        or preference_source["license"] != "CC BY 4.0"
-        or preference_source["licenseURL"] != CC_BY_4_URL
-        or preference_source["url"] != ARENA_DATASET_URL
-    ):
-        raise CatalogError("catalog community-preference source is unsupported")
-    if not HEX_40_RE.fullmatch(str(preference_source["revision"])):
-        raise CatalogError("catalog community-preference revision is invalid")
-    _arena_date(preference_source["snapshotDate"], "catalogue snapshot date")
+    preference_source = catalog.get("communityPreferenceSource")
+    if preference_source is None:
+        if not allow_missing_preferences:
+            raise CatalogError("catalog is missing communityPreferenceSource")
+    else:
+        if not isinstance(preference_source, dict):
+            raise CatalogError("catalog communityPreferenceSource must be an object")
+        expect_exact_keys(
+            preference_source,
+            {
+                "publisher", "dataset", "configuration", "split", "category", "revision",
+                "snapshotDate", "license", "licenseURL", "url",
+            },
+            "catalog communityPreferenceSource",
+        )
+        if (
+            preference_source["publisher"] != "LM Arena"
+            or preference_source["dataset"] != ARENA_DATASET
+            or preference_source["configuration"] != ARENA_CONFIGURATION
+            or preference_source["split"] != ARENA_SPLIT
+            or preference_source["category"] != ARENA_CATEGORY
+            or preference_source["license"] != "CC BY 4.0"
+            or preference_source["licenseURL"] != CC_BY_4_URL
+            or preference_source["url"] != ARENA_DATASET_URL
+        ):
+            raise CatalogError("catalog community-preference source is unsupported")
+        if not HEX_40_RE.fullmatch(str(preference_source["revision"])):
+            raise CatalogError("catalog community-preference revision is invalid")
+        _arena_date(preference_source["snapshotDate"], "catalogue snapshot date")
 
     models = catalog["models"]
     if not isinstance(models, list):
@@ -689,6 +738,8 @@ def validate_catalog(
 
         preference = model.get("communityPreference")
         if preference is not None:
+            if preference_source is None:
+                raise CatalogError(f"{context} has communityPreference without source metadata")
             if not isinstance(preference, dict):
                 raise CatalogError(f"{context} communityPreference must be an object")
             expect_exact_keys(
@@ -797,7 +848,7 @@ def validate_catalog(
     missing_providers = REQUIRED_PROVIDERS - providers
     if missing_providers:
         raise CatalogError(f"catalog is missing required providers: {', '.join(sorted(missing_providers))}")
-    if preference_model_count < minimum_preference_model_count:
+    if preference_source is not None and preference_model_count < minimum_preference_model_count:
         raise CatalogError(
             f"catalog has community-preference data for {preference_model_count} models; "
             f"expected at least {minimum_preference_model_count}"
@@ -869,6 +920,7 @@ def fetch_arena() -> tuple[dict[str, Any], list[dict[str, Any]]]:
                 "dataset": ARENA_DATASET,
                 "config": ARENA_CONFIGURATION,
                 "split": ARENA_SPLIT,
+                "revision": revision,
                 "offset": page * ARENA_PAGE_SIZE,
                 "length": ARENA_PAGE_SIZE,
             }
@@ -936,6 +988,16 @@ def load_catalog(path: Path) -> dict[str, Any]:
     return value
 
 
+def fetch_catalog(url: str) -> dict[str, Any]:
+    try:
+        value = json.loads(request_bytes(url, accept="application/json"))
+    except json.JSONDecodeError as error:
+        raise CatalogError("previous catalogue is not valid JSON") from error
+    if not isinstance(value, dict):
+        raise CatalogError("previous catalogue root must be an object")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -947,6 +1009,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--minimum-preference-model-count",
         type=int,
         default=PRODUCTION_MINIMUM_PREFERENCE_MODELS,
+    )
+    fetch.add_argument(
+        "--preference-fallback-url",
+        help="last published catalogue whose validated LM Arena snapshot may be reused",
+    )
+    fetch.add_argument(
+        "--allow-missing-preferences",
+        action="store_true",
+        help="publish current prices even if neither fresh nor previous Arena data is usable",
     )
 
     generate = subparsers.add_parser(
@@ -969,6 +1040,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=PRODUCTION_MINIMUM_PREFERENCE_MODELS,
     )
+    validate.add_argument("--allow-missing-preferences", action="store_true")
     return parser
 
 
@@ -978,18 +1050,55 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "fetch":
             source_text, revision = fetch_source()
             catalog = build_catalog(source_text, source_revision=revision, generated_at=utc_now())
-            preference_source, arena_rows = fetch_arena()
-            enrich_catalog_with_arena(catalog, source=preference_source, rows=arena_rows)
+            preference_status = "fresh"
+            fresh_error: CatalogError | None = None
+            try:
+                preference_source, arena_rows = fetch_arena()
+                enrich_catalog_with_arena(catalog, source=preference_source, rows=arena_rows)
+                validate_catalog(
+                    catalog,
+                    minimum_model_count=args.minimum_model_count,
+                    minimum_preference_model_count=args.minimum_preference_model_count,
+                )
+            except CatalogError as error:
+                fresh_error = error
+                strip_community_preferences(catalog)
+                preference_status = "unavailable"
+                if args.preference_fallback_url:
+                    try:
+                        previous = fetch_catalog(args.preference_fallback_url)
+                        validate_catalog(
+                            previous,
+                            minimum_model_count=1,
+                            minimum_preference_model_count=1,
+                        )
+                        reuse_community_preferences(catalog, previous)
+                        validate_catalog(
+                            catalog,
+                            minimum_model_count=args.minimum_model_count,
+                            minimum_preference_model_count=args.minimum_preference_model_count,
+                        )
+                        preference_status = "last-known-good"
+                    except CatalogError as fallback_error:
+                        strip_community_preferences(catalog)
+                        print(
+                            f"warning: fresh LM Arena data failed ({fresh_error}); "
+                            f"previous snapshot failed ({fallback_error})",
+                            file=sys.stderr,
+                        )
+                if preference_status == "unavailable" and not args.allow_missing_preferences:
+                    raise fresh_error
             validate_catalog(
                 catalog,
                 minimum_model_count=args.minimum_model_count,
                 minimum_preference_model_count=args.minimum_preference_model_count,
+                allow_missing_preferences=args.allow_missing_preferences,
             )
             write_catalog(args.output, catalog)
             preference_count = sum("communityPreference" in model for model in catalog["models"])
             print(
                 f"wrote {catalog['modelCount']} models with {preference_count} LM Arena matches "
-                f"from pricing revision {revision[:12]}"
+                f"from pricing revision {revision[:12]} (Arena: {preference_status})"
             )
         elif args.command == "generate":
             source_text = args.input.read_text(encoding="utf-8")
@@ -1020,6 +1129,7 @@ def main(argv: list[str] | None = None) -> int:
                 catalog,
                 minimum_model_count=args.minimum_model_count,
                 minimum_preference_model_count=args.minimum_preference_model_count,
+                allow_missing_preferences=args.allow_missing_preferences,
             )
             print(f"validated {catalog['modelCount']} models")
     except (CatalogError, OSError, json.JSONDecodeError) as error:

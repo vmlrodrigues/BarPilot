@@ -14,7 +14,8 @@ Written in **Swift / SwiftUI**, fully self-contained with **no external
 dependencies**. The primary dashboard stores GitHub’s account credit counter
 locally; the deprecated detail view reads Copilot OTel telemetry directly from
 disk. Network access is limited to GitHub authentication and credit totals,
-optional private-gist sync, app updates, and the USD→AUD exchange-rate fetch.
+optional private-gist sync, app updates, model-pricing catalogue updates, and the
+USD→AUD exchange-rate fetch.
 
 ## What it shows
 
@@ -23,6 +24,11 @@ optional private-gist sync, app updates, and the USD→AUD exchange-rate fetch.
   displayed figure may be the incomplete local fallback.
 - **Detail window** (click the menu-bar item):
   - Current billing-cycle credits and their value in both USD and AUD.
+  - A **Model prices…** dialogue with current input, cached-input, cache-write
+    and output rates; local favourites; provider/search filters; and workload
+    cost comparisons. It also shows sortable LM Arena community-preference ranks,
+    reasoning-mode details, ratings, and vote counts. The catalogue is cached for
+    offline use.
   - A daily credit-usage bar chart built from persisted GitHub samples.
   - An observed daily-spend table. Opening usage and unsampled growth crossing a
     UTC day boundary remain separate rather than being assigned without evidence.
@@ -130,14 +136,18 @@ Requires the Swift toolchain (Command Line Tools are enough — **no full Xcode
 needed**).
 
 ```sh
-./build-app.sh        # compiles with SwiftPM and assembles BarPilot.app
+./build-app.sh        # compiles, assembles, and stable-signs BarPilot.app when the project identity is installed
 open BarPilot.app    # look for the $ amount in your menu bar
 ```
 
-To run during development without bundling:
+For interactive development, use the bundled build above so Keychain sees the
+same signed application after every rebuild. `swift run` remains useful for the
+headless verification and output modes, but launching the menu-bar UI that way
+does not provide a stable app identity.
 
 ```sh
-swift run BarPilot
+make local
+make run
 ```
 
 ### Headless output
@@ -163,6 +173,7 @@ Sources/BarPilot/
   CreditTimeline.swift Conservative daily sample projection
   CreditReconciliation.swift Server total + local attribution overlay
   CompactDashboard.swift Primary current-cycle dashboard + legacy transition
+  ModelPricing.swift  Offline-first pricing catalogue client + interactive dialogue
   SyncAggregate.swift Versioned counter-observation + legacy sync payload
   GitHubBackend.swift Private-gist multi-machine sync transport
   DetailView.swift   Window UI: header, sparkline, budget bar, status footer
@@ -171,7 +182,7 @@ Sources/BarPilot/
   Dump.swift         Headless --dump output path
 Info.plist           LSUIElement (menu-bar-only) agent bundle metadata
 build-app.sh         Build + assemble the .app bundle
-Scripts/model_pricing_catalog.py  Validates and publishes the model-price contract
+Scripts/model_pricing_catalog.py  Builds the price + community-preference contract
 .github/workflows/publish-model-pricing.yml  Daily GitHub Pages catalogue pipeline
 ```
 
@@ -203,6 +214,12 @@ If you truly see nothing, confirm it's running: `pgrep -lf BarPilot`.
   The USD→AUD rate is fetched from a public service on launch and refreshed daily
   (cached for offline use); your monthly budget stays in USD and is shown converted
   and rounded to a whole dollar when displaying AUD.
+- **Model pricing:** open **Model prices…** from the dashboard header. BarPilot
+  reads its versioned public catalogue from GitHub Pages, keeps the last valid
+  response for offline use, and checks for a newer snapshot after 12 hours. The
+  daily GitHub Actions job—not the app—fetches and exactly matches LM Arena's
+  overall, text-style-controlled leaderboard. Favourite changes stay on the Mac
+  and are never published or synced.
 - **Left-click** the menu-bar icon to open the usage window; **right-click** (or
   control-click) it for a menu with **Open Usage Window**, **Refresh Now**,
   **Set Monthly Budget…**, **Currency**, **Start at Login**, **GitHub Credit
@@ -212,6 +229,7 @@ If you truly see nothing, confirm it's running: `pgrep -lf BarPilot`.
 ## License
 
 BarPilot is released under the **MIT License** — see [LICENSE](LICENSE) for the
-full text.
+full text. Model-pricing data attribution is recorded in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 Copyright (c) 2026 Victor Rodrigues

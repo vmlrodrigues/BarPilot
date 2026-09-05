@@ -47,9 +47,9 @@ pushes **main** — merge first.
 ## Build / run / verify
 
 ```sh
-./build-app.sh                       # swift build -c release + assemble BarPilot.app
+./build-app.sh                       # release compile + assemble + stable local signing when available
 open BarPilot.app                    # look for the "$ <amount>" item in the menu bar
-swift run BarPilot                   # dev run, no bundle
+make local && make run               # preferred interactive dev workflow (stable Keychain identity)
 swift build                          # quick compile check
 ```
 
@@ -126,6 +126,10 @@ current UTC billing cycle:
   account's existing history; it does not establish a visibility boundary.
   Cumulative samples are not converted into daily rows because gaps cannot be
   assigned to a day reliably.
+- New samples snapshot the canonical USD budget for their billing cycle.
+  Historical cycles use that snapshot. A one-time migration repair may fill the
+  immediately preceding missed cycle, but ordinary historical budgets are not
+  editable and older missing snapshots remain unknown.
 - Disconnecting removes only the credential. Stored samples, the account
   attribution on them, and sync authorization are all left intact, so
   reconnecting restores the existing history rather than starting a new one.
@@ -194,7 +198,7 @@ Sources/BarPilot/
   DiagLog.swift      Size-capped rotating support log (one line per reload).
   Diagnose.swift     Diagnose.run() — the --diagnose support report.
 Info.plist           LSUIElement (menu-bar-only) agent bundle.
-build-app.sh         Build + assemble + ad-hoc codesign the .app.
+build-app.sh         Build + assemble + stable-sign locally (ad-hoc fallback for contributors).
 ```
 
 Primary data flow: `CreditUsageAPI` → `CreditSampleStore` → local observations +
@@ -235,10 +239,11 @@ overlay never mutates local aggregation.
   - **`SettingsWindow` overrides `performKeyEquivalent`** for ⌘W / ⌘Q / ⌘M.
     BarPilot is an `LSUIElement` agent with no main menu, so AppKit supplies none
     of the standard shortcuts and the window otherwise looks broken.
-  The content is a plain `VStack` with `.fixedSize(horizontal: false, vertical:
-  true)` — no `ScrollView` and no min/max height, or the window pads itself out
-  with dead space. Switch rows go through `switchRow`, which puts the switch after
-  a `Spacer` so switches align on the right regardless of label length.
+  The content has a fixed 740×470 sidebar layout with General, Spending, GitHub,
+  and Updates & Support panes. `Start at login` is first in General, and the pane
+  header provides an explicit Done action in addition to the standard window
+  controls. Switch rows go through `switchRow`, which puts the switch after a
+  `Spacer` so switches align on the right regardless of label length.
 - **The usage-window shortcut uses Carbon `RegisterEventHotKey`, not an event
   tap.** It therefore works globally without Accessibility or Input Monitoring
   permission. Recording temporarily unregisters the current combination; cancel,
@@ -260,10 +265,11 @@ overlay never mutates local aggregation.
   editor-based guard would swallow the initial value. `BudgetInput.parse` rejects
   non-numeric, negative, non-finite and anything above `BudgetInput.maximum`
   (1,000,000); it is covered by `--verify-projection`.
-- **Clicking a currency card in the dashboard selects the menu-bar currency.**
-  The cards compare against `store.effectiveCurrency`, not `displayCurrency`, so
-  the "Menu bar" badge shows what is actually rendered (AUD falls back to USD
-  until a rate loads).
+- **The dashboard has one selected-currency spend summary.** Its segmented
+  currency control writes `displayCurrency`; all monetary values render through
+  `effectiveCurrency`, so AUD still falls back to USD until a rate loads. The
+  budget meter draws the projection beneath current spend, with an endpoint
+  marker and anchored value; over-budget projections use off-scale chevrons.
 - **GitHub connection is the primary dashboard setup state and is separately
   authorized from gist sync.** A disconnected window shows a **Connect GitHub**
   CTA; there is no unsolicited startup prompt. Settings exposes

@@ -150,11 +150,97 @@ class ModelPricingCatalogTests(unittest.TestCase):
         self.assertEqual(github_headers["Authorization"], "Bearer test-secret")
         self.assertNotIn("Authorization", arena_headers)
 
-    def test_requires_community_preference_source_in_v2(self):
+    def test_requires_community_preference_source_by_default(self):
         invalid = copy.deepcopy(self.catalog)
-        invalid.pop("communityPreferenceSource")
+        catalogue.strip_community_preferences(invalid)
         with self.assertRaisesRegex(catalogue.CatalogError, "missing communityPreferenceSource"):
             catalogue.validate_catalog(invalid, minimum_model_count=3)
+
+    def test_accepts_price_only_catalogue_when_explicitly_allowed(self):
+        price_only = copy.deepcopy(self.catalog)
+        catalogue.strip_community_preferences(price_only)
+        catalogue.validate_catalog(
+            price_only,
+            minimum_model_count=3,
+            minimum_preference_model_count=2,
+            allow_missing_preferences=True,
+        )
+        self.assertNotIn("communityPreferenceSource", price_only)
+        self.assertTrue(all("communityPreference" not in model for model in price_only["models"]))
+
+    def test_rejects_preference_without_source_even_in_price_only_mode(self):
+        invalid = copy.deepcopy(self.catalog)
+        invalid.pop("communityPreferenceSource")
+        with self.assertRaisesRegex(catalogue.CatalogError, "without source metadata"):
+            catalogue.validate_catalog(
+                invalid,
+                minimum_model_count=3,
+                allow_missing_preferences=True,
+            )
+
+    def test_reuses_only_preference_fields_from_last_known_good_catalogue(self):
+        new_catalog = catalogue.build_catalog(
+            self.source.replace("output: $10.00", "output: $11.00", 1),
+            source_revision="f" * 40,
+            generated_at="2026-09-05T00:00:00Z",
+        )
+        copied = catalogue.reuse_community_preferences(new_catalog, self.catalog)
+        catalogue.validate_catalog(
+            new_catalog, minimum_model_count=3, minimum_preference_model_count=2
+        )
+        sol = next(model for model in new_catalog["models"] if model["id"] == "openai:gpt-5.6-sol")
+        self.assertEqual(sol["tiers"][0]["prices"]["output"], 11)
+        self.assertEqual(sol["communityPreference"]["bestRank"], 16)
+        self.assertEqual(copied, 3)
+
+    def test_fetch_reuses_last_known_good_when_fresh_arena_fails(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            catalogue, "fetch_source", return_value=(self.source, "a" * 40)
+        ), patch.object(
+            catalogue, "fetch_arena", side_effect=catalogue.CatalogError("Arena offline")
+        ), patch.object(
+            catalogue, "fetch_catalog", return_value=copy.deepcopy(self.catalog)
+        ):
+            output = Path(directory) / "catalog.json"
+            result = catalogue.main(
+                [
+                    "fetch", "--output", str(output),
+                    "--minimum-model-count", "3",
+                    "--minimum-preference-model-count", "2",
+                    "--preference-fallback-url", "https://example.invalid/catalog.json",
+                ]
+            )
+            self.assertEqual(result, 0)
+            published = json.loads(output.read_text(encoding="utf-8"))
+            self.assertIn("communityPreferenceSource", published)
+            self.assertEqual(
+                sum("communityPreference" in model for model in published["models"]), 3
+            )
+
+    def test_fetch_publishes_prices_when_all_arena_sources_fail(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            catalogue, "fetch_source", return_value=(self.source, "a" * 40)
+        ), patch.object(
+            catalogue, "fetch_arena", side_effect=catalogue.CatalogError("Arena offline")
+        ), patch.object(
+            catalogue, "fetch_catalog", side_effect=catalogue.CatalogError("No fallback")
+        ):
+            output = Path(directory) / "catalog.json"
+            result = catalogue.main(
+                [
+                    "fetch", "--output", str(output),
+                    "--minimum-model-count", "3",
+                    "--minimum-preference-model-count", "2",
+                    "--preference-fallback-url", "https://example.invalid/catalog.json",
+                    "--allow-missing-preferences",
+                ]
+            )
+            self.assertEqual(result, 0)
+            published = json.loads(output.read_text(encoding="utf-8"))
+            self.assertNotIn("communityPreferenceSource", published)
+            self.assertTrue(
+                all("communityPreference" not in model for model in published["models"])
+            )
 
     def test_generate_and_validate_cli_round_trip(self):
         with tempfile.TemporaryDirectory() as directory:

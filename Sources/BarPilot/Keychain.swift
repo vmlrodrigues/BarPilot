@@ -4,29 +4,43 @@ import Security
 // ---------------------------------------------------------------------------
 // Keychain — stores the GitHub sync token (from device-flow OAuth).
 //
-// Release builds use the macOS Keychain (secure, and their stable Developer ID
-// signature keeps access across app updates). DEV builds are ad-hoc signed and
-// get a *new* code signature on every rebuild, which invalidates Keychain access
-// — so for dev builds only, the token is kept in UserDefaults instead, so it
-// survives rebuilds during testing. Never ships that way.
+// Credentials always use the macOS Keychain. Older development builds briefly
+// stored tokens in UserDefaults; token() performs a one-time best-effort migration
+// and removes that plaintext value whether or not Keychain accepts it.
 // ---------------------------------------------------------------------------
 
 private enum SecureTokenStore {
     static func save(_ token: String, service: String, account: String, devKey: String) -> Bool {
-        if Updater.isDevBuild {
-            UserDefaults.standard.set(token, forKey: devKey)
-            return self.token(service: service, account: account, devKey: devKey) == token
+        guard !token.isEmpty else { return false }
+        let query = baseQuery(service: service, account: account)
+        let values: [String: Any] = [
+            kSecValueData as String: Data(token.utf8),
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
+        ]
+        var status = SecItemUpdate(query as CFDictionary, values as CFDictionary)
+        if status == errSecItemNotFound {
+            status = SecItemAdd(query.merging(values) { _, new in new } as CFDictionary, nil)
         }
-        SecItemDelete(baseQuery(service: service, account: account) as CFDictionary)
-        var attrs = baseQuery(service: service, account: account)
-        attrs[kSecValueData as String] = Data(token.utf8)
-        attrs[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        guard SecItemAdd(attrs as CFDictionary, nil) == errSecSuccess else { return false }
-        return self.token(service: service, account: account, devKey: devKey) == token
+        guard status == errSecSuccess else { return false }
+        UserDefaults.standard.removeObject(forKey: devKey)
+        return keychainToken(service: service, account: account) == token
     }
 
     static func token(service: String, account: String, devKey: String) -> String? {
-        if Updater.isDevBuild { return UserDefaults.standard.string(forKey: devKey) }
+        if let stored = keychainToken(service: service, account: account) {
+            // Also scrub a duplicate left by a short-lived development build that
+            // wrote UserDefaults before the Keychain-backed version was installed.
+            UserDefaults.standard.removeObject(forKey: devKey)
+            return stored
+        }
+        guard let legacy = UserDefaults.standard.string(forKey: devKey) else { return nil }
+        let migrated = save(legacy, service: service, account: account, devKey: devKey)
+        // Never leave a credential in plaintext just because migration failed.
+        UserDefaults.standard.removeObject(forKey: devKey)
+        return migrated ? legacy : nil
+    }
+
+    private static func keychainToken(service: String, account: String) -> String? {
         var query = baseQuery(service: service, account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -38,12 +52,9 @@ private enum SecureTokenStore {
 
     static func delete(service: String, account: String, devKey: String) -> Bool {
         UserDefaults.standard.removeObject(forKey: devKey)
-        if Updater.isDevBuild {
-            return token(service: service, account: account, devKey: devKey) == nil
-        }
         let status = SecItemDelete(baseQuery(service: service, account: account) as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else { return false }
-        return token(service: service, account: account, devKey: devKey) == nil
+        return keychainToken(service: service, account: account) == nil
     }
 
     private static func baseQuery(service: String, account: String) -> [String: Any] {

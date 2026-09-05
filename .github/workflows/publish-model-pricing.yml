@@ -36,7 +36,7 @@ jobs:
       - name: Run catalogue tests
         run: python3 -m unittest discover -s Tests/model_pricing_catalog -p 'test_*.py'
 
-      - name: Fetch and normalize public pricing and preference data
+      - name: Fetch prices and enrich with best available preference data
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: >-
@@ -44,6 +44,8 @@ jobs:
           --output _site/model-pricing/v2/catalog.json
           --minimum-model-count 20
           --minimum-preference-model-count 5
+          --preference-fallback-url https://vmlrodrigues.github.io/BarPilot/model-pricing/v2/catalog.json
+          --allow-missing-preferences
 
       - name: Validate generated catalogue
         run: >-
@@ -51,6 +53,7 @@ jobs:
           --input _site/model-pricing/v2/catalog.json
           --minimum-model-count 20
           --minimum-preference-model-count 5
+          --allow-missing-preferences
 
       - name: Add the versioned schema
         run: install -m 0644 catalog/model-pricing-v2.schema.json _site/model-pricing/v2/schema.json

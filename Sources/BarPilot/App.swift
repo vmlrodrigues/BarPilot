@@ -57,6 +57,16 @@ struct AppMain {
             GlobalShortcut.verify()
             exit(0)
         }
+        // Dev-only: pricing fallback, shortlist and tier/cost rules.
+        if CommandLine.arguments.contains("--verify-model-pricing") {
+            ModelPricingVerification.run()
+            exit(0)
+        }
+        // Dev-only: layered Escape routing for nested popover overlays.
+        if CommandLine.arguments.contains("--verify-presentation") {
+            PopoverPresentationState.verify()
+            exit(0)
+        }
         // Support report — state, a timed load, and the recent reload log (#24).
         if CommandLine.arguments.contains("--diagnose") {
             Diagnose.run()
@@ -88,6 +98,7 @@ struct AppMain {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     let store = UsageStore()
     private let updater = Updater()
+    private let popoverPresentationState = PopoverPresentationState()
 
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
@@ -96,8 +107,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // NSMenu (the period Picker) runs its modal event loop. This global monitor
     // ensures clicks in other apps still close the popover in that case.
     private var outsideClickMonitor: Any?
+    private var popoverKeyMonitor: Any?
     private var settingsWindow: NSWindow?
     private var wakeRefreshTask: Task<Void, Never>?
+    private var isWaitingForBudgetPersistence = false
     private weak var shortcutPreviousWindow: NSWindow?
     private var shortcutPreviousApplication: NSRunningApplication?
     private lazy var shortcutController = GlobalShortcutController { [weak self] in
@@ -129,7 +142,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 connectGitHub: { [weak self] in
                     self?.startCreditUsageDeviceFlow()
                 },
-                openSettings: { [weak self] in self?.openSettings() }
+                openSettings: { [weak self] in self?.openSettings() },
+                closePopover: { [weak self] in self?.popover.performClose(nil) },
+                presentationState: popoverPresentationState
             )
             .environmentObject(store)
         )
@@ -165,6 +180,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         wakeRefreshTask?.cancel()
         shortcutController.stop()
         NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if isWaitingForBudgetPersistence { return .terminateLater }
+        guard store.hasPendingBudgetPersistence else { return .terminateNow }
+        isWaitingForBudgetPersistence = true
+        Task { [weak self] in
+            guard let self else {
+                sender.reply(toApplicationShouldTerminate: true)
+                return
+            }
+            await self.store.flushPendingBudgetPersistence()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     /// Left-click toggles the window; right-click (or control-click) shows a menu.
@@ -229,6 +259,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         let actions = SettingsActions(
+            close: { [weak self] in self?.settingsWindow?.performClose(nil) },
             connectGitHub: { [weak self] in self?.startCreditUsageDeviceFlow() },
             disconnectGitHub: { [weak self] in self?.confirmDisconnectGitHub() },
             toggleSync: { [weak self] in self?.toggleSync() },
@@ -561,6 +592,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         popover.contentViewController?.view.window?.makeKey()
         installOutsideClickMonitor()
+        installPopoverKeyMonitor()
         Task { await store.reload() }   // freshen on open
     }
 
@@ -581,6 +613,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// NSPopover consumes Escape before SwiftUI's `onExitCommand` reaches a
+    /// nested overlay. Intercept it at the AppKit event boundary and let the
+    /// shared presentation state dismiss exactly one layer first.
+    private func installPopoverKeyMonitor() {
+        removePopoverKeyMonitor()
+        popoverKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
+            [weak self] event in
+            guard let self, self.popover.isShown, event.keyCode == 53 else {
+                return event
+            }
+            if self.popoverPresentationState.dismissTopLayer() { return nil }
+            self.popover.performClose(nil)
+            return nil
+        }
+    }
+
+    private func removePopoverKeyMonitor() {
+        if let monitor = popoverKeyMonitor {
+            NSEvent.removeMonitor(monitor)
+            popoverKeyMonitor = nil
+        }
+    }
+
     /// Window size, clamped so it never exceeds the usable screen height.
     private func desiredContentSize() -> NSSize {
         let screen = statusItem.button?.window?.screen ?? NSScreen.main
@@ -596,6 +651,8 @@ extension AppDelegate: NSPopoverDelegate {
     /// monitor, or the status-bar button toggle). Always clean up the monitor.
     func popoverDidClose(_ notification: Notification) {
         removeOutsideClickMonitor()
+        removePopoverKeyMonitor()
+        popoverPresentationState.reset()
         clearShortcutFocusTarget()
     }
 }

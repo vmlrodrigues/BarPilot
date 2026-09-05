@@ -13,11 +13,35 @@ APP="BarPilot.app"
 BIN_NAME="BarPilot"
 
 # Signing is configurable via the environment (the Makefile's `release` target
-# sets these). Defaults produce an ad-hoc-signed local/dev build.
-SIGN_IDENTITY="${SIGN_IDENTITY:--}"   # "-" = ad-hoc
+# sets these). Prefer the owner's stable Developer ID for local builds when it is
+# installed: ad-hoc identities change on every rebuild and cause macOS Keychain
+# to ask for access again. Other contributors still fall back to ad-hoc signing.
+LOCAL_SIGN_IDENTITY="${LOCAL_SIGN_IDENTITY:-Developer ID Application: Victor Rodrigues (9N354A3UZK)}"
+if [ -z "${SIGN_IDENTITY+x}" ]; then
+    REQUESTED_SIGN_IDENTITY="$LOCAL_SIGN_IDENTITY"
+    ALLOW_ADHOC_FALLBACK=1
+else
+    REQUESTED_SIGN_IDENTITY="$SIGN_IDENTITY"
+    ALLOW_ADHOC_FALLBACK=""
+fi
+
+# Resolve names through `find-identity` and pass the valid certificate fingerprint
+# to codesign. This avoids ambiguous/transient name lookup behaviour and makes the
+# exact identity used by local and release builds deterministic.
+SIGN_IDENTITY="$REQUESTED_SIGN_IDENTITY"
+if [ "$REQUESTED_SIGN_IDENTITY" != "-" ]; then
+    RESOLVED_SIGN_IDENTITY="$(security find-identity -v -p codesigning 2>/dev/null |
+        awk -v identity="\"$REQUESTED_SIGN_IDENTITY\"" 'index($0, identity) { print $2; exit }')"
+    if [ -n "$RESOLVED_SIGN_IDENTITY" ]; then
+        SIGN_IDENTITY="$RESOLVED_SIGN_IDENTITY"
+    elif [ -n "$ALLOW_ADHOC_FALLBACK" ]; then
+        SIGN_IDENTITY="-"
+    fi
+fi
 ENTITLEMENTS="${ENTITLEMENTS:-}"      # optional path to a .entitlements plist
 HARDENED="${HARDENED:-}"              # non-empty → Hardened Runtime + secure timestamp
 VERSION="${VERSION:-$(cat VERSION 2>/dev/null)}"   # stamp into the bundle Info.plist
+BUILD_CHANNEL="${BUILD_CHANNEL:-development}"
 
 echo "▸ Building ($CONFIG) …"
 swift build -c "$CONFIG"
@@ -40,6 +64,11 @@ if [ -n "$VERSION" ]; then
     /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION"            "$APP/Contents/Info.plist"
 fi
 
+# Signature type is no longer a reliable development marker because local builds
+# may be Developer ID-signed for stable Keychain access. The release target
+# explicitly overrides this value.
+/usr/libexec/PlistBuddy -c "Add :BarPilotBuildChannel string $BUILD_CHANNEL" "$APP/Contents/Info.plist"
+
 # Generate the app icon (.icns) from AppIcon.png, if present.
 if [ -f AppIcon.png ]; then
     echo "▸ Generating app icon …"
@@ -53,9 +82,9 @@ if [ -f AppIcon.png ]; then
     rm -rf "$(dirname "$ICONSET")"
 fi
 
-# Code-sign. Defaults to ad-hoc ("-") for local/dev builds; `make release`
-# overrides SIGN_IDENTITY / ENTITLEMENTS / HARDENED for a Developer ID signature.
-echo "▸ Signing ($SIGN_IDENTITY) …"
+# Code-sign. Local builds use the stable identity above when available; `make
+# release` additionally enables entitlements, Hardened Runtime and timestamping.
+echo "▸ Signing ($REQUESTED_SIGN_IDENTITY) …"
 set -- --force --sign "$SIGN_IDENTITY"
 [ -n "$HARDENED" ]     && set -- "$@" --options runtime --timestamp
 [ -n "$ENTITLEMENTS" ] && set -- "$@" --entitlements "$ENTITLEMENTS"
@@ -63,6 +92,7 @@ if [ "$SIGN_IDENTITY" = "-" ]; then
     codesign "$@" "$APP" 2>/dev/null || true
 else
     codesign "$@" "$APP"
+    codesign --verify --deep --strict "$APP"
 fi
 
 echo "✓ Built $APP"

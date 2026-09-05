@@ -1,0 +1,51 @@
+name: Swift verification
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/swift-ci.yml
+      - Package.swift
+      - Sources/BarPilot/**
+      - Scripts/model_pricing_catalog.py
+      - Tests/model_pricing_catalog/**
+  pull_request:
+    paths:
+      - .github/workflows/swift-ci.yml
+      - Package.swift
+      - Sources/BarPilot/**
+      - Scripts/model_pricing_catalog.py
+      - Tests/model_pricing_catalog/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swift-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Build and run regression checks
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build debug and release configurations
+        run: |
+          swift build
+          swift build -c release
+
+      - name: Enforce complete Swift concurrency checking
+        run: swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
+
+      - name: Run headless app regression checks
+        run: |
+          for check in projection watchdog incremental credits wake-refresh shortcut model-pricing presentation sync; do
+            .build/debug/BarPilot "--verify-${check}"
+          done
+
+      - name: Run catalogue unit tests
+        run: python3 -m unittest discover -s Tests/model_pricing_catalog -p 'test_*.py'

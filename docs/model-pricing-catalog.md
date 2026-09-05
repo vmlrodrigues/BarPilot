@@ -13,9 +13,11 @@ Tracked by GitHub issue #52.
 - JSON Schema: `<Pages deployment URL>/model-pricing/v2/schema.json`
 
 Schema v2 is intentionally a breaking replacement for the unreleased v1 model-
-pricing prototype. Every v2 catalogue must include both source descriptions.
-An individual model may omit `communityPreference` when there is no exact current
-LM Arena match; this is represented as unranked in the app.
+pricing prototype. GitHub pricing and its source description are mandatory.
+LM Arena data is an optional enrichment: when fresh Arena data is unavailable the
+pipeline first reuses the last validated Arena snapshot; if that is unavailable too,
+it publishes current prices without ranks. An individual model may also omit
+`communityPreference` when there is no exact current LM Arena match.
 
 The pricing portion preserves GitHub's provider, release status, category, prices,
 source revision, and source-file SHA-256. Markdown footnote markers are removed
@@ -76,19 +78,23 @@ The build job:
 
 1. runs the fixture-based unit tests;
 2. resolves and downloads an immutable GitHub Docs pricing revision;
-3. reads the public, ungated LM Arena dataset through Hugging Face's documented
+3. attempts to read the public, ungated LM Arena dataset through Hugging Face's documented
    Dataset Viewer API;
 4. verifies LM Arena still declares CC BY 4.0, fetches the contiguous overall
    leaderboard pages, and confirms the observed dataset revision did not change
    during pagination;
 5. joins only exact names from the reviewed mapping;
 6. validates model counts, required providers, price tiers, ratings, intervals,
-   vote counts, ranks, source metadata, and a minimum number of matched models; and
-7. publishes the catalogue and schema to GitHub Pages.
+   vote counts, ranks, source metadata, and a minimum number of matched models;
+7. if Arena is unavailable, reuses only ranking fields from the last validated
+   published catalogue, or explicitly omits rankings when no safe fallback exists; and
+8. publishes the catalogue and schema to GitHub Pages.
 
-The deploy job depends on the complete build. A network failure, source format or
-licence change, malformed value, missing major provider, unexpectedly small
-catalogue, or inadequate match count leaves the previous Pages deployment intact.
+The deploy job depends on the complete build. A GitHub pricing failure, source
+format change, malformed price, missing major provider, or unexpectedly small
+catalogue leaves the previous Pages deployment intact. An Arena outage cannot hold
+back a valid GitHub price change; it produces last-known-good or explicitly absent
+rankings, both of which the app presents honestly.
 `GITHUB_TOKEN` is sent only to GitHub hosts and is never sent to Hugging Face.
 No LM Arena or Hugging Face key is required.
 
@@ -124,7 +130,9 @@ To exercise both public sources and the production safety floors:
 python3 Scripts/model_pricing_catalog.py fetch \
   --output /tmp/model-pricing-v2.json \
   --minimum-model-count 20 \
-  --minimum-preference-model-count 5
+  --minimum-preference-model-count 5 \
+  --preference-fallback-url https://vmlrodrigues.github.io/BarPilot/model-pricing/v2/catalog.json \
+  --allow-missing-preferences
 ```
 
 ## Licensing and attribution

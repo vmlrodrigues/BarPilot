@@ -1,6 +1,6 @@
 # BarPilot — build & distribution
 #
-#   make local                  Ad-hoc local/dev build  -> ./BarPilot.app
+#   make local                  Stable-signed local/dev build -> ./BarPilot.app
 #   make run                    Launch ./BarPilot.app
 #   make dmg VERSION=0.1.0      Developer ID sign + notarise + DMG (no tag/publish)
 #   make release VERSION=0.1.0  Everything in `dmg`, then tag + GitHub release
@@ -27,14 +27,15 @@ NOTARIZE_PROFILE      := barpilot-notarization
 # Push with the gh-authenticated account (avoids stale keychain creds 403ing).
 GIT_PUSH := git -c credential.helper="" -c credential.helper="!gh auth git-credential" push
 
-.PHONY: all local run dmg release check clean help
+.PHONY: all local run verify dmg release check clean help
 
 all: local
 
 help:
 	@echo "BarPilot targets:"
-	@echo "  local                    Ad-hoc local build   -> ./$(APP)"
+	@echo "  local                    Stable-signed local build -> ./$(APP)"
 	@echo "  run                      Launch ./$(APP)"
+	@echo "  verify                   Build and run deterministic regression checks"
 	@echo "  dmg VERSION=x.y.z        Developer ID sign + notarise + DMG (no tag/publish)"
 	@echo "  release VERSION=x.y.z    Everything in 'dmg', then tag + GitHub release"
 	@echo "  check                    Verify tools + signing certificate"
@@ -54,12 +55,21 @@ check:
 	@security find-identity -v -p codesigning | grep -q "$(RELEASE_SIGN_IDENTITY)" || { echo "x Developer ID cert not in keychain. Expected:"; echo "    $(RELEASE_SIGN_IDENTITY)"; exit 1; }
 	@echo "OK - all release prerequisites present."
 
-dmg: check
+verify:
+	swift build
+	swift build -c release
+	swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
+	@for check in projection watchdog incremental credits wake-refresh shortcut model-pricing presentation sync; do \
+		.build/debug/BarPilot "--verify-$$check" || exit 1; \
+	done
+	python3 -m unittest discover -s Tests/model_pricing_catalog -p 'test_*.py'
+
+dmg: check verify
 	@[ "$(VERSION)" != "0.0.0" ] || { echo "Set a version:  make dmg VERSION=x.y.z  (or edit ./VERSION)"; exit 1; }
 	@echo "=== Building BarPilot $(VERSION) for distribution ==="
 	@rm -rf "$(STAGING)" "$(DMG_NAME)" && mkdir -p "$(STAGING)"
 	@echo "-> Building + signing (Developer ID . Hardened Runtime)..."
-	SIGN_IDENTITY="$(RELEASE_SIGN_IDENTITY)" ENTITLEMENTS="$(ENTITLEMENTS)" HARDENED=1 VERSION="$(VERSION)" ./build-app.sh
+	SIGN_IDENTITY="$(RELEASE_SIGN_IDENTITY)" ENTITLEMENTS="$(ENTITLEMENTS)" HARDENED=1 BUILD_CHANNEL=release VERSION="$(VERSION)" ./build-app.sh
 	@echo "-> Verifying signature..."
 	@codesign --verify --deep --strict --verbose=2 "$(APP)"
 	@codesign -dvv "$(APP)" 2>&1 | grep -E "Authority=Developer ID|TeamIdentifier|runtime" || true

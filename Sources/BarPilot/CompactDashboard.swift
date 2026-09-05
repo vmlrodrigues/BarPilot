@@ -1,12 +1,45 @@
 import SwiftUI
 import Charts
 
+@MainActor
+final class PopoverPresentationState: ObservableObject {
+    enum Layer {
+        case base
+        case spendCalendar
+        case modelPricing
+    }
+
+    @Published var layer: Layer = .base
+
+    /// Returns true when an overlay consumed Escape. The caller may close the
+    /// containing NSPopover only when this returns false.
+    @discardableResult
+    func dismissTopLayer() -> Bool {
+        guard layer != .base else { return false }
+        layer = .base
+        return true
+    }
+
+    func reset() { layer = .base }
+
+    static func verify() {
+        let state = PopoverPresentationState()
+        precondition(!state.dismissTopLayer())
+        state.layer = .spendCalendar
+        precondition(state.dismissTopLayer() && state.layer == .base)
+        state.layer = .modelPricing
+        precondition(state.dismissTopLayer() && state.layer == .base)
+        print("popover presentation verification passed")
+    }
+}
+
 struct CompactDashboard: View {
     @EnvironmentObject var store: UsageStore
     let connectGitHub: () -> Void
     let openSettings: () -> Void
     let showLegacy: () -> Void
-    @State private var showingSpendCalendar = false
+    let closePopover: () -> Void
+    @ObservedObject var presentationState: PopoverPresentationState
     @State private var selectedSpendDay: String?
     @State private var selectedSpendCredits: Double?
 
@@ -15,30 +48,67 @@ struct CompactDashboard: View {
             VStack(alignment: .leading, spacing: 0) {
                 header
                 Divider()
+                cycleNavigator
+                Divider()
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 12) {
                         if !store.serverUsageEnabled {
                             connectionCard
                         }
-                        valueCards
+                        spendSummary
                         CompactBudgetBar()
                         if selectedSpendDay != nil {
                             selectedDayCard
                         }
-                        dailyChartSection
-                        dailySection
+                        activityCard
                     }
                     .padding(16)
                 }
                 Divider()
                 footer
             }
+            .allowsHitTesting(!showingModelPricing)
+            .accessibilityHidden(showingModelPricing)
             if showingSpendCalendar {
                 spendCalendarOverlay
+            }
+            if showingModelPricing {
+                modelPricingOverlay
             }
         }
         .frame(width: 600)
         .frame(minHeight: 480, maxHeight: .infinity)
+        .onExitCommand(perform: dismissTopLayer)
+    }
+
+    /// Escape unwinds exactly one presentation level. Handling it here avoids
+    /// a nested overlay and NSPopover both reacting to the same key event.
+    private func dismissTopLayer() {
+        if !presentationState.dismissTopLayer() {
+            closePopover()
+        }
+    }
+
+    private var showingSpendCalendar: Bool {
+        get { presentationState.layer == .spendCalendar }
+        nonmutating set {
+            if newValue {
+                presentationState.layer = .spendCalendar
+            } else if presentationState.layer == .spendCalendar {
+                presentationState.layer = .base
+            }
+        }
+    }
+
+    private var showingModelPricing: Bool {
+        get { presentationState.layer == .modelPricing }
+        nonmutating set {
+            if newValue {
+                presentationState.layer = .modelPricing
+            } else if presentationState.layer == .modelPricing {
+                presentationState.layer = .base
+            }
+        }
     }
 
     private var connectionCard: some View {
@@ -85,102 +155,115 @@ struct CompactDashboard: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
+        HStack(spacing: 10) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(Color.accentColor.gradient)
                 Image(systemName: "chart.line.uptrend.xyaxis")
-                    .foregroundStyle(.tint)
-                Text("Copilot Credits")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+            }
+            .frame(width: 32, height: 32)
+            VStack(alignment: .leading, spacing: 0) {
+                Text("BARPILOT")
+                    .font(.system(size: 9, weight: .semibold))
+                    .tracking(1.1)
+                    .foregroundStyle(.secondary)
+                Text("Copilot usage")
                     .font(.headline)
-                Spacer()
-                if store.isLoading { ProgressView().controlSize(.small) }
-                Button {
-                    showLegacy()
-                } label: {
-                    Label("Legacy telemetry", systemImage: "clock.arrow.circlepath")
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help("Open the previous telemetry-based interface.")
-                Button {
-                    Task { await store.reload() }
-                } label: {
-                    Image(systemName: "arrow.clockwise")
-                }
-                .buttonStyle(.borderless)
-                .help("Refresh now")
-                Button {
-                    openSettings()
-                } label: {
-                    Label("Settings", systemImage: "gearshape.fill")
-                        .labelStyle(.iconOnly)
-                }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help("Budget, currency, GitHub connection, sync and updates")
             }
-
-            HStack(alignment: .firstTextBaseline) {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack(spacing: 5) {
-                        Button {
-                            selectedSpendDay = nil
-                            selectedSpendCredits = nil
-                            showingSpendCalendar = false
-                            store.selectOlderCreditCycle()
-                        } label: {
-                            Image(systemName: "chevron.left")
-                        }
-                        .buttonStyle(.borderless)
-                        .disabled(!store.canSelectOlderCreditCycle || store.isLoadingCreditCycle)
-                        .help("Older billing cycle")
-                        Button {
-                            showingSpendCalendar.toggle()
-                        } label: {
-                            HStack(spacing: 4) {
-                                Image(systemName: "calendar")
-                                Text(cycleRangeLabel).monospacedDigit()
-                            }
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                        .disabled(store.selectedCreditCycle == nil)
-                        .help("Choose a date and inspect observed daily spend")
-                        Button {
-                            selectedSpendDay = nil
-                            selectedSpendCredits = nil
-                            showingSpendCalendar = false
-                            store.selectNewerCreditCycle()
-                        } label: {
-                            Image(systemName: "chevron.right")
-                        }
-                        .buttonStyle(.borderless)
-                        .disabled(!store.canSelectNewerCreditCycle || store.isLoadingCreditCycle)
-                        .help("Newer billing cycle")
-                        if store.isLoadingCreditCycle {
-                            ProgressView().controlSize(.mini)
-                        }
-                    }
-                    Text("\(Fmt.credits(store.compactTotalCredits)) credits")
-                        .font(.system(size: 32, weight: .bold, design: .rounded))
-                        .monospacedDigit()
-                }
-                Spacer()
-                if let cycle = store.selectedCreditCycle {
-                    VStack(alignment: .trailing, spacing: 2) {
-                        Text(store.isViewingCurrentCreditCycle ? "Resets" : "Ended")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                        Text(Self.resetFormatter.string(from: cycle.resetAt))
-                            .font(.caption.weight(.medium))
-                    }
-                }
-
+            Spacer()
+            if store.isLoading { ProgressView().controlSize(.small) }
+            Button {
+                Task { await store.reload() }
+            } label: {
+                Image(systemName: "arrow.clockwise")
             }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Refresh now")
+            Button {
+                openSettings()
+            } label: {
+                Label("Settings", systemImage: "gearshape.fill")
+                    .labelStyle(.iconOnly)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Budget, currency, GitHub connection, sync and updates")
         }
-
         .padding(.horizontal, 16)
-        .padding(.vertical, 14)
+        .padding(.vertical, 12)
+    }
+
+    private var cycleNavigator: some View {
+        HStack(spacing: 12) {
+            Button {
+                selectedSpendDay = nil
+                selectedSpendCredits = nil
+                showingSpendCalendar = false
+                store.selectOlderCreditCycle()
+            } label: {
+                Image(systemName: "chevron.left")
+            }
+            .buttonStyle(.borderless)
+            .disabled(!store.canSelectOlderCreditCycle || store.isLoadingCreditCycle)
+            .help("Older billing cycle")
+
+            Button {
+                showingSpendCalendar.toggle()
+            } label: {
+                VStack(spacing: 1) {
+                    Text(store.isViewingCurrentCreditCycle ? "Current billing cycle" : "Billing cycle")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 4) {
+                        Image(systemName: "calendar")
+                        Text(cycleRangeLabel).monospacedDigit()
+                    }
+                    .font(.caption.weight(.medium))
+                }
+                .frame(minWidth: 150)
+            }
+            .buttonStyle(.plain)
+            .disabled(store.selectedCreditCycle == nil)
+            .help("Choose a date and inspect observed daily spend")
+
+            Button {
+                selectedSpendDay = nil
+                selectedSpendCredits = nil
+                showingSpendCalendar = false
+                store.selectNewerCreditCycle()
+            } label: {
+                Image(systemName: "chevron.right")
+            }
+            .buttonStyle(.borderless)
+            .disabled(!store.canSelectNewerCreditCycle || store.isLoadingCreditCycle)
+            .help("Newer billing cycle")
+            if store.isLoadingCreditCycle { ProgressView().controlSize(.mini) }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .background(Color.primary.opacity(0.025))
+    }
+
+    private var modelPricingOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.18)
+                .contentShape(Rectangle())
+                .onTapGesture { showingModelPricing = false }
+            ModelPricingView(close: { showingModelPricing = false })
+                .frame(width: 570)
+                .frame(maxHeight: 660)
+                .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14)
+                        .strokeBorder(Color.secondary.opacity(0.2))
+                )
+                .shadow(color: .black.opacity(0.25), radius: 22, y: 9)
+                .padding(14)
+        }
+        .zIndex(20)
     }
 
     private var cycleRangeLabel: String {
@@ -219,7 +302,7 @@ struct CompactDashboard: View {
                     .strokeBorder(Color.secondary.opacity(0.2))
             )
             .shadow(color: .black.opacity(0.22), radius: 18, y: 8)
-            .offset(x: 16, y: 72)
+            .offset(x: 16, y: 108)
         }
         .zIndex(10)
     }
@@ -278,67 +361,108 @@ struct CompactDashboard: View {
         return "\(Self.selectedDayFormatter.string(from: date)) · UTC"
     }
 
-    /// Clicking a card selects the currency shown in the menu bar (and across
-    /// the window). The cards are the most legible place to see both figures
-    /// side by side, so they are also the most natural place to pick one.
-    private var valueCards: some View {
-        HStack(spacing: 10) {
-            valueCard(
-                currency: .usd, title: "US dollars",
-                value: store.usdCostString(credits: store.compactTotalCredits),
-                detail: "100 credits = US$1")
-            valueCard(
-                currency: .aud, title: "Australian dollars",
-                value: store.audCostString(credits: store.compactTotalCredits),
-                detail: store.usdToAUD.map { String(format: "Live rate · %.4f", $0) } ?? "Exchange rate unavailable")
+    private var spendSummary: some View {
+        HStack(alignment: .top, spacing: 20) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 7) {
+                    Text(store.isViewingCurrentCreditCycle
+                         ? "SPENT THIS CYCLE" : "SPENT IN THIS CYCLE")
+                        .font(.system(size: 10, weight: .semibold))
+                        .tracking(0.7)
+                        .foregroundStyle(.secondary)
+                    if let updated = store.currentServerUsageSample?.capturedAt,
+                       store.isViewingCurrentCreditCycle {
+                        Circle()
+                            .fill(statusColor)
+                            .frame(width: 6, height: 6)
+                        Text("Updated \(relativeUpdatedLabel(updated))")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Text(store.displayCostString(credits: store.compactTotalCredits))
+                    .font(.system(size: 34, weight: .bold, design: .rounded))
+                    .monospacedDigit()
+                HStack(spacing: 7) {
+                    Text("\(Fmt.credits(store.compactTotalCredits)) premium credits")
+                        .font(.caption)
+                    if let cycle = store.selectedCreditCycle {
+                        Text("·")
+                        Text("\(store.isViewingCurrentCreditCycle ? "Resets" : "Ended") \(Self.resetFormatter.string(from: cycle.resetAt))")
+                            .font(.caption)
+                    }
+                }
+                .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            VStack(alignment: .trailing, spacing: 8) {
+                Picker("Display currency", selection: $store.displayCurrency) {
+                    ForEach(Currency.allCases, id: \.self) { currency in
+                        Text(currency.code).tag(currency)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 132)
+
+                Button {
+                    showingSpendCalendar = false
+                    showingModelPricing = true
+                } label: {
+                    Label("Model prices", systemImage: "tag")
+                        .frame(width: 112)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .tint(.accentColor)
+                .help("Compare current GitHub Copilot model token prices")
+
+                Button {
+                    showLegacy()
+                } label: {
+                    Label("Legacy telemetry", systemImage: "clock.arrow.circlepath")
+                }
+                .buttonStyle(.borderless)
+                .controlSize(.small)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .help("Open the previous telemetry-based interface unchanged")
+            }
+        }
+        .padding(16)
+        .background(
+            LinearGradient(
+                colors: [Color.primary.opacity(0.045), Color.accentColor.opacity(0.07)],
+                startPoint: .topLeading, endPoint: .bottomTrailing),
+            in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .strokeBorder(Color.secondary.opacity(0.16))
         }
     }
 
-    private func valueCard(
-        currency: Currency, title: String, value: String, detail: String
-    ) -> some View {
-        // Compare against effectiveCurrency, not displayCurrency: AUD falls back
-        // to USD until a rate loads, and the badge must show what the menu bar
-        // is actually displaying rather than what was requested.
-        let isMenuBar = store.effectiveCurrency == currency
-        let unavailable = currency == .aud && store.usdToAUD == nil
-        return Button {
-            store.displayCurrency = currency
-        } label: {
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(spacing: 5) {
-                    Text(title).font(.caption).foregroundStyle(.secondary)
-                    Spacer(minLength: 4)
-                    if isMenuBar {
-                        Label("Menu bar", systemImage: "menubar.rectangle")
-                            .font(.caption2.weight(.medium))
-                            .labelStyle(.titleAndIcon)
-                            .foregroundStyle(.tint)
-                    }
-                }
-                Text(value)
-                    .font(.title2.weight(.semibold))
-                    .monospacedDigit()
-                    .foregroundStyle(.primary)
-                Text(detail).font(.caption2).foregroundStyle(.tertiary)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(12)
-            .background(
-                Color.primary.opacity(isMenuBar ? 0.075 : 0.045),
-                in: RoundedRectangle(cornerRadius: 10))
-            .overlay(
-                RoundedRectangle(cornerRadius: 10)
-                    .strokeBorder(isMenuBar ? Color.accentColor : .clear, lineWidth: 1.5))
-            .contentShape(RoundedRectangle(cornerRadius: 10))
+    private func relativeUpdatedLabel(_ date: Date) -> String {
+        let seconds = max(0, Date().timeIntervalSince(date))
+        if seconds < 60 { return "just now" }
+        if seconds < 3_600 { return "\(Int(seconds / 60))m ago" }
+        return "\(Int(seconds / 3_600))h ago"
+    }
+
+    private var activityCard: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            dailyChartSection
+                .padding(14)
+            Divider()
+            dailySection
+                .padding(14)
         }
-        .buttonStyle(.plain)
-        .disabled(unavailable)
-        .help(unavailable
-              ? "Available once an exchange rate loads."
-              : (isMenuBar ? "Already shown in the menu bar"
-                           : "Show \(currency.code) in the menu bar"))
-        .accessibilityAddTraits(isMenuBar ? [.isSelected] : [])
+        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .strokeBorder(Color.secondary.opacity(0.16))
+        }
     }
 
     private var dailyChartSection: some View {
@@ -386,7 +510,7 @@ struct CompactDashboard: View {
         let timeline = store.creditTimeline
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Observed daily spend")
+                Text("Recent activity")
                     .font(.subheadline.weight(.semibold))
                 Spacer()
                 Text("UTC")
@@ -400,8 +524,7 @@ struct CompactDashboard: View {
             HStack {
                 Text("Day").frame(maxWidth: .infinity, alignment: .leading)
                 Text("Credits").frame(width: 90, alignment: .trailing)
-                Text("USD").frame(width: 75, alignment: .trailing)
-                Text("AUD").frame(width: 80, alignment: .trailing)
+                Text("Cost").frame(width: 90, alignment: .trailing)
             }
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
@@ -423,12 +546,9 @@ struct CompactDashboard: View {
                             Text(Fmt.credits(row.credits))
                                 .monospacedDigit()
                                 .frame(width: 90, alignment: .trailing)
-                            Text(store.usdCostString(credits: row.credits))
+                            Text(store.displayCostString(credits: row.credits))
                                 .monospacedDigit()
-                                .frame(width: 75, alignment: .trailing)
-                            Text(store.audCostString(credits: row.credits))
-                                .monospacedDigit()
-                                .frame(width: 80, alignment: .trailing)
+                                .frame(width: 90, alignment: .trailing)
                         }
                         .font(.callout)
                         .padding(.vertical, 5)
@@ -464,8 +584,8 @@ struct CompactDashboard: View {
             Text(store.serverUsageStatusLabel)
                 .font(.caption2)
                 .foregroundStyle(store.serverUsageError == nil ? Color.secondary : Color.red)
-            if let updated = store.lastUpdated {
-                Text("· updated \(Fmt.dateTime(Int64(updated.timeIntervalSince1970 * 1000)))")
+            if let updated = store.currentServerUsageSample?.capturedAt {
+                Text("· GitHub updated \(Fmt.dateTime(Int64(updated.timeIntervalSince1970 * 1000)))")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
@@ -492,7 +612,7 @@ struct CompactDashboard: View {
     private var statusColor: Color {
         if store.serverUsageError != nil { return .red }
         guard store.serverUsageEnabled else { return .orange }
-        if store.serverUsageSample == nil || store.serverUsageIsStale { return .orange }
+        if store.currentServerUsageSample == nil || store.serverUsageIsStale { return .orange }
         return .green
     }
 
@@ -800,75 +920,318 @@ private struct SpendHistoryCalendar: View {
 
 private struct CompactBudgetBar: View {
     @EnvironmentObject var store: UsageStore
-    private let budgetMarkerFraction = 0.70
+    @State private var isEditingHistoricalBudget = false
+    @State private var historicalBudgetText = ""
+    @State private var historicalBudgetError: String?
+    @State private var isSavingHistoricalBudget = false
+    private static let barHeight: CGFloat = 10
+    private static let chevronGutter: CGFloat = 7
+    private static let labelWidth: CGFloat = 142
+    private static let caretGap: CGFloat = 7
+    private static let budgetMonthFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMMM"
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        return formatter
+    }()
 
     var body: some View {
         let spent = store.compactTotalCredits
-        let budget = store.monthlyBudget * 100
+        let budgetUSD = store.compactBudgetUSD
+        let budget = (budgetUSD ?? 0) * 100
         let projection = store.compactSpendProjection
         let hasBudget = budget > 0
-        let maximum = hasBudget
-            ? budget / budgetMarkerFraction
-            : max(spent, projection?.projectedCredits ?? 0, 1)
-        let over = hasBudget && spent > budget
 
-        VStack(alignment: .leading, spacing: 7) {
-            HStack {
-                Text(store.isViewingCurrentCreditCycle
-                     ? "This cycle’s spend" : "Selected cycle’s spend")
-                    .font(.subheadline.weight(.semibold))
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Monthly budget")
+                        .font(.subheadline.weight(.semibold))
+                    if let budgetUSD, hasBudget {
+                        Text("\(store.displayCostString(credits: spent)) of \(store.budgetMoneyString(usd: budgetUSD))")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .monospacedDigit()
+                    } else if store.canAssignMissingBudgetForSelectedCreditCycle {
+                        Text("The budget wasn’t captured for \(selectedCycleMonthLabel).")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else if budgetUSD == nil {
+                        Text("No budget was recorded for this older cycle.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else if store.isViewingCurrentCreditCycle {
+                        Text("Set a target in Settings to compare your current pace.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("This cycle was recorded without a budget.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Spacer()
-                Text(hasBudget
-                     ? "\(store.budgetMoneyString(usd: store.monthlyBudget)) budget"
-                     : "No budget set")
+                if store.isViewingCurrentCreditCycle {
+                    Group {
+                        if hasBudget {
+                            Text("\(Int((spent / budget * 100).rounded()))% used")
+                                .monospacedDigit()
+                        } else {
+                            Text("No budget set")
+                        }
+                    }
                     .font(.caption)
                     .foregroundStyle(.secondary)
-            }
-
-            GeometryReader { geometry in
-                let width = geometry.size.width
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.secondary.opacity(0.14))
-                    if let projection {
-                        Capsule()
-                            .fill((projection.overBudget ? Color.red : Color.green).opacity(0.18))
-                            .frame(width: width * min(projection.projectedCredits / maximum, 1))
+                } else {
+                    HStack(spacing: 9) {
+                        if hasBudget {
+                            Text("\(Int((spent / budget * 100).rounded()))% used")
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                        }
+                        if store.canAssignMissingBudgetForSelectedCreditCycle,
+                           !isEditingHistoricalBudget {
+                            Button("Add \(selectedCycleMonthLabel) budget") {
+                                beginEditingHistoricalBudget()
+                            }
+                            .buttonStyle(.plain)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .disabled(store.isLoadingCreditCycle)
+                            .help("Supply the one budget missed before automatic snapshots began")
+                        }
                     }
-                    Capsule()
-                        .fill(over ? Color.red : Color.green)
-                        .frame(width: width * min(spent / maximum, 1))
-                    if hasBudget {
-                        Rectangle()
-                            .fill(Color.orange)
-                            .frame(width: 2, height: 18)
-                            .offset(x: width * budgetMarkerFraction - 1)
-                    }
+                    .font(.caption)
                 }
             }
-            .frame(height: 18)
 
-            HStack {
-                Text("\(store.usdCostString(credits: spent)) USD")
-                    .fontWeight(.medium)
-                    .foregroundStyle(over ? Color.red : Color.primary)
-                Text("· \(store.audCostString(credits: spent)) AUD")
-                    .foregroundStyle(.secondary)
-                Spacer()
-                if let projection {
-                    // The bar clamps at the top of the overflow region (~143% of
-                    // budget), so past that every overrun looks identical. The
-                    // percentage keeps the saturated case quantified.
-                    Text(hasBudget
-                         ? "Projected \(store.displayCostString(credits: projection.projectedCredits)) · \(Int(projection.pctOfBudget.rounded()))% of budget"
-                         : "Projected \(store.displayCostString(credits: projection.projectedCredits))")
-                        .foregroundStyle(projection.overBudget ? Color.red : Color.secondary)
-                }
+            if isEditingHistoricalBudget {
+                historicalBudgetEditor
             }
-            .font(.caption)
-            .monospacedDigit()
+
+            if let budgetUSD, budgetUSD > 0 {
+                budgetMeter(
+                    spent: spent,
+                    budget: budget,
+                    budgetUSD: budgetUSD,
+                    projection: projection
+                )
+            }
         }
         .padding(12)
         .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(Color.secondary.opacity(0.14))
+        }
+        .onChange(of: store.selectedCreditCycleDayMs) { _ in
+            isEditingHistoricalBudget = false
+            historicalBudgetError = nil
+            isSavingHistoricalBudget = false
+        }
+        .onChange(of: store.displayCurrency) { _ in
+            if isEditingHistoricalBudget { beginEditingHistoricalBudget() }
+        }
+        .onChange(of: store.usdToAUD) { _ in
+            if isEditingHistoricalBudget { beginEditingHistoricalBudget() }
+        }
+    }
+
+    private var historicalBudgetEditor: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 7) {
+                Text("\(selectedCycleMonthLabel) budget")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(store.effectiveCurrency.symbol)
+                    .foregroundStyle(.secondary)
+                BudgetField(
+                    text: $historicalBudgetText,
+                    onCommit: commitHistoricalBudget
+                )
+                .frame(width: 92, height: 22)
+                Button("Save", action: commitHistoricalBudget)
+                    .disabled(
+                        historicalBudgetText.trimmingCharacters(in: .whitespaces).isEmpty
+                            || isSavingHistoricalBudget
+                            || store.isLoadingCreditCycle
+                    )
+                Button("Cancel") {
+                    isEditingHistoricalBudget = false
+                    historicalBudgetError = nil
+                }
+                .disabled(isSavingHistoricalBudget)
+                if isSavingHistoricalBudget {
+                    ProgressView().controlSize(.small)
+                }
+            }
+            if let historicalBudgetError {
+                Text(historicalBudgetError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        }
+    }
+
+    private func budgetMeter(
+        spent: Double,
+        budget: Double,
+        budgetUSD: Double,
+        projection: SpendProjection?
+    ) -> some View {
+        let maximum = budget
+        let over = spent > budget
+        return VStack(alignment: .leading, spacing: 0) {
+            GeometryReader { geometry in
+                let width = geometry.size.width
+                let currentReach = width * min(spent / maximum, 1)
+                ZStack(alignment: .leading) {
+                    Capsule().fill(Color.secondary.opacity(0.16))
+                    if let projection {
+                        let reach = width * min(projection.projectedCredits / maximum, 1)
+                        Capsule()
+                            .fill(projectionColor(projection).opacity(0.28))
+                            .frame(width: reach)
+                        if projection.projectedCredits <= maximum {
+                            Capsule()
+                                .fill(projectionColor(projection).opacity(0.9))
+                                .frame(width: 2)
+                                .offset(x: max(0, reach - 2))
+                        }
+                    }
+                    Capsule()
+                        .fill(over ? Color.red : Color.accentColor)
+                        .frame(width: spent > 0 ? max(Self.barHeight, currentReach) : 0)
+                }
+                .overlay(alignment: .leading) {
+                    if let projection, projection.projectedCredits > maximum {
+                        let overPercent = projection.projectedCredits / maximum * 100 - 100
+                        let count = overPercent >= 75 ? 3 : (overPercent >= 25 ? 2 : 1)
+                        HStack(spacing: -2) {
+                            ForEach(0..<count, id: \.self) { _ in
+                                Text("›").font(.system(size: 13, weight: .bold))
+                            }
+                        }
+                        .foregroundStyle(projectionColor(projection))
+                        .fixedSize()
+                        .offset(x: width + 3)
+                    }
+                }
+            }
+            .frame(height: Self.barHeight)
+            .padding(.trailing, Self.chevronGutter)
+
+            if let projection, projection.projectedCredits > maximum {
+                Text(projectionLabel(projection))
+                    .font(.system(size: 9, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundStyle(projectionColor(projection))
+                    .padding(.top, 3)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    .help(projectionHelp(projection))
+            } else if let projection {
+                GeometryReader { geometry in
+                    let fraction = min(1, projection.projectedCredits / maximum)
+                    let x = geometry.size.width * fraction
+                    let flip = x + Self.caretGap + Self.labelWidth > geometry.size.width
+                    ZStack(alignment: .topLeading) {
+                        Text("▲")
+                            .font(.system(size: 7))
+                            .offset(x: max(0, x - 3))
+                        Text(projectionLabel(projection))
+                            .font(.system(size: 9, weight: .medium))
+                            .monospacedDigit()
+                            .frame(width: Self.labelWidth, alignment: flip ? .trailing : .leading)
+                            .offset(x: flip
+                                ? x - Self.labelWidth - Self.caretGap
+                                : x + Self.caretGap)
+                    }
+                    .foregroundStyle(projectionColor(projection))
+                    .help(projectionHelp(projection))
+                }
+                .frame(height: 12)
+                .padding(.trailing, Self.chevronGutter)
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Monthly budget")
+        .accessibilityValue(accessibilityValue(
+            spent: spent,
+            budgetUSD: budgetUSD,
+            projection: projection
+        ))
+    }
+
+    private func beginEditingHistoricalBudget() {
+        let budgetUSD = store.compactBudgetUSD ?? store.monthlyBudget
+        if store.effectiveCurrency == .aud, let rate = store.usdToAUD {
+            historicalBudgetText = String(Int((budgetUSD * rate).rounded()))
+        } else {
+            historicalBudgetText = Fmt.money(budgetUSD)
+                .replacingOccurrences(of: "$", with: "")
+        }
+        historicalBudgetError = nil
+        isEditingHistoricalBudget = true
+    }
+
+    private func commitHistoricalBudget() {
+        let value: Double
+        switch BudgetInput.parse(historicalBudgetText) {
+        case .invalid:
+            historicalBudgetError = "Enter a number, for example 500."
+            return
+        case .tooLarge:
+            historicalBudgetError = "That looks like a typo — the maximum is \(store.effectiveCurrency.symbol)\(BudgetInput.maximumText)."
+            return
+        case .ok(let parsed):
+            if store.effectiveCurrency == .aud, let rate = store.usdToAUD, rate > 0 {
+                value = parsed / rate
+            } else {
+                value = parsed
+            }
+        }
+
+        historicalBudgetError = nil
+        isSavingHistoricalBudget = true
+        Task {
+            let saved = await store.assignMissingBudgetForSelectedCreditCycle(value)
+            isSavingHistoricalBudget = false
+            if saved {
+                isEditingHistoricalBudget = false
+            } else {
+                historicalBudgetError = "The budget could not be saved. Try again."
+            }
+        }
+    }
+
+    private var selectedCycleMonthLabel: String {
+        guard let start = store.selectedCreditCycle?.startAt else {
+            return "previous cycle"
+        }
+        return Self.budgetMonthFormatter.string(from: start)
+    }
+
+    private func projectionColor(_ projection: SpendProjection) -> Color {
+        projection.overBudget ? .red : .secondary
+    }
+
+    private func projectionLabel(_ projection: SpendProjection) -> String {
+        "projected \(store.displayCostString(credits: projection.projectedCredits))"
+    }
+
+    private func projectionHelp(_ projection: SpendProjection) -> String {
+        let basis = projection.excludesWeekends ? "working-day" : "calendar-day"
+        return "Projected to \(projection.endLabel) from the current \(basis) pace."
+    }
+
+    private func accessibilityValue(
+        spent: Double, budgetUSD: Double, projection: SpendProjection?
+    ) -> String {
+        var parts = ["\(store.displayCostString(credits: spent)) spent"]
+        parts.append("\(store.budgetMoneyString(usd: budgetUSD)) budget")
+        if let projection { parts.append(projectionLabel(projection)) }
+        return parts.joined(separator: ", ")
     }
 }
 

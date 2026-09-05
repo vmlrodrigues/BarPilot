@@ -8,7 +8,6 @@
     "generatedAt",
     "pricingUnit",
     "source",
-    "communityPreferenceSource",
     "modelCount",
     "models"
   ],
@@ -36,6 +35,18 @@
       "items": { "$ref": "#/$defs/model" }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "models": {
+            "contains": { "required": ["communityPreference"] }
+          }
+        }
+      },
+      "then": { "required": ["communityPreferenceSource"] }
+    }
+  ],
   "$defs": {
     "communityPreferenceSource": {
       "type": "object",

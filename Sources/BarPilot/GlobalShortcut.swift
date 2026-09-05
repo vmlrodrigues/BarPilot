@@ -167,11 +167,17 @@ struct GlobalShortcut: Codable, Equatable {
         } else {
             check(false, "persistence round trip")
         }
-        if let registrationProbe = validated(
+        let registrationProbe = validated(
             keyCode: 90,
             modifiers: [.control, .option, .shift, .command],
             keyLabel: "F20"
-        ) {
+        )
+        check(registrationProbe != nil, "registration probe is valid")
+        // Carbon registration depends on an interactive WindowServer session.
+        // Keep it available as an explicit local integration probe, while the
+        // default verification remains deterministic on headless CI runners.
+        if ProcessInfo.processInfo.environment["BARPILOT_VERIFY_LIVE_SHORTCUT"] == "1",
+           let registrationProbe {
             let first = GlobalHotKeyRegistrar()
             let second = GlobalHotKeyRegistrar()
             let firstStatus = first.register(registrationProbe, identifier: 1)
@@ -189,8 +195,6 @@ struct GlobalShortcut: Codable, Equatable {
                 )
                 second.unregister()
             }
-        } else {
-            check(false, "registration probe is valid")
         }
 
         let previous = valid!
@@ -502,7 +506,10 @@ final class GlobalShortcutController: ObservableObject {
     }
 }
 
-private final class GlobalHotKeyRegistrar: GlobalHotKeyRegistering {
+/// Carbon invokes its handler on the application event loop. The callback and
+/// every mutation of this registrar are therefore main-thread confined, but the
+/// legacy C API cannot express that contract to Swift's Sendable checker.
+private final class GlobalHotKeyRegistrar: GlobalHotKeyRegistering, @unchecked Sendable {
     private static let signature: OSType = 0x42504C54 // "BPLT"
 
     var onPress: (@MainActor (UInt32) -> Void)?
@@ -662,19 +669,21 @@ final class ShortcutRecorderButton: NSButton {
 
     override var acceptsFirstResponder: Bool { true }
 
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
         if let windowResignObserver {
             NotificationCenter.default.removeObserver(windowResignObserver)
             self.windowResignObserver = nil
         }
-        guard let window else { return }
+        guard let newWindow else { return }
         windowResignObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification,
-            object: window,
+            object: newWindow,
             queue: .main
         ) { [weak self] _ in
-            self?.cancelIfRecording()
+            Task { @MainActor [weak self] in
+                self?.cancelIfRecording()
+            }
         }
     }
 
@@ -745,9 +754,4 @@ final class ShortcutRecorderButton: NSButton {
             : "Click, then press a shortcut using at least two modifiers."
     }
 
-    deinit {
-        if let windowResignObserver {
-            NotificationCenter.default.removeObserver(windowResignObserver)
-        }
-    }
 }

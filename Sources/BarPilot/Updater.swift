@@ -10,8 +10,9 @@ import AppKit
 // accepted by Gatekeeper, then swaps the app bundle in place and relaunches —
 // no UI, no extra dependencies.
 //
-// Gated to Developer ID-signed builds (real releases); ad-hoc/dev builds are
-// skipped, so development is never disrupted.
+// Gated to release-channel, Developer ID-signed builds. Local bundles also use
+// a stable Developer ID signature for Keychain continuity, but remain explicitly
+// marked as development builds so development is never disrupted.
 // ---------------------------------------------------------------------------
 
 final class Updater {
@@ -25,7 +26,7 @@ final class Updater {
     @MainActor
     func start() {
         guard !Self.isDevBuild else {
-            NSLog("BarPilot: auto-update disabled (not a Developer ID build)")
+            NSLog("BarPilot: auto-update disabled (development build)")
             return
         }
         Self.checkNow(afterSeconds: 20)
@@ -35,6 +36,10 @@ final class Updater {
     }
 
     static func checkNow(afterSeconds delay: TimeInterval = 0) {
+        guard !isDevBuild else {
+            NSLog("BarPilot: update check skipped (development build)")
+            return
+        }
         Task.detached(priority: .background) {
             if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
             await performCheck()
@@ -214,8 +219,14 @@ final class Updater {
         return out.contains("TeamIdentifier=\(teamID)") && out.contains("Authority=Developer ID Application")
     }
 
-    /// Cached once: true for ad-hoc / local (`build-app.sh`) builds that are NOT
-    /// Developer ID-signed. Drives the in-app "DEV" markers so a local build is
-    /// always identifiable. Computed lazily on first access (one `codesign` call).
-    static let isDevBuild: Bool = !isDeveloperIDSigned()
+    /// Cached once. New bundles carry an explicit channel because signature type
+    /// cannot distinguish a release from a stable-signed local build. The signing
+    /// check remains as a safe fallback for older bundles and `swift run`.
+    static let isDevBuild: Bool = {
+        if let channel = Bundle.main.infoDictionary?["BarPilotBuildChannel"] as? String {
+            guard channel == "release" else { return true }
+            return !isDeveloperIDSigned()
+        }
+        return !isDeveloperIDSigned()
+    }()
 }

@@ -15,11 +15,48 @@ import AppKit
 /// Actions the settings window needs from the AppDelegate, which owns the
 /// device flows, alerts and panels.
 struct SettingsActions {
+    var close: () -> Void
     var connectGitHub: () -> Void
     var disconnectGitHub: () -> Void
     var toggleSync: () -> Void
     var checkForUpdates: () -> Void
     var saveDiagnostics: () -> Void
+}
+
+private enum SettingsPane: String, CaseIterable, Identifiable {
+    case general
+    case spending
+    case github
+    case support
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .general: return "General"
+        case .spending: return "Spending"
+        case .github: return "GitHub"
+        case .support: return "Updates & Support"
+        }
+    }
+
+    var subtitle: String {
+        switch self {
+        case .general: return "Control how BarPilot starts and how quickly you can reach it."
+        case .spending: return "Choose the currency you see and the budget you want to track."
+        case .github: return "Manage the account used for usage data and optional cross-device sync."
+        case .support: return "Keep BarPilot current or collect information for troubleshooting."
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .general: return "slider.horizontal.3"
+        case .spending: return "creditcard"
+        case .github: return "person.crop.circle"
+        case .support: return "lifepreserver"
+        }
+    }
 }
 
 struct SettingsView: View {
@@ -30,28 +67,102 @@ struct SettingsView: View {
     @State private var budgetText: String = ""
     @State private var budgetError: String?
     @State private var startAtLogin: Bool = LoginItem.isEnabled
+    @State private var selectedPane: SettingsPane = .general
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            budgetSection
+        HStack(spacing: 0) {
+            sidebar
             Divider()
-            currencySection
-            Divider()
-            accountSection
-            Divider()
-            generalSection
+            VStack(alignment: .leading, spacing: 20) {
+                HStack(alignment: .top, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(selectedPane.title)
+                            .font(.system(size: 22, weight: .semibold))
+                        Text(selectedPane.subtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Done", action: actions.close)
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                }
+                selectedPaneContent
+                Spacer(minLength: 0)
+            }
+            .padding(28)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
-        .padding(20)
-        .frame(width: 460)
-        // No ScrollView and no min/max height: the hosting controller then sizes
-        // the window to exactly fit the content, instead of padding it out with
-        // dead space at the bottom.
-        .fixedSize(horizontal: false, vertical: true)
-        .onAppear { budgetText = currentBudgetText }
+        .frame(width: 740, height: 470)
+        .onAppear {
+            budgetText = currentBudgetText
+            startAtLogin = LoginItem.isEnabled
+        }
         // The budget is stored in USD, so switching currency must restate the
         // field in the newly selected one rather than leave a stale number.
         .onChange(of: store.displayCurrency) { _ in budgetText = currentBudgetText }
         .onChange(of: store.usdToAUD) { _ in budgetText = currentBudgetText }
+    }
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 9) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(Color.accentColor.gradient)
+                    Image(systemName: "chart.line.uptrend.xyaxis")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.white)
+                }
+                .frame(width: 32, height: 32)
+                VStack(alignment: .leading, spacing: 0) {
+                    Text("BarPilot").font(.subheadline.weight(.semibold))
+                    Text("Copilot usage monitor")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.bottom, 12)
+
+            ForEach(SettingsPane.allCases) { pane in
+                Button {
+                    selectedPane = pane
+                } label: {
+                    Label(pane.title, systemImage: pane.symbol)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 8)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(selectedPane == pane ? Color.primary : Color.secondary)
+                .background(
+                    selectedPane == pane ? Color.primary.opacity(0.08) : Color.clear,
+                    in: RoundedRectangle(cornerRadius: 7)
+                )
+            }
+
+            Spacer()
+            Text("BarPilot \(Updater.currentVersion())\(Updater.isDevBuild ? " · Development" : "")")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .padding(.horizontal, 8)
+        }
+        .padding(12)
+        .frame(width: 190)
+        .frame(maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.primary.opacity(0.025))
+    }
+
+    @ViewBuilder
+    private var selectedPaneContent: some View {
+        switch selectedPane {
+        case .general: generalPane
+        case .spending: spendingPane
+        case .github: githubPane
+        case .support: supportPane
+        }
     }
 
     /// A label-plus-switch row where the switch always sits hard right, so the
@@ -74,40 +185,79 @@ struct SettingsView: View {
                 .toggleStyle(.switch)
                 .labelsHidden()
         }
+        .padding(14)
     }
 
-    // -- Budget --------------------------------------------------------------
+    private var spendingPane: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            settingsGroup {
+                VStack(spacing: 0) {
+                    HStack(spacing: 16) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Display currency")
+                            Text("Used consistently across the dashboard, forecasts and model prices.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Picker("Display currency", selection: $store.displayCurrency) {
+                            ForEach(Currency.allCases, id: \.self) { currency in
+                                Text(currency.code).tag(currency)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .labelsHidden()
+                        .frame(width: 132)
+                    }
+                    .padding(14)
 
-    private var budgetSection: some View {
-        section("Monthly budget", "Your Copilot spend target per month. It is pro-rated across the days in the period being shown.") {
-            HStack(spacing: 8) {
-                Text(store.effectiveCurrency.symbol)
-                    .foregroundStyle(.secondary)
-                BudgetField(text: $budgetText, onCommit: commitBudget)
-                    .frame(width: 120, height: 22)
-                Text("per month")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Set", action: commitBudget)
-                    .disabled(budgetText.trimmingCharacters(in: .whitespaces).isEmpty)
+                    Divider().padding(.leading, 14)
+
+                    HStack(alignment: .center, spacing: 16) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Monthly budget")
+                            Text(budgetDetail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 12)
+                        HStack(spacing: 7) {
+                            Text(store.effectiveCurrency.symbol)
+                                .foregroundStyle(.secondary)
+                            BudgetField(text: $budgetText, onCommit: commitBudget)
+                                .frame(width: 92, height: 22)
+                            Button("Set", action: commitBudget)
+                                .disabled(budgetText.trimmingCharacters(in: .whitespaces).isEmpty)
+                        }
+                    }
+                    .padding(14)
+
+                    Divider().padding(.leading, 14)
+
+                    switchRow(
+                        "Exclude weekends from the forecast",
+                        "Project future spend across working days only. Weekend spend already made still counts.",
+                        isOn: $store.excludeWeekendsFromProjection
+                    )
+                }
             }
+
             if let budgetError {
-                Text(budgetError).font(.caption).foregroundStyle(.red)
-            } else if store.effectiveCurrency == .aud {
-                Text("Stored as \(Fmt.money(store.monthlyBudget)) US and converted for display, so the target doesn't move when the exchange rate does.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                statusNote(budgetError, color: .red)
+            } else if let persistenceError = store.budgetPersistenceError {
+                statusNote(persistenceError, color: .red)
+            } else if store.displayCurrency == .aud && store.usdToAUD == nil {
+                statusNote("Showing US dollars until an exchange rate loads.", color: .orange)
             }
-
-            Divider()
-
-            switchRow(
-                "Exclude weekends from the forecast",
-                "Projects month-end spend across working days only, so a five-day week isn't forecast as seven. Weekend spend you have already made still counts.",
-                isOn: $store.excludeWeekendsFromProjection
-            )
         }
+    }
+
+    private var budgetDetail: String {
+        if store.effectiveCurrency == .aud {
+            return "Stored as \(Fmt.money(store.monthlyBudget)) US and converted for display so the target remains stable."
+        }
+        return "Your Copilot spend target, pro-rated for the period being shown."
     }
 
     private var currentBudgetText: String {
@@ -134,63 +284,54 @@ struct SettingsView: View {
         }
     }
 
-    // -- Currency ------------------------------------------------------------
-
-    private var currencySection: some View {
-        section("Currency", "Sets the currency used in the menu bar and throughout the usage window. You can also switch this by clicking a currency card in the usage window.") {
-            Picker("", selection: $store.displayCurrency) {
-                ForEach(Currency.allCases, id: \.self) { c in
-                    Text(c.menuLabel).tag(c)
-                }
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            if store.displayCurrency == .aud && store.usdToAUD == nil {
-                Text("Showing US dollars until an exchange rate loads.")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-            }
-        }
-    }
-
-    // -- Account -------------------------------------------------------------
-
-    private var accountSection: some View {
-        section("GitHub", "BarPilot reads your account-wide credit total from GitHub. Without it the figure is estimated from local telemetry and reads low.") {
-            HStack(spacing: 10) {
-                Image(systemName: store.serverUsageEnabled
-                      ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
-                    .foregroundStyle(store.serverUsageEnabled ? .green : .orange)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(store.serverUsageEnabled ? "Connected" : "Not connected")
-                        .font(.subheadline.weight(.medium))
-                    if let error = store.serverUsageError {
-                        Text(error).font(.caption).foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
+    private var githubPane: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            settingsGroup {
+                VStack(spacing: 0) {
+                    HStack(spacing: 11) {
+                        Image(systemName: store.serverUsageEnabled
+                              ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                            .font(.title3)
+                            .foregroundStyle(store.serverUsageEnabled ? .green : .orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(store.serverUsageEnabled ? "GitHub connected" : "GitHub not connected")
+                                .font(.subheadline.weight(.medium))
+                            Text(store.serverUsageError
+                                 ?? "Account-wide credit usage is used for the authoritative total.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer()
+                        if store.isConnectingServerUsage {
+                            HStack(spacing: 6) {
+                                ProgressView().controlSize(.small)
+                                Button("Cancel") { store.cancelServerUsageConnection() }
+                            }
+                        } else if store.serverUsageEnabled {
+                            Button("Disconnect", action: actions.disconnectGitHub)
+                        } else {
+                            Button("Connect…", action: actions.connectGitHub)
+                                .buttonStyle(.borderedProminent)
+                        }
                     }
-                }
-                Spacer()
-                if store.isConnectingServerUsage {
-                    HStack(spacing: 6) {
-                        ProgressView().controlSize(.small)
-                        Button("Cancel") { store.cancelServerUsageConnection() }
-                    }
-                } else if store.serverUsageEnabled {
-                    Button("Disconnect", action: actions.disconnectGitHub)
-                } else {
-                    Button("Connect…", action: actions.connectGitHub)
-                        .buttonStyle(.borderedProminent)
+                    .padding(14)
+
+                    Divider().padding(.leading, 14)
+
+                    switchRow("Multi-machine sync", syncDetail, isOn: Binding(
+                        get: { store.syncEnabled },
+                        set: { _ in actions.toggleSync() }
+                    ))
                 }
             }
-
-            switchRow("Multi-machine sync", syncDetail, isOn: Binding(
-                get: { store.syncEnabled },
-                set: { _ in actions.toggleSync() }
-            ))
             if let error = store.syncError {
-                Text(error).font(.caption).foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
+                statusNote(error, color: .orange)
             }
+            infoNote(
+                symbol: "lock.shield",
+                text: "Sync stores usage totals only. Credentials remain in the macOS Keychain."
+            )
         }
     }
 
@@ -204,94 +345,136 @@ struct SettingsView: View {
         return "Authorized as \(who). \(others) other Mac\(others == 1 ? "" : "s") contributing readings."
     }
 
-    // -- General -------------------------------------------------------------
-
-    private var generalSection: some View {
-        section("General", nil) {
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Usage window shortcut")
-                    Text("Show or hide BarPilot from any app. Use at least two modifiers.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer(minLength: 12)
-                ShortcutRecorder(
-                    shortcut: shortcutController.pendingShortcut
-                        ?? shortcutController.shortcut,
-                    isRecording: shortcutController.isRecording,
-                    beginRecording: shortcutController.beginRecording,
-                    cancelRecording: shortcutController.cancelRecording,
-                    assign: shortcutController.assign,
-                    reportInvalid: shortcutController.reportInvalidCombination
-                )
-                .frame(width: 132, height: 24)
-                Button("Clear") { shortcutController.clear() }
-                    .disabled(
-                        shortcutController.shortcut == nil
-                            || shortcutController.isRecording
+    private var generalPane: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            settingsGroup {
+                VStack(spacing: 0) {
+                    switchRow(
+                        "Start at login",
+                        "Open BarPilot automatically when you log in.",
+                        isOn: Binding(
+                            get: { startAtLogin },
+                            set: { _ in
+                                LoginItem.toggle()
+                                startAtLogin = LoginItem.isEnabled
+                            }
+                        )
                     )
-            }
-            Group {
-                if let message = shortcutController.confirmationMessage {
-                    Text(message).foregroundStyle(.blue)
-                } else if let error = shortcutController.errorMessage {
-                    Text(error).foregroundStyle(.orange)
-                } else {
-                    Text("Shortcut status").hidden()
+
+                    Divider().padding(.leading, 14)
+
+                    HStack(alignment: .center, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Usage window shortcut")
+                            Text("Show or hide BarPilot from any app. Use at least two modifiers.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer(minLength: 12)
+                        ShortcutRecorder(
+                            shortcut: shortcutController.pendingShortcut
+                                ?? shortcutController.shortcut,
+                            isRecording: shortcutController.isRecording,
+                            beginRecording: shortcutController.beginRecording,
+                            cancelRecording: shortcutController.cancelRecording,
+                            assign: shortcutController.assign,
+                            reportInvalid: shortcutController.reportInvalidCombination
+                        )
+                        .frame(width: 132, height: 24)
+                        Button("Clear") { shortcutController.clear() }
+                            .disabled(
+                                shortcutController.shortcut == nil
+                                    || shortcutController.isRecording
+                            )
+                    }
+                    .padding(14)
                 }
             }
-                    .font(.caption)
-                    .fixedSize(horizontal: false, vertical: true)
 
-            Divider()
-
-            switchRow("Start at login", "Open BarPilot automatically when you log in.",
-                      isOn: Binding(
-                          get: { startAtLogin },
-                          set: { _ in
-                              LoginItem.toggle()
-                              // Reflect what the system actually did:
-                              // registration can be refused, and a switch that
-                              // lies is worse than no switch.
-                              startAtLogin = LoginItem.isEnabled
-                          }
-                      ))
-
-            HStack(spacing: 10) {
-                Button("Check for Updates", action: actions.checkForUpdates)
-                Button("Save Diagnostics…", action: actions.saveDiagnostics)
-                    .help("Save a support report — timings and counts only, no code, prompts or account details.")
-                Spacer()
+            if let message = shortcutController.confirmationMessage {
+                statusNote(message, color: .blue)
+            } else if let error = shortcutController.errorMessage {
+                statusNote(error, color: .orange)
             }
-            .padding(.top, 2)
-
-            Text("BarPilot \(Updater.currentVersion())\(Updater.isDevBuild ? " (development build — auto-update disabled)" : "")")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .padding(.top, 12)
+            infoNote(
+                symbol: "menubar.rectangle",
+                text: "BarPilot remains a menu-bar app. Starting it at login does not add a Dock icon."
+            )
         }
     }
 
-    // -- Layout --------------------------------------------------------------
+    private var supportPane: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            settingsGroup {
+                VStack(spacing: 0) {
+                    HStack(spacing: 16) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Software updates")
+                            Text("You are running BarPilot \(Updater.currentVersion())\(Updater.isDevBuild ? " (development build)." : ".")")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Check for Updates", action: actions.checkForUpdates)
+                    }
+                    .padding(14)
 
-    @ViewBuilder
-    private func section<Content: View>(
-        _ title: String, _ subtitle: String?, @ViewBuilder content: () -> Content
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(title).font(.headline)
-                if let subtitle {
-                    Text(subtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    Divider().padding(.leading, 14)
+
+                    HStack(spacing: 16) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Diagnostics")
+                            Text("Save a support report you can inspect before sharing.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Save Diagnostics…", action: actions.saveDiagnostics)
+                            .help("Save timings and counts only — no code, prompts or account details.")
+                    }
+                    .padding(14)
                 }
             }
-            content()
+            infoNote(
+                symbol: "lock.doc",
+                text: "Diagnostic exports omit credentials, monetary figures and credit totals."
+            )
         }
+    }
+
+    @ViewBuilder
+    private func settingsGroup<Content: View>(
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        content()
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .strokeBorder(Color.secondary.opacity(0.18))
+            }
+    }
+
+    private func infoNote(symbol: String, text: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: symbol)
+                .foregroundStyle(.tint)
+                .frame(width: 16)
+            Text(text)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.025), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func statusNote(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(color)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 2)
     }
 }
 
@@ -392,7 +575,7 @@ struct BudgetField: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
-    final class Coordinator: NSObject, NSTextFieldDelegate {
+    @MainActor final class Coordinator: NSObject, NSTextFieldDelegate {
         var parent: BudgetField
         /// Last value seen on the binding, so updateNSView can tell an external
         /// change from an echo of the user's own typing.

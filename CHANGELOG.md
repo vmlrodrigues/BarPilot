@@ -4,11 +4,39 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+## [0.11.0] — 2026-09-05
+
 ### Added
 - **Validated daily model-pricing catalogue pipeline.** GitHub Actions now
-  normalizes the public Copilot pricing source into a versioned JSON contract,
-  rejects malformed or unexpectedly incomplete updates, and preserves the last
-  successful GitHub Pages deployment when validation fails. (#52)
+  combines the public Copilot pricing source with LM Arena's overall,
+  text-style-controlled community leaderboard in a versioned JSON contract.
+  The model-prices dialogue shows sortable ranks and per-mode ratings and vote
+  counts; unmatched models remain explicitly unranked. Strict validation and
+  licence checks preserve the last successful Pages deployment when an upstream
+  fetch or contract changes unexpectedly. (#52)
+- **Historical billing cycles retain their own budget target.** New credit
+  observations snapshot the active USD target, completed cycles use that value
+  for their percentage and meter, and one subtle migration affordance fills the
+  immediately preceding missed cycle once without becoming a historical budget
+  editor. (#55)
+
+### Changed
+- **Redesigned the primary dashboard and Settings window.** The selected-currency
+  spend is now the main cycle summary, model pricing remains prominent, legacy
+  telemetry stays available without competing with the current view, and the
+  budget meter shows its projected extent with an anchored forecast marker.
+  Settings is organised into General, Spending, GitHub, and Updates & Support,
+  with Start at Login first and an explicit Done action. (#54)
+
+### Fixed
+- **Layered popovers now handle Escape consistently.** Escape dismisses the
+  calendar or model-pricing surface that currently owns keyboard focus before it
+  can close the primary menu-bar popover. Model-price sorting is also persisted,
+  with a visible reset action for returning to the curated default order.
+- **Credentials remain Keychain-backed without repeated development prompts.**
+  Legacy plaintext preferences are removed, local bundles keep a stable signing
+  identity when available, and signed development builds remain clearly marked
+  with automatic updates disabled.
 
 ## [0.10.7] — 2026-09-02
 

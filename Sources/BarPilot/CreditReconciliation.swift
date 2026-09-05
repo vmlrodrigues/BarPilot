@@ -267,6 +267,12 @@ enum CreditReconciliation {
                          "pre-attribution rows must be visible to the connected account")
             precondition(CreditSampleStore.latest(account: nil)?.creditsUsed == 30,
                          "nil-account latest must read only unattributed rows")
+            precondition(
+                CreditSampleStore.cycleBudget(
+                    resetDayMs: CreditCycleSummary.dayStart(for: reset),
+                    account: old
+                ) == nil,
+                "pre-migration history must not invent a budget snapshot")
 
             // Reconnecting under a *different-looking* fingerprint for the same
             // account must adopt, not discard.
@@ -282,10 +288,11 @@ enum CreditReconciliation {
                          "a different account must not see another account's history")
 
             // New rows stay attributed and isolated.
-            CreditSampleStore.save(
-                CreditSample(capturedAtMs: base + 600_000, serverAtMs: nil,
-                             resetAtMs: reset, creditsUsed: 90),
-                account: other)
+            let otherSample = CreditSample(
+                capturedAtMs: base + 600_000, serverAtMs: nil,
+                resetAtMs: reset, creditsUsed: 90
+            )
+            CreditSampleStore.save(otherSample, account: other, budgetUSD: 222)
             precondition(CreditSampleStore.load(resetAtMs: reset, account: new).count == 3,
                          "another account's writes must not appear in this account's cycle")
             precondition(CreditSampleStore.load(resetAtMs: reset, account: other).count == 1,
@@ -294,6 +301,19 @@ enum CreditReconciliation {
                          "nil-account loads must not expose attributed rows")
             precondition(CreditSampleStore.cycles(account: nil).isEmpty,
                          "nil-account cycle lists must not expose attributed rows")
+            precondition(
+                CreditSampleStore.cycleBudget(
+                    resetDayMs: CreditCycleSummary.dayStart(for: reset),
+                    account: other
+                ) == 222,
+                "a budget snapshot must remain isolated to its account")
+            CreditSampleStore.save(otherSample, account: other)
+            precondition(
+                CreditSampleStore.cycleBudget(
+                    resetDayMs: CreditCycleSummary.dayStart(for: reset),
+                    account: other
+                ) == 222,
+                "rewriting a sample without a budget must preserve its snapshot")
 
             let priorReset = Aggregator.utcMidnightMs("2030-03-01")
             CreditSampleStore.save(
@@ -316,7 +336,7 @@ enum CreditReconciliation {
             CreditSampleStore.save(
                 CreditSample(capturedAtMs: base + 700_000, serverAtMs: nil,
                              resetAtMs: shiftedReset, creditsUsed: 95),
-                account: new)
+                account: new, budgetUSD: 140)
             let coalesced = CreditSampleStore.cycles(account: new)
             precondition(coalesced.count == 2
                          && coalesced.first?.latestSample.creditsUsed == 95,
@@ -327,6 +347,60 @@ enum CreditReconciliation {
                     account: new
                 ).count == 4,
                 "a coalesced cycle must load every same-day reset variant")
+            let resetDay = CreditCycleSummary.dayStart(for: reset)
+            precondition(
+                CreditSampleStore.cycleBudget(
+                    resetDayMs: resetDay, account: new
+                ) == 140,
+                "the newest same-day reset variant must supply the cycle budget")
+            precondition(
+                CreditSampleStore.budgetMigrationCycle(
+                    liveResetDayMs: resetDay,
+                    cycles: coalesced,
+                    account: new,
+                    eligibleStartMonth: "2030-02"
+                ) == CreditCycleSummary.dayStart(for: priorReset),
+                "only the immediately preceding missing cycle may be repaired")
+            let priorResetDay = CreditCycleSummary.dayStart(for: priorReset)
+            precondition(
+                CreditSampleStore.assignCycleBudgetIfMissing(
+                    resetDayMs: priorResetDay, account: new, budgetUSD: 125
+                ),
+                "the missed pre-migration cycle must accept one assignment")
+            precondition(
+                CreditSampleStore.cycleBudget(
+                    resetDayMs: priorResetDay, account: new
+                ) == 125,
+                "the one-time historical assignment must persist")
+            precondition(
+                !CreditSampleStore.assignCycleBudgetIfMissing(
+                    resetDayMs: priorResetDay, account: new, budgetUSD: 999
+                ),
+                "the migration repair must never overwrite an assigned budget")
+            CreditSampleStore.completeBudgetMigration(account: new)
+            precondition(
+                CreditSampleStore.budgetMigrationCycle(
+                    liveResetDayMs: resetDay,
+                    cycles: coalesced,
+                    account: new,
+                    eligibleStartMonth: "2030-02"
+                ) == nil,
+                "the one-time repair must disappear instead of moving backward")
+            precondition(
+                CreditSampleStore.setCycleBudget(
+                    resetDayMs: resetDay, account: new, budgetUSD: 175
+                ),
+                "the active cycle budget must follow a current target change")
+            precondition(
+                CreditSampleStore.cycleBudget(
+                    resetDayMs: resetDay, account: new
+                ) == 175,
+                "the active cycle target update must persist")
+            precondition(
+                CreditSampleStore.cycleBudget(
+                    resetDayMs: resetDay, account: other
+                ) == 222,
+                "updating one account must not alter another account")
         }
     }
 }
