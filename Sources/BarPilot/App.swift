@@ -65,6 +65,7 @@ struct AppMain {
         // Dev-only: layered Escape routing for nested popover overlays.
         if CommandLine.arguments.contains("--verify-presentation") {
             PopoverPresentationState.verify()
+            AppDelegate.verifyPopoverCloseTriggerRetention()
             exit(0)
         }
         // Support report — state, a timed load, and the recent reload log (#24).
@@ -103,11 +104,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let popover = NSPopover()
     private var cancellables = Set<AnyCancellable>()
-    // Backup outside-click monitor: NSPopover(.transient) breaks after a native
-    // NSMenu (the period Picker) runs its modal event loop. This global monitor
-    // ensures clicks in other apps still close the popover in that case.
-    private var outsideClickMonitor: Any?
+    // AppKit deliberately leaves transient-popover dismissal interactions
+    // unspecified. Paired monitors let BarPilot own dismissal deterministically
+    // without requiring Accessibility permission.
+    private var globalOutsideClickMonitor: Any?
+    private var localOutsideClickMonitor: Any?
     private var popoverKeyMonitor: Any?
+    private var pendingPopoverCloseTrigger: PopoverCloseTrigger?
     private var settingsWindow: NSWindow?
     private var wakeRefreshTask: Task<Void, Never>?
     private var isWaitingForBudgetPersistence = false
@@ -134,7 +137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         statusItem = item
 
-        popover.behavior = .transient
+        popover.behavior = .applicationDefined
         popover.animates = false
         popover.delegate = self
         popover.contentViewController = NSHostingController(
@@ -143,7 +146,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.startCreditUsageDeviceFlow()
                 },
                 openSettings: { [weak self] in self?.openSettings() },
-                closePopover: { [weak self] in self?.popover.performClose(nil) },
+                closePopover: { [weak self] in self?.closePopover(trigger: .escape) },
                 presentationState: popoverPresentationState
             )
             .environmentObject(store)
@@ -182,6 +185,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.notificationCenter.removeObserver(self)
     }
 
+    func applicationDidResignActive(_ notification: Notification) {
+        if popover.isShown { closePopover(trigger: .applicationDeactivated) }
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if isWaitingForBudgetPersistence { return .terminateLater }
         guard store.hasPendingBudgetPersistence else { return .terminateNow }
@@ -209,7 +216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func showContextMenu() {
         guard let button = statusItem.button else { return }
-        if popover.isShown { popover.performClose(nil) }
+        if popover.isShown { closePopover(trigger: .contextMenu) }
 
         // Actions only. Everything that changes behaviour lives in Settings, so
         // a setting has exactly one home rather than being spread across a menu,
@@ -249,10 +256,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // Settings
     // -----------------------------------------------------------------------
 
-    /// A real window, not a popover: every control here opens a sheet, alert or
-    /// save panel, and a `.transient` popover closes as soon as one takes focus.
+    /// A real window, not a popover: settings owns sheets, alerts and save panels
+    /// without complicating the compact status-item presentation hierarchy.
     @objc func openSettings() {
-        if popover.isShown { popover.performClose(nil) }
+        if popover.isShown { closePopover(trigger: .settings) }
         if let existing = settingsWindow {
             NSApp.activate(ignoringOtherApps: true)
             existing.makeKeyAndOrderFront(nil)
@@ -544,7 +551,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func togglePopover(_ sender: Any?) {
         if popover.isShown {
-            popover.performClose(sender)
+            closePopover(trigger: .statusItem, sender: sender)
         } else {
             showPopover()
         }
@@ -555,7 +562,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let previousWindow = shortcutPreviousWindow
             let previousApplication = shortcutPreviousApplication
             clearShortcutFocusTarget()
-            popover.performClose(nil)
+            closePopover(trigger: .shortcut)
 
             if let previousWindow, previousWindow.isVisible {
                 NSApp.activate(ignoringOtherApps: true)
@@ -588,29 +595,89 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Re-clamp to the current screen so the window always fits below the
         // menu bar (the status item sits at the very top of the screen).
         popover.contentSize = desiredContentSize()
+        pendingPopoverCloseTrigger = nil
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         NSApp.activate(ignoringOtherApps: true)
         popover.contentViewController?.view.window?.makeKey()
-        installOutsideClickMonitor()
+        installOutsideClickMonitors()
         installPopoverKeyMonitor()
         Task { await store.reload() }   // freshen on open
     }
 
-    private func installOutsideClickMonitor() {
-        removeOutsideClickMonitor()
-        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
-            matching: [.leftMouseDown, .rightMouseDown]
+    private enum PopoverCloseTrigger: String {
+        case applicationDeactivated
+        case contextMenu
+        case escape
+        case otherApplication
+        case settings
+        case settingsWindow
+        case shortcut
+        case statusItem
+        case system
+    }
+
+    static func verifyPopoverCloseTriggerRetention() {
+        precondition(retainedCloseTrigger(nil, incoming: .escape) == .escape)
+        precondition(retainedCloseTrigger(.escape, incoming: .otherApplication) == .escape)
+    }
+
+    private static func retainedCloseTrigger(
+        _ existing: PopoverCloseTrigger?,
+        incoming: PopoverCloseTrigger
+    ) -> PopoverCloseTrigger {
+        existing ?? incoming
+    }
+
+    private func closePopover(trigger: PopoverCloseTrigger, sender: Any? = nil) {
+        guard popover.isShown else { return }
+        // More than one AppKit notification can describe the same interaction
+        // (for example, a click in another app can also deactivate BarPilot).
+        // Retain the first cause so diagnostics describe what initiated closure.
+        pendingPopoverCloseTrigger = Self.retainedCloseTrigger(
+            pendingPopoverCloseTrigger,
+            incoming: trigger
+        )
+        popover.performClose(sender)
+    }
+
+    private func installOutsideClickMonitors() {
+        removeOutsideClickMonitors()
+        globalOutsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
         ) { [weak self] _ in
             guard let self, self.popover.isShown else { return }
-            self.popover.performClose(nil)
+            self.closePopover(trigger: .otherApplication)
+        }
+        localOutsideClickMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] event in
+            guard let self, self.popover.isShown else { return event }
+            let target = self.mouseTarget(for: event)
+            if target.closesParent {
+                self.closePopover(trigger: .settingsWindow)
+            }
+            return event
         }
     }
 
-    private func removeOutsideClickMonitor() {
-        if let m = outsideClickMonitor {
+    private func removeOutsideClickMonitors() {
+        if let m = globalOutsideClickMonitor {
             NSEvent.removeMonitor(m)
-            outsideClickMonitor = nil
+            globalOutsideClickMonitor = nil
         }
+        if let m = localOutsideClickMonitor {
+            NSEvent.removeMonitor(m)
+            localOutsideClickMonitor = nil
+        }
+    }
+
+    private func mouseTarget(for event: NSEvent) -> PopoverMouseTarget {
+        PopoverMouseTarget.classify(
+            candidate: event.window,
+            statusItemWindow: statusItem.button?.window,
+            popoverRoot: popover.contentViewController?.view.window,
+            settingsRoot: settingsWindow
+        )
     }
 
     /// NSPopover consumes Escape before SwiftUI's `onExitCommand` reaches a
@@ -624,7 +691,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return event
             }
             if self.popoverPresentationState.dismissTopLayer() { return nil }
-            self.popover.performClose(nil)
+            self.closePopover(trigger: .escape)
             return nil
         }
     }
@@ -647,10 +714,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - NSPopoverDelegate
 
 extension AppDelegate: NSPopoverDelegate {
-    /// Called whenever the popover closes (transient auto-close, our backup
-    /// monitor, or the status-bar button toggle). Always clean up the monitor.
+    /// Called for every explicit close path, plus an unexpected system close.
+    /// The trigger is deliberately safe to include in a public support report.
     func popoverDidClose(_ notification: Notification) {
-        removeOutsideClickMonitor()
+        let trigger = pendingPopoverCloseTrigger ?? .system
+        DiagLog.write(
+            "popover closed · trigger \(trigger.rawValue) · layer \(popoverPresentationState.layer)"
+        )
+        pendingPopoverCloseTrigger = nil
+        removeOutsideClickMonitors()
         removePopoverKeyMonitor()
         popoverPresentationState.reset()
         clearShortcutFocusTarget()

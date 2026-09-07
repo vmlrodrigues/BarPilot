@@ -221,8 +221,14 @@ overlay never mutates local aggregation.
   Check for Updates, What's New, Save Diagnostics…, Quit. Anything that *sets* or
   *toggles* state belongs in Settings, not the menu.
 - **Settings is a real `NSWindow` (`SettingsView.swift`), not a popover.** The
-  status-item popover is `.transient`, so it closes the instant a sheet, alert or
-  save panel takes focus — which is every interesting settings control. Opened by
+  status-item popover uses application-defined dismissal so its inline calendar
+  and model-pricing layers cannot trigger AppKit's unspecified transient-close
+  heuristics. Paired local/global mouse monitors close it deterministically for
+  the known Settings window and other-app outside clicks; unknown AppKit windows
+  are retained because SwiftUI uses them for nested controls. The status item,
+  Escape, and Settings each use an explicit close path. Settings remains a
+  separate window because its sheets, alerts and save panels need an independent
+  hierarchy. Opened by
   the cog button in the dashboard header, by "Settings… ⌘," in the menu, or by the
   `--settings` launch flag (the documented notch/overflow gotcha can put the
   status item out of reach). `isReleasedWhenClosed = false`; `windowWillClose`

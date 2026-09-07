@@ -4,6 +4,15 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+## [0.11.1] — 2026-09-08
+
+### Fixed
+- **Opening Model prices no longer intermittently dismisses the usage window.**
+  The parent popover now uses one explicit dismissal policy instead of AppKit's
+  unspecified transient-close heuristics. Inside controls and nested surfaces
+  retain the window—including AppKit-created auxiliary panels—while Escape, the
+  menu-bar item, Settings, and clicks in another app close it deterministically.
+
 ## [0.11.0] — 2026-09-05
 
 ### Added

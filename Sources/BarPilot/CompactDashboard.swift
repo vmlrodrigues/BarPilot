@@ -29,7 +29,110 @@ final class PopoverPresentationState: ObservableObject {
         precondition(state.dismissTopLayer() && state.layer == .base)
         state.layer = .modelPricing
         precondition(state.dismissTopLayer() && state.layer == .base)
+
+        let statusItemWindow = verificationWindow()
+        let popoverRoot = verificationWindow()
+        let popoverChild = verificationWindow()
+        let settingsRoot = verificationWindow()
+        let settingsSheet = verificationWindow()
+        let unknownPanel = verificationWindow()
+        popoverRoot.addChildWindow(popoverChild, ordered: .above)
+        settingsRoot.addChildWindow(settingsSheet, ordered: .above)
+
+        precondition(PopoverMouseTarget.classify(
+            candidate: statusItemWindow,
+            statusItemWindow: statusItemWindow,
+            popoverRoot: popoverRoot,
+            settingsRoot: settingsRoot
+        ) == .statusItem)
+        for candidate in [popoverRoot, popoverChild] {
+            precondition(PopoverMouseTarget.classify(
+                candidate: candidate,
+                statusItemWindow: statusItemWindow,
+                popoverRoot: popoverRoot,
+                settingsRoot: settingsRoot
+            ) == .content)
+        }
+        for candidate in [settingsRoot, settingsSheet] {
+            precondition(PopoverMouseTarget.classify(
+                candidate: candidate,
+                statusItemWindow: statusItemWindow,
+                popoverRoot: popoverRoot,
+                settingsRoot: settingsRoot
+            ) == .settingsWindow)
+        }
+        precondition(PopoverMouseTarget.classify(
+            candidate: unknownPanel,
+            statusItemWindow: statusItemWindow,
+            popoverRoot: popoverRoot,
+            settingsRoot: settingsRoot
+        ) == .auxiliaryUI)
+        precondition(PopoverMouseTarget.classify(
+            candidate: nil,
+            statusItemWindow: statusItemWindow,
+            popoverRoot: popoverRoot,
+            settingsRoot: settingsRoot
+        ) == .auxiliaryUI)
+        precondition(PopoverMouseTarget.settingsWindow.closesParent)
+        precondition(PopoverMouseTarget.otherApplication.closesParent)
         print("popover presentation verification passed")
+    }
+
+    private static func verificationWindow() -> NSWindow {
+        NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 10, height: 10),
+            styleMask: .borderless,
+            backing: .buffered,
+            defer: false
+        )
+    }
+}
+
+/// The usage popover has application-defined dismissal, so every mouse event
+/// has one explicit owner. Replacing a clicked SwiftUI button with an overlay
+/// must never let AppKit reinterpret that click as a reason to close the parent.
+@MainActor
+enum PopoverMouseTarget: Equatable {
+    case content
+    case statusItem
+    case auxiliaryUI
+    case settingsWindow
+    case otherApplication
+
+    var closesParent: Bool {
+        switch self {
+        case .settingsWindow, .otherApplication:
+            return true
+        case .content, .statusItem, .auxiliaryUI:
+            return false
+        }
+    }
+
+    /// Classifies only windows BarPilot owns. Unknown local windows are treated
+    /// as auxiliary UI because SwiftUI and AppKit create implementation-detail
+    /// panels for controls such as popovers, menus and date pickers. Assuming an
+    /// unknown panel is "outside" can close the parent during a valid click.
+    static func classify(
+        candidate: NSWindow?,
+        statusItemWindow: NSWindow?,
+        popoverRoot: NSWindow?,
+        settingsRoot: NSWindow?
+    ) -> Self {
+        guard let candidate else { return .auxiliaryUI }
+        if candidate === statusItemWindow { return .statusItem }
+        if belongs(candidate, to: popoverRoot) { return .content }
+        if belongs(candidate, to: settingsRoot) { return .settingsWindow }
+        return .auxiliaryUI
+    }
+
+    private static func belongs(_ candidate: NSWindow, to root: NSWindow?) -> Bool {
+        guard let root else { return false }
+        var window: NSWindow? = candidate
+        while let current = window {
+            if current === root { return true }
+            window = current.parent
+        }
+        return false
     }
 }
 

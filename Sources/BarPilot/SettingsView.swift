@@ -7,9 +7,8 @@ import AppKit
 // The right-click menu keeps only actions (open, refresh, updates, what's new,
 // diagnostics, quit). Anything that changes how BarPilot behaves moves here, so
 // a setting has one home instead of being half-menu, half-dialog. The window is
-// a real NSWindow rather than a popover: the popover is `.transient` and closes
-// the moment a sheet, alert or save panel takes focus, which every one of these
-// controls does.
+// a real NSWindow rather than a popover, giving sheets, alerts and save panels
+// an independent presentation hierarchy.
 // ---------------------------------------------------------------------------
 
 /// Actions the settings window needs from the AppDelegate, which owns the
