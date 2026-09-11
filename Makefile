@@ -62,6 +62,8 @@ verify:
 	@for check in projection watchdog incremental credits wake-refresh shortcut model-pricing presentation sync; do \
 		.build/debug/BarPilot "--verify-$$check" || exit 1; \
 	done
+	TZ=America/Los_Angeles .build/debug/BarPilot --verify-projection
+	TZ=Pacific/Auckland .build/debug/BarPilot --verify-projection
 	python3 -m unittest discover -s Tests/model_pricing_catalog -p 'test_*.py'
 
 dmg: check verify

@@ -71,12 +71,16 @@ Other headless modes — run the relevant ones after touching their area:
 | `--verify-incremental` | incremental JSONL reads never lose/duplicate a record (#24) |
 | `--verify-watchdog` | exporter-heartbeat rules: warn only when running-but-not-writing (#27) |
 | `--verify-projection` | spend-projection run-rate math + guards (#18) |
-| `--verify-sync` | v2 sync payload, account isolation, remote gap-fill, legacy fit |
+| `--verify-sync` | v3 sync payload, account isolation, remote gap-fill, legacy fit |
 | `--verify-credits` | server-counter parsing, current-cycle guards, and unclassified reconciliation (#33) |
 | `--verify-wake-refresh` | visible-wake freshness and bounded retry rules (#39) |
 | `--verify-shortcut` | global shortcut validation and persistence encoding (#40) |
 | `--sync-preview` | combined multi-machine view vs a simulated second machine |
 | `--diagnose` | support report: state, a timed load, recent reload log |
+
+Every `--verify-*` command exits nonzero when any assertion fails. `make verify`
+also runs the projection verifier under Los Angeles and Auckland timezones to
+catch UTC/local-date regressions that the host timezone would otherwise hide.
 
 `--diagnose` is the one to ask a **user** to run (from the installed bundle, so it
 reads the right Info.plist and preferences):
@@ -126,10 +130,11 @@ current UTC billing cycle:
   account's existing history; it does not establish a visibility boundary.
   Cumulative samples are not converted into daily rows because gaps cannot be
   assigned to a day reliably.
-- New samples snapshot the canonical USD budget for their billing cycle.
-  Historical cycles use that snapshot. A one-time migration repair may fill the
-  immediately preceding missed cycle, but ordinary historical budgets are not
-  editable and older missing snapshots remain unknown.
+- Billing-cycle budgets are first-class records, independent of counter samples.
+  New samples still carry the value for compatibility, while historical cycles
+  use the cycle record. A one-time migration repair may fill the immediately
+  preceding missed cycle, but ordinary historical budgets are not editable and
+  older missing snapshots remain unknown.
 - Disconnecting removes only the credential. Stored samples, the account
   attribution on them, and sync authorization are all left intact, so
   reconnecting restores the existing history rather than starting a new one.
@@ -210,6 +215,19 @@ Legacy data flow: `DataSources.loadAll()` (off-actor) → `UsageStore.allRecords
 `CreditReconciliation.build(...)` → deprecated telemetry views. The reconciliation
 overlay never mutates local aggregation.
 
+The daily-cost chart expands sparse observations into every UTC day in the
+selected billing cycle, including future placeholders, so its geometry does not
+grow through the month. Recent activity shows five rows at once but retains all
+stored completed-cycle rows in its own scrollable history; historical cycle
+selection narrows the list back to that selected cycle. The production popover
+uses 806 points as its comfortable viewport but always clamps to the usable
+screen, including displays shorter than the old minimum. The main content
+scrolls independently of the pinned footer, and owns an explicit 16-point
+bottom inset so card and footer borders cannot collide. Chart hover content is
+drawn in `chartOverlay`, never as a mark annotation: annotations alter Swift
+Charts’ plot-area geometry when an edge bar is selected. Hovering any chart
+column or date reveals that day’s date, credits and display-currency cost.
+
 ## Design decisions — don't casually revert these (all user-chosen)
 
 - **AppKit `NSStatusItem` + `NSPopover`, NOT SwiftUI `MenuBarExtra`** —
@@ -217,6 +235,12 @@ overlay never mutates local aggregation.
   SwiftUI, hosted in the popover. Popover size is re-clamped to the screen's
   `visibleFrame` on each open so it never spills over the top.
 - **Left-click** opens the window; **right-click / control-click** shows the menu.
+  The primary action acts on left mouse-down and validates the event's source
+  window, then defers presentation to the next main-loop turn so AppKit has
+  finished its status-button tracking session. Do not move it back to left
+  mouse-up or present synchronously during mouse-down: either can turn a later
+  content click into a toggle after an idle period. Right-click retains standard
+  mouse-up menu timing.
   **The menu holds actions only** — Open Usage Window, Refresh Now, Settings…,
   Check for Updates, What's New, Save Diagnostics…, Quit. Anything that *sets* or
   *toggles* state belongs in Settings, not the menu.
@@ -297,14 +321,57 @@ overlay never mutates local aggregation.
 - **The menu-bar figure warns when GitHub is not authoritative.** Reuse the
   existing warning glyph while disconnected, reconnect-required, stale, or in
   error; the amount remains the local fallback rather than disappearing.
-- **Multi-machine sync uses schema v2 counter observations.** Each Mac publishes
-  only its first locally captured observation in each 15-minute UTC bucket. Pulled
-  samples stay in the separate remote store and are
-  never re-published. A PBKDF2-derived account fingerprint gates merging;
-  account-wide counter values are never added across machines. The fingerprint
+- **Multi-machine sync uses schema v3 counter observations and cycle budgets.** Each Mac publishes
+  the live cycle's first locally captured observation in each 15-minute UTC
+  bucket plus its moving close. Completed cycles retain the first, high-water
+  and last observation of each UTC day plus their final close, using server time
+  when available for ordering and UTC-day membership, and the payload has a
+  defensive 6,144-sample ceiling. That ceiling, a raw payload-size bound and
+  numeric/timestamp validation use the same gate before upload and after
+  download. The complete snapshot is capped at 64 machine payloads so bounded
+  row counters cannot overflow a combined signed-64-bit report. A single
+  compact SQL history read avoids
+  materialising every minute-level poll. Pulled samples are decoded off the main
+  actor once, cached in memory, written to the separate remote store as one
+  atomic snapshot, can add remote-only cycles to navigation and rolling
+  activity, and are never re-published. Snapshot persistence executes off the
+  main actor and is generation-gated so a late write cannot survive a sync
+  disable/re-enable. If cached peers and local history finish loading in either
+  order, the latter view is recombined before publication. Turning sync off cancels its active
+  network task; sync, account-generation, connection-state and fingerprint
+  checks reject any late continuation after an identity change. A startup push
+  is also withheld unless the complete saved history loads successfully, and an
+  enabled connection cannot publish until its account identity is resolved. This
+  protection is fingerprint-driven, not connection-driven: disconnecting
+  account usage leaves multi-Mac sync enabled, so that state must still load the
+  full local history before publishing. Pull failures, unreadable machine files,
+  unsupported cached schemas, missing authorization and local snapshot write
+  failures retain the complete last-good cache and remain visible in the footer;
+  a successful empty pull removes absent peers. A canonical SHA-256 digest of
+  every publishable field (except `updatedAt`) controls unchanged uploads; do not
+  replace it with aggregate counts or totals that can collide. `--verify-sync`
+  always uses a temporary remote database and
+  terminates unsuccessfully on either aggregate or persistence mismatches. A
+  PBKDF2-derived account
+  fingerprint gates merging;
+  account-wide counter values are never added across machines. Before any push,
+  the complete Gist is validated. A durable database identity gates one-time
+  reconciliation with this machine's supported prior payload; this restores
+  observations after local database loss without resurrecting normally pruned
+  rows, and prevents a downgraded build from overwriting a future self schema.
+  Push decisions compare the newly projected content with the downloaded self
+  file; a local fingerprint cache must never stand in for remote truth. Cycle
+  budgets are stored independently of observations, persist their true edit time
+  separately from observation time, and use machine id as the deterministic
+  tie-breaker for simultaneous edits. This allows a locally edited budget for a
+  peer-only cycle to be published even when this Mac has no sample in that cycle.
+  Persistence completions are also gated by account generation and fingerprint;
+  an old account's delayed write must not mutate current in-memory state.
+  A fresh matching peer observation may drive the current cycle when the local
+  Mac missed rollover, with the UI identifying its synced origin. The fingerprint
   must stay deterministic across Macs (no per-install salt), so a plain hash of
   GitHub's small numeric id space would be reversible by a precomputed table —
-  hence the KDF. Schema v2 retains legacy
+  hence the KDF. Schema v3 retains legacy
   aggregate rows only during deprecation. Truncated gist files are fetched through
   their authenticated `raw_url`. Payloads also carry the public USD→AUD quote and
   its provider update timestamp. The newest valid provider timestamp wins across
@@ -315,8 +382,9 @@ overlay never mutates local aggregation.
   carries the reset in four fields, two of which encode a time-of-day, and
   anniversary-billed accounts never land on the 1st. Requiring alignment silently
   blanked the entire dashboard for those accounts with no error shown. The legacy
-  overlay (`matchesCurrentCycle`) keeps the extra day-key check because it sits on
-  top of a locally aggregated calendar-month range.
+  overlay (`matchesCurrentCycle`) additionally requires an exact UTC-midnight
+  start because even a same-day 10am reset leaves prior-cycle hours in a locally
+  aggregated calendar-month range.
 - **Sample history is addressed by cycle and account, never by a mutable pointer.**
   `credit_samples.account` records which account observed each row, and
   `Store.loadCycleSamples` reads by UTC reset day + account. Exact reset instants

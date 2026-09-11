@@ -53,7 +53,6 @@ struct DetailView: View {
             footer
         }
         .frame(width: 600)
-        .frame(minHeight: 480, maxHeight: .infinity)
     }
 
     private var legacyBanner: some View {
@@ -246,7 +245,7 @@ struct DetailView: View {
                         .frame(width: 7, height: 7)
                     Text(store.serverUsageStatusLabel)
                         .font(.caption2)
-                        .foregroundStyle(store.serverUsageError == nil ? Color.secondary : Color.red)
+                        .foregroundStyle(store.serverUsageStatusIsError ? Color.red : Color.secondary)
                         .fixedSize()
                     Button { showingCreditInfo.toggle() } label: {
                         Image(systemName: "info.circle").font(.caption2).foregroundStyle(.blue)
@@ -262,8 +261,10 @@ struct DetailView: View {
                                 if let error = store.serverUsageError {
                                     Text(error).foregroundStyle(.red)
                                 }
-                                if let sample = store.serverUsageSample {
-                                    Text("Last sample: **\(Fmt.dateTime(sample.capturedAtMs))**")
+                                if let sample = store.currentServerUsageSample {
+                                    Text(store.currentServerUsageSampleIsRemote
+                                         ? "Last synced sample: **\(Fmt.dateTime(Int64((store.currentServerUsageObservedAt ?? sample.capturedAt).timeIntervalSince1970 * 1000)))**"
+                                         : "Last sample: **\(Fmt.dateTime(sample.capturedAtMs))**")
                                     Text("Billing-cycle reset: **\(Fmt.dateTime(sample.resetAtMs))**")
                                 } else if store.serverUsageError == nil {
                                     Text("Waiting for the first sample…").foregroundStyle(.secondary)
@@ -390,8 +391,8 @@ struct DetailView: View {
 
     private var creditStatusColor: Color {
         guard store.serverUsageEnabled else { return Color.secondary.opacity(0.4) }
-        if store.serverUsageError != nil { return .red }
-        if store.serverUsageSample == nil || store.serverUsageIsStale { return .orange }
+        if store.serverUsageStatusIsError { return .red }
+        if store.currentServerUsageSample == nil || store.serverUsageIsStale { return .orange }
         return .green
     }
 }

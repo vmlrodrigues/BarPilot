@@ -20,15 +20,308 @@ private actor CycleBudgetWriter {
         revision: Int,
         resetDayMs: Int64,
         account: String?,
-        budgetUSD: Double
+        budgetUSD: Double,
+        updatedAtMs: Int64
     ) -> Bool {
         guard revision >= newestRevision else { return true }
         newestRevision = revision
         return CreditSampleStore.setCycleBudget(
             resetDayMs: resetDayMs,
             account: account,
-            budgetUSD: budgetUSD
+            budgetUSD: budgetUSD,
+            updatedAtMs: updatedAtMs
         )
+    }
+}
+
+/// Serialises remote-cache mutations away from the UI actor. The generation
+/// makes a late write harmless when sync is disabled or re-authorized while a
+/// large snapshot is still being encoded and committed.
+private actor RemoteSnapshotWriter {
+    private var newestGeneration = Int.min
+
+    func replaceAll(
+        _ payloads: [MachineSyncPayload], generation: Int
+    ) -> Bool {
+        guard generation >= newestGeneration else { return false }
+        newestGeneration = generation
+        return RemoteStore.replaceAll(payloads)
+    }
+
+    func clear(generation: Int) {
+        guard generation >= newestGeneration else { return }
+        newestGeneration = generation
+        RemoteStore.clear()
+    }
+}
+
+enum RemoteCacheApplicationPolicy {
+    static func shouldReapplyHistory(
+        installedCurrentCache: Bool, hasLocalHistory: Bool
+    ) -> Bool {
+        installedCurrentCache && hasLocalHistory
+    }
+
+    static func verify() {
+        precondition(shouldReapplyHistory(
+            installedCurrentCache: true, hasLocalHistory: true
+        ))
+        precondition(!shouldReapplyHistory(
+            installedCurrentCache: true, hasLocalHistory: false
+        ))
+        precondition(!shouldReapplyHistory(
+            installedCurrentCache: false, hasLocalHistory: true
+        ))
+    }
+}
+
+enum BudgetPersistenceCompletionPolicy {
+    static func shouldApply(
+        revision: Int, latestRevision: Int,
+        accountGeneration: Int, currentAccountGeneration: Int,
+        account: String?, currentAccount: String?
+    ) -> Bool {
+        revision == latestRevision
+            && accountGeneration == currentAccountGeneration
+            && account == currentAccount
+    }
+
+    static func verify() {
+        precondition(shouldApply(
+            revision: 2, latestRevision: 2,
+            accountGeneration: 3, currentAccountGeneration: 3,
+            account: "same", currentAccount: "same"
+        ))
+        precondition(!shouldApply(
+            revision: 2, latestRevision: 2,
+            accountGeneration: 2, currentAccountGeneration: 3,
+            account: "same", currentAccount: "same"
+        ))
+        precondition(!shouldApply(
+            revision: 2, latestRevision: 2,
+            accountGeneration: 3, currentAccountGeneration: 3,
+            account: "old", currentAccount: "new"
+        ))
+    }
+}
+
+enum CreditCycleTransitionPolicy {
+    private static let boundaryWindowMs: Int64 = 24 * 60 * 60 * 1_000
+
+    /// GitHub can advance the reset boundary one response before its cumulative
+    /// counter resets. Do not persist that ambiguous first response into the new
+    /// cycle: if it is the old counter, it would become an artificial high-water
+    /// mark for the entire month.
+    static func needsConfirmation(
+        previous: CreditSample?, current: CreditSample
+    ) -> Bool {
+        guard let previous else { return false }
+        let observedAtMs = current.serverAtMs ?? current.capturedAtMs
+        let distanceFromBoundary = abs(
+            Double(observedAtMs) - Double(previous.resetAtMs)
+        )
+        return distanceFromBoundary <= Double(boundaryWindowMs)
+            && CreditCycleSummary.dayStart(for: current.resetAtMs)
+                > CreditCycleSummary.dayStart(for: previous.resetAtMs)
+            && current.creditsUsed >= previous.creditsUsed
+    }
+
+    /// A response for the same new boundary confirms it only after the counter
+    /// falls below the previous cycle's high-water mark. Mere movement is not
+    /// enough: the stale old counter may still be increasing while fields settle.
+    static func confirms(
+        previous: CreditSample,
+        pending: CreditSample,
+        current: CreditSample
+    ) -> Bool {
+        CreditCycleSummary.dayStart(for: pending.resetAtMs)
+            == CreditCycleSummary.dayStart(for: current.resetAtMs)
+            && CreditCycleSummary.dayStart(for: current.resetAtMs)
+                > CreditCycleSummary.dayStart(for: previous.resetAtMs)
+            && current.creditsUsed < previous.creditsUsed
+    }
+
+    static func changed(previous: CreditSample?, current: CreditSample) -> Bool {
+        guard let previous else { return false }
+        return CreditCycleSummary.dayStart(for: previous.resetAtMs)
+            != CreditCycleSummary.dayStart(for: current.resetAtMs)
+    }
+
+    static func rolledOver(
+        previous: CreditSample?, current: CreditSample
+    ) -> Bool {
+        guard let previous else { return false }
+        return CreditCycleSummary.dayStart(for: current.resetAtMs)
+                > CreditCycleSummary.dayStart(for: previous.resetAtMs)
+            && current.creditsUsed < previous.creditsUsed
+    }
+
+    static func verify() {
+        let oldReset = Aggregator.utcMidnightMs("2030-01-01")
+        let newReset = Aggregator.utcMidnightMs("2030-02-01")
+        let previous = CreditSample(
+            capturedAtMs: oldReset - 1, serverAtMs: nil,
+            resetAtMs: oldReset, creditsUsed: 1_000
+        )
+        let staleCounter = CreditSample(
+            capturedAtMs: oldReset, serverAtMs: nil,
+            resetAtMs: newReset, creditsUsed: 1_000
+        )
+        precondition(changed(previous: previous, current: staleCounter))
+        precondition(!rolledOver(previous: previous, current: staleCounter))
+        precondition(needsConfirmation(
+            previous: previous, current: staleCounter
+        ))
+        let delayedReconnect = CreditSample(
+            capturedAtMs: oldReset + 3 * CreditCycleSummary.dayMs,
+            serverAtMs: nil,
+            resetAtMs: newReset,
+            creditsUsed: 1_200
+        )
+        precondition(!needsConfirmation(
+            previous: previous, current: delayedReconnect
+        ))
+        let resetCounter = CreditSample(
+            capturedAtMs: oldReset + 1, serverAtMs: nil,
+            resetAtMs: newReset, creditsUsed: 10
+        )
+        precondition(rolledOver(previous: previous, current: resetCounter))
+        precondition(confirms(
+            previous: previous, pending: staleCounter, current: resetCounter
+        ))
+        precondition(!needsConfirmation(
+            previous: staleCounter, current: resetCounter
+        ))
+        let growingNewCounter = CreditSample(
+            capturedAtMs: oldReset + 2, serverAtMs: nil,
+            resetAtMs: newReset, creditsUsed: 1_001
+        )
+        precondition(!confirms(
+            previous: previous,
+            pending: staleCounter,
+            current: growingNewCounter
+        ))
+        let zeroBoundary = CreditSample(
+            capturedAtMs: oldReset + 3, serverAtMs: nil,
+            resetAtMs: newReset, creditsUsed: 0
+        )
+        precondition(confirms(
+            previous: previous,
+            pending: zeroBoundary,
+            current: zeroBoundary
+        ))
+    }
+}
+
+enum CreditHistoryMergePolicy {
+    /// A database read can begin before a target edit and finish after it. Merge
+    /// its snapshot with the live values so that late reads cannot roll back an
+    /// already-persisted edit in memory or in the next sync payload.
+    static func cycleBudgets(
+        stored: [SyncedCycleBudget], live: [SyncedCycleBudget]
+    ) -> [SyncedCycleBudget] {
+        SyncAggregate.compactCycleBudgets(stored + live)
+    }
+
+    static func verify() {
+        let day = Aggregator.utcMidnightMs("2030-02-01")
+        let stale = SyncedCycleBudget(
+            resetDayMs: day, budgetUSD: 100, updatedAtMs: day - 2
+        )
+        let edited = SyncedCycleBudget(
+            resetDayMs: day, budgetUSD: 200, updatedAtMs: day - 1
+        )
+        precondition(cycleBudgets(
+            stored: [stale], live: [edited]
+        ).first?.budgetUSD == 200)
+    }
+}
+
+/// Loading policy shared by launch and sync. Account usage can be disconnected
+/// while multi-Mac sync deliberately remains enabled, so UI connection state
+/// must never decide whether a complete counter history is safe to publish.
+enum CreditHistoryLoadPolicy {
+    static func shouldLoad(
+        serverUsageEnabled: Bool,
+        syncEnabled: Bool,
+        accountFingerprint: String?
+    ) -> Bool {
+        serverUsageEnabled || (syncEnabled && accountFingerprint != nil)
+    }
+
+    static func mustLoadBeforeSync(accountFingerprint: String?) -> Bool {
+        accountFingerprint != nil
+    }
+
+    /// An enabled account connection with no verified identity is transient: it
+    /// commonly occurs while an older install is resolving its fingerprint.
+    /// Publishing then would replace this Mac's remote counter history with a
+    /// payload whose account fields are deliberately nil.
+    static func canPublish(
+        serverUsageEnabled: Bool,
+        accountFingerprint: String?
+    ) -> Bool {
+        !serverUsageEnabled || accountFingerprint != nil
+    }
+
+    static func verify() {
+        precondition(shouldLoad(
+            serverUsageEnabled: true,
+            syncEnabled: false,
+            accountFingerprint: nil
+        ))
+        precondition(shouldLoad(
+            serverUsageEnabled: false,
+            syncEnabled: true,
+            accountFingerprint: "known-account"
+        ), "disconnected account usage must not permit a partial sync upload")
+        precondition(!shouldLoad(
+            serverUsageEnabled: false,
+            syncEnabled: true,
+            accountFingerprint: nil
+        ))
+        precondition(mustLoadBeforeSync(accountFingerprint: "known-account"))
+        precondition(!mustLoadBeforeSync(accountFingerprint: nil))
+        precondition(canPublish(
+            serverUsageEnabled: true,
+            accountFingerprint: "known-account"
+        ))
+        precondition(!canPublish(
+            serverUsageEnabled: true,
+            accountFingerprint: nil
+        ), "sync must wait while an enabled account's identity is unresolved")
+        precondition(canPublish(
+            serverUsageEnabled: false,
+            accountFingerprint: nil
+        ))
+    }
+}
+
+/// Upload policy kept pure so the simultaneous first-enable race is covered by
+/// deterministic verification rather than requiring two live GitHub accounts.
+enum SyncPublishPolicy {
+    static func shouldPush(
+        force: Bool,
+        fingerprint: String,
+        needsRetry: Bool,
+        remoteFingerprint: String?
+    ) -> Bool {
+        force || needsRetry || fingerprint != remoteFingerprint
+    }
+
+    static func verify() {
+        precondition(shouldPush(
+            force: false, fingerprint: "same", needsRetry: false,
+            remoteFingerprint: nil
+        ), "a Mac missing from the canonical Gist must republish after a creation race")
+        precondition(!shouldPush(
+            force: false, fingerprint: "same", needsRetry: false,
+            remoteFingerprint: "same"
+        ), "an unchanged published payload must not upload every minute")
+        precondition(shouldPush(
+            force: false, fingerprint: "current", needsRetry: false,
+            remoteFingerprint: "stale"
+        ), "an existing but stale self file must be repaired")
     }
 }
 
@@ -49,7 +342,9 @@ final class UsageStore: ObservableObject {
 
     /// Monthly budget in USD. The per-period budget is derived from this by
     /// pro-rating across the days in the selected range (a per-day rate).
-    @Published var monthlyBudget: Double { didSet { persistBudget() } }
+    @Published var monthlyBudget: Double {
+        didSet { persistBudget(previousValue: oldValue) }
+    }
     @Published private(set) var budgetPersistenceError: String?
     /// Project the month-end forecast across working days only. Off by default,
     /// so an existing install's forecast does not move on upgrade.
@@ -73,8 +368,29 @@ final class UsageStore: ObservableObject {
     /// Last sync failure to surface in the footer (nil = healthy). Mainly catches
     /// the "this account can't create gists" (enterprise) case.
     @Published private(set) var syncError: String?
-    private var isSyncing = false        // reentrancy guard so overlapping syncNow calls don't interleave
+    /// Changes whenever sync is enabled or disabled. Account-generation,
+    /// connection-state and fingerprint snapshots independently invalidate work
+    /// when the account connection changes during a network request.
+    private var syncGeneration = 0
+    private struct ActiveSyncRun {
+        let id: UUID
+        let generation: Int
+        let serverUsageGeneration: Int
+        let serverUsageEnabled: Bool
+        let accountFingerprint: String?
+        let task: Task<Void, Never>
+    }
+    private var activeSyncRun: ActiveSyncRun?
     private var syncPushBlocked = false  // set after a permanent (403/401) failure; cleared on re-enable
+    private var syncPushNeedsRetry = false
+    /// Decoded once and then replaced from successful pulls. Never reopen and
+    /// JSON-decode the remote SQLite cache during a main-actor recomputation.
+    private var remoteAggregates: [MachineSyncPayload] = []
+    private var hasLoadedRemoteAggregateCache = false
+    /// Resolved once whenever source state changes. A payload can contain several
+    /// thousand samples, so SwiftUI accessors must not rescan every peer on each
+    /// body evaluation.
+    private var resolvedCurrentCreditObservation: CurrentCreditObservation?
 
     /// Primary account-level credit connection, independent from gist sync.
     @Published private(set) var serverUsageEnabled = false
@@ -85,6 +401,9 @@ final class UsageStore: ObservableObject {
     private var serverUsageConnectTask: Task<Void, Never>?
     /// Cached in `recompute()` — see `updateCreditCycleView()`.
     @Published private(set) var creditTimeline: CreditTimeline = .empty
+    /// Completed-cycle rows retained beside the live cycle so Recent activity
+    /// remains a true rolling history when a new billing cycle begins.
+    @Published private(set) var previousCreditActivity: [ObservedDayCredits] = []
     @Published private(set) var creditCycles: [CreditCycleSummary] = []
     @Published private(set) var selectedCreditCycleDayMs: Int64?
     @Published private(set) var isLoadingCreditCycle = false
@@ -96,13 +415,26 @@ final class UsageStore: ObservableObject {
     @Published private(set) var isLoadingSpendCalendar = false
     @Published private(set) var counterSyncMachineCount = 1
     private var creditSamples: [CreditSample] = []
+    /// Local-only compacted history published by this Mac. Remote observations
+    /// are deliberately never copied here, which prevents sync feedback loops.
+    private var syncCreditSamples: [CreditSample] = []
+    /// Local-only cycle targets published beside the observations. Remote
+    /// targets are resolved for display but never copied into this collection.
+    private var syncCycleBudgets: [SyncedCycleBudget] = []
+    /// One-pass local history snapshot. Routine one-minute sync pulls recombine
+    /// this with the remote cache in memory instead of rescanning SQLite.
+    private var localCreditHistory: CreditSampleStore.HistorySnapshot?
     private var selectedCreditCycleSamples: [CreditSample] = []
     private var serverUsageAccountFingerprint: String?
     private var serverUsageGeneration = 0
     private var creditCycleLoadGeneration = 0
     private var spendCalendarLoadGeneration = 0
     private let cycleBudgetWriter = CycleBudgetWriter()
+    private let remoteSnapshotWriter = RemoteSnapshotWriter()
     private var budgetWriteRevision = 0
+    /// True user-edit time for the active target. Routine counter observations
+    /// reuse this value instead of pretending that each poll changed the budget.
+    private var budgetUpdatedAtMs: Int64
     private var budgetPersistenceTask: Task<Void, Never>?
     private struct ActiveServerRefresh {
         let id: UUID
@@ -110,6 +442,17 @@ final class UsageStore: ObservableObject {
         let task: Task<ServerUsageRefreshOutcome, Never>
     }
     private var activeServerRefreshes: [Int: ActiveServerRefresh] = [:]
+    private struct ActiveCreditHistoryLoad {
+        let id: UUID
+        let generation: Int
+        let account: String?
+        let task: Task<CreditSampleStore.HistorySnapshot?, Never>
+    }
+    private var activeCreditHistoryLoad: ActiveCreditHistoryLoad?
+    /// An ambiguous first response after GitHub advances the reset boundary.
+    /// It remains in memory only and cannot seed the new cycle's high-water mark
+    /// until another response confirms the transition.
+    private var pendingCycleTransitionSample: CreditSample?
 
     /// Text shown in the menu bar (the compact current-month total cost).
     @Published private(set) var menuBarTitle: String = "—"
@@ -131,6 +474,7 @@ final class UsageStore: ObservableObject {
 
     private static let periodKey = "selectedPeriodKind"
     private static let budgetKey = "monthlyBudgetUSD"
+    private static let budgetUpdatedAtKey = "monthlyBudgetUpdatedAtMs"
     private static let excludeWeekendsKey = "excludeWeekendsFromProjection"
     private static let currencyKey = "displayCurrency"
     private static let rateKey = "usdToAUDRate"
@@ -141,6 +485,7 @@ final class UsageStore: ObservableObject {
     private static let serverUsageKey = "serverCreditUsageEnabled"
     private static let serverUsageDisconnectedKey = "serverCreditUsageExplicitlyDisconnected"
     private static let serverUsageAccountKey = "serverCreditUsageAccountFingerprint"
+    private static let creditStoreIdentityKey = "creditHistoryStoreIdentity"
     private static let utcCalendar: Calendar = {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "UTC")!
@@ -149,16 +494,33 @@ final class UsageStore: ObservableObject {
     /// Average days per month (365.25 / 12) — used to convert the monthly
     /// budget into a stable per-day rate for any selected range.
     private static let avgDaysPerMonth = 30.4375
+    /// True only when the database identity differs from the one seen on the
+    /// prior launch. Normal retention must not resurrect pruned remote rows.
+    private var needsSelfHistoryRecovery = false
+    private var creditStoreIdentity: String?
 
     init() {
         let saved = UserDefaults.standard.string(forKey: Self.periodKey)
         periodKind = PeriodKind(rawValue: saved ?? "") ?? .thisMonth
 
         if UserDefaults.standard.object(forKey: Self.budgetKey) != nil {
-            monthlyBudget = max(0, UserDefaults.standard.double(forKey: Self.budgetKey))
+            let stored = UserDefaults.standard.double(forKey: Self.budgetKey)
+            if case let .ok(value) = BudgetInput.parse(String(stored)) {
+                monthlyBudget = value
+            } else {
+                monthlyBudget = 0
+            }
         } else {
             monthlyBudget = 150  // ≈ $5/day default
         }
+        let storedBudgetUpdatedAt = (UserDefaults.standard.object(
+            forKey: Self.budgetUpdatedAtKey
+        ) as? NSNumber)?.int64Value ?? 0
+        budgetUpdatedAtMs = storedBudgetUpdatedAt > 0 ? storedBudgetUpdatedAt
+            : Int64(Date().timeIntervalSince1970 * 1_000)
+        UserDefaults.standard.set(
+            budgetUpdatedAtMs, forKey: Self.budgetUpdatedAtKey
+        )
 
         displayCurrency = Currency(rawValue: UserDefaults.standard.string(forKey: Self.currencyKey) ?? "") ?? .usd
         excludeWeekendsFromProjection = UserDefaults.standard.bool(forKey: Self.excludeWeekendsKey)  // default false
@@ -193,6 +555,21 @@ final class UsageStore: ObservableObject {
         serverUsageEnabled = !explicitlyDisconnected && CreditUsageKeychain.token() != nil
         UserDefaults.standard.set(serverUsageEnabled, forKey: Self.serverUsageKey)
         serverUsageAccountFingerprint = UserDefaults.standard.string(forKey: Self.serverUsageAccountKey)
+        let previousStoreIdentity = UserDefaults.standard.string(
+            forKey: Self.creditStoreIdentityKey
+        )
+        let currentStoreIdentity = CreditSampleStore.storeIdentity()
+        creditStoreIdentity = currentStoreIdentity
+        needsSelfHistoryRecovery = previousStoreIdentity != nil
+            && currentStoreIdentity != nil
+            && previousStoreIdentity != currentStoreIdentity
+        // Do not acknowledge a replacement database until remote recovery has
+        // succeeded. A crash or network failure must retry on the next launch.
+        if !needsSelfHistoryRecovery, let currentStoreIdentity {
+            UserDefaults.standard.set(
+                currentStoreIdentity, forKey: Self.creditStoreIdentityKey
+            )
+        }
         // Hydrate from the cycle itself. Keying this off the baseline pointer
         // alone meant a missing or advanced pointer left the dashboard blank
         // even though the samples were sitting in the database.
@@ -203,8 +580,10 @@ final class UsageStore: ObservableObject {
             creditSamples = Self.loadCycleSamples(
                 resetAtMs: latest.resetAtMs, account: serverUsageAccountFingerprint
             )
+            syncCreditSamples = creditSamples
             selectedCreditCycleSamples = creditSamples
         }
+        refreshCurrentCreditObservation()
 
         Task { await reload() }
         Task { await refreshCreditCycles() }
@@ -231,12 +610,44 @@ final class UsageStore: ObservableObject {
         guard !isLoading else { return }
         isLoading = true
         let t0 = Date()
+        let loadRemoteCache = syncEnabled && !hasLoadedRemoteAggregateCache
+        let remoteCacheGeneration = syncGeneration
+        let machineId = Self.machineId
         let loaded = await Task.detached(priority: .utility) {
-            DataSources.loadAll()
+            let usage = DataSources.loadAll()
+            let remotes: [MachineSyncPayload]?
+            let remoteCacheReadFailed: Bool
+            if loadRemoteCache {
+                if let snapshot = RemoteStore.load() {
+                    remotes = snapshot.filter { $0.machineId != machineId }
+                    remoteCacheReadFailed = false
+                } else {
+                    remotes = nil
+                    remoteCacheReadFailed = true
+                }
+            } else {
+                remotes = nil
+                remoteCacheReadFailed = false
+            }
+            return (
+                usage: usage,
+                remotes: remotes,
+                remoteCacheReadFailed: remoteCacheReadFailed
+            )
         }.value
         let loadMs = Int(Date().timeIntervalSince(t0) * 1000)
-        allRecords = loaded.records
-        status = loaded.status
+        allRecords = loaded.usage.records
+        status = loaded.usage.status
+        var installedCurrentRemoteCache = false
+        if let remotes = loaded.remotes, syncEnabled,
+           syncGeneration == remoteCacheGeneration {
+            remoteAggregates = remotes
+            hasLoadedRemoteAggregateCache = true
+            installedCurrentRemoteCache = true
+        } else if loaded.remoteCacheReadFailed, syncEnabled,
+                  syncGeneration == remoteCacheGeneration {
+            syncError = "Saved multi-Mac usage couldn’t be read. BarPilot kept its current view and will retry."
+        }
         lastUpdated = Date()
         isLoading = false
 
@@ -257,7 +668,17 @@ final class UsageStore: ObservableObject {
             && ProcessInfo.processInfo.environment["BARPILOT_SIMULATE_EXPORTER_DOWN"] != nil
         if simulatingExporterDown { exporterVerdict = .silent(minutes: 14) }
 
-        recompute()
+        if RemoteCacheApplicationPolicy.shouldReapplyHistory(
+            installedCurrentCache: installedCurrentRemoteCache,
+            hasLocalHistory: localCreditHistory != nil
+        ), let localCreditHistory {
+            // The local-history task may have completed before the slower usage
+            // and remote-cache read. Reapply it now so cached peer-only cycles
+            // are available even when the following network sync is offline.
+            applyCreditHistory(localCreditHistory)
+        } else {
+            recompute()
+        }
         // Rotating support log (#24): load cost + what the reload actually computed
         // vs the menu title it set — also the #13 display-vs-data drift diagnostic.
         DiagLog.write("reload: \(loadMs)ms · scanned \(DiagLog.humanBytes(status.jsonlBytesScanned)) · +\(status.newRecords) new · \(allRecords.count) cached · period \(periodKind.rawValue) · menu \(menuBarTitle.hasPrefix("⚠︎") ? "warn" : "ok")\(menuBarTitle.hasSuffix(costString(credits: currentCompactTotalCredits)) ? "" : " · DRIFT")")
@@ -270,6 +691,7 @@ final class UsageStore: ObservableObject {
     // -----------------------------------------------------------------------
 
     private func recompute() {
+        refreshCurrentCreditObservation()
         // Don't paint the menu bar before the first load lands: init() kicks off
         // reload() and refreshRate() concurrently, and if the rate fetch wins the
         // race it would recompute with allRecords still empty — showing a
@@ -312,7 +734,7 @@ final class UsageStore: ObservableObject {
         // The menu-bar figure must signal when it is a local fallback rather than
         // the authoritative GitHub total. Reuse the existing warning glyph.
         let cost = costString(credits: currentCompactTotalCredits)
-        let needsWarning = !serverUsageEnabled || serverUsageError != nil
+        let needsWarning = !serverUsageEnabled || serverUsageStatusIsError
             || currentServerUsageSample == nil || serverUsageIsStale
             || showExporterWarning
         menuBarTitle = needsWarning ? "⚠︎ " + cost : cost
@@ -321,7 +743,7 @@ final class UsageStore: ObservableObject {
     /// Other machines' payloads from the last successful pull. Excludes this
     /// machine's own id defensively.
     private func currentRemoteAggregates() -> [MachineSyncPayload] {
-        RemoteStore.load().filter { $0.machineId != Self.machineId }
+        remoteAggregates
     }
 
     // -----------------------------------------------------------------------
@@ -336,8 +758,6 @@ final class UsageStore: ObservableObject {
         return id
     }
     private static func nowISO() -> String { ISO8601DateFormatter().string(from: Date()) }
-    private static let pushFPKey = "syncLastPushFingerprint"
-
     /// Turn sync on with a freshly-obtained token: persist it, enable, and do an
     /// initial push + pull. Returns the machine count now contributing.
     func enableSyncWith(token: String) async -> Int {
@@ -345,8 +765,13 @@ final class UsageStore: ObservableObject {
             syncError = "The sync credential couldn’t be saved securely."
             return syncMachineCount
         }
-        syncPushBlocked = false; syncError = nil   // fresh start (clears a prior permanent-error block)
-        syncLogin = await GitHubBackend(token: token).currentLogin()   // show which account
+        syncPushBlocked = false
+        syncPushNeedsRetry = false
+        syncError = nil   // fresh start (clears a prior permanent-error block)
+        syncLogin = nil   // the freshly authorized token may be another account
+        syncGeneration += 1
+        activeSyncRun?.task.cancel()
+        activeSyncRun = nil
         syncEnabled = true          // didSet persists + recomputes (local only until pull lands)
         await syncNow(force: true)
         return syncMachineCount
@@ -355,62 +780,327 @@ final class UsageStore: ObservableObject {
     /// Turn sync off. Local raw cache untouched; remote data cache cleared and
     /// the token removed. Does NOT delete the remote gist (offered separately).
     func disableSync() {
+        syncGeneration += 1
+        let generation = syncGeneration
+        activeSyncRun?.task.cancel()
+        activeSyncRun = nil
         syncEnabled = false         // didSet persists + recomputes (back to local-only)
         let removed = Keychain.deleteToken()
-        RemoteStore.clear()
+        let remoteSnapshotWriter = remoteSnapshotWriter
+        Task {
+            await remoteSnapshotWriter.clear(generation: generation)
+        }
+        remoteAggregates = []
+        hasLoadedRemoteAggregateCache = true
         syncLogin = nil
         syncError = removed
             ? nil
             : "Sync is off, but macOS couldn’t remove its saved credential."
         syncPushBlocked = false
-        UserDefaults.standard.removeObject(forKey: Self.pushFPKey)
+        syncPushNeedsRetry = false
+        if let localCreditHistory {
+            applyCreditHistory(localCreditHistory)
+        } else {
+            Task { await refreshCreditCycles() }
+        }
     }
 
     /// Push this machine's payload (only if it changed) and pull the others
     /// into the RemoteStore, then recompute. Safe no-op when off / no token.
     func syncNow(force: Bool = false) async {
-        guard syncEnabled, !isSyncing, !isConnectingServerUsage,
-              let token = Keychain.token() else { return }
-        isSyncing = true
-        defer { isSyncing = false }
-        let backend = GitHubBackend(token: token)
-        if syncLogin == nil { syncLogin = await backend.currentLogin() }   // backfill for already-enabled installs
-        let mine = SyncAggregate.project(
-            allRecords, creditSamples: creditSamples,
-            accountFingerprint: serverUsageAccountFingerprint,
+        let generation = syncGeneration
+        let accountGeneration = serverUsageGeneration
+        let accountUsageEnabled = serverUsageEnabled
+        let accountFingerprint = serverUsageAccountFingerprint
+        guard syncEnabled, !isConnectingServerUsage else { return }
+        guard let token = Keychain.token() else {
+            syncError = "Sync authorization is missing. Turn sync off and re-enable it to reconnect."
+            return
+        }
+        if let active = activeSyncRun {
+            if active.generation == generation,
+               active.serverUsageGeneration == accountGeneration,
+               active.serverUsageEnabled == accountUsageEnabled,
+               active.accountFingerprint == accountFingerprint {
+                await active.task.value
+                return
+            }
+            active.task.cancel()
+            activeSyncRun = nil
+        }
+        let id = UUID()
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await self.performSync(
+                force: force, token: token, generation: generation,
+                serverUsageGeneration: accountGeneration,
+                serverUsageEnabled: accountUsageEnabled,
+                accountFingerprint: accountFingerprint
+            )
+        }
+        activeSyncRun = ActiveSyncRun(
+            id: id,
+            generation: generation,
+            serverUsageGeneration: accountGeneration,
+            serverUsageEnabled: accountUsageEnabled,
+            accountFingerprint: accountFingerprint,
+            task: task
+        )
+        await task.value
+        if activeSyncRun?.id == id {
+            activeSyncRun = nil
+        }
+    }
+
+    private func performSync(
+        force: Bool,
+        token: String,
+        generation: Int,
+        serverUsageGeneration accountGeneration: Int,
+        serverUsageEnabled accountUsageEnabled: Bool,
+        accountFingerprint: String?
+    ) async {
+        guard syncContextIsCurrent(
+            generation: generation,
+            serverUsageGeneration: accountGeneration,
+            serverUsageEnabled: accountUsageEnabled,
+            accountFingerprint: accountFingerprint
+        ),
+              !Task.isCancelled else { return }
+        // Never overwrite this Mac's complete gist history with the one cycle
+        // hydrated synchronously during launch. A failed history read pauses the
+        // push rather than publishing a destructive partial snapshot.
+        if CreditHistoryLoadPolicy.mustLoadBeforeSync(
+            accountFingerprint: accountFingerprint
+        ),
+           localCreditHistory == nil {
+            await refreshCreditCycles()
+            guard syncContextIsCurrent(
+                generation: generation,
+                serverUsageGeneration: accountGeneration,
+                serverUsageEnabled: accountUsageEnabled,
+                accountFingerprint: accountFingerprint
+            ),
+                  !Task.isCancelled else { return }
+            guard localCreditHistory != nil else {
+                syncError = "Saved usage history couldn’t be read, so sync is paused to protect the remote copy."
+                return
+            }
+        }
+
+        var backend = GitHubBackend(token: token, cacheIdentity: syncLogin)
+        if syncPushBlocked { return }
+        if syncLogin == nil {
+            let login = await backend.currentLogin()
+            guard syncContextIsCurrent(
+                generation: generation,
+                serverUsageGeneration: accountGeneration,
+                serverUsageEnabled: accountUsageEnabled,
+                accountFingerprint: accountFingerprint
+            ),
+                  !Task.isCancelled else { return }
+            syncLogin = login
+            backend = GitHubBackend(token: token, cacheIdentity: login)
+        }
+
+        // Read and validate the complete Gist before writing anything. Besides
+        // producing the peer snapshot, this protects a newer-schema self file
+        // during downgrade and recovers this machine's own observations if its
+        // local database was recreated while UserDefaults retained the machine id.
+        let snapshot: [MachineSyncPayload]
+        do {
+            snapshot = try await backend.pullAll()
+        } catch {
+            guard syncContextIsCurrent(
+                generation: generation,
+                serverUsageGeneration: accountGeneration,
+                serverUsageEnabled: accountUsageEnabled,
+                accountFingerprint: accountFingerprint
+            ), !Task.isCancelled else { return }
+            syncError = Self.syncPullErrorMessage(error)
+            NSLog("BarPilot sync: preflight pull failed (\(error))")
+            return
+        }
+        guard syncContextIsCurrent(
+            generation: generation,
+            serverUsageGeneration: accountGeneration,
+            serverUsageEnabled: accountUsageEnabled,
+            accountFingerprint: accountFingerprint
+        ), !Task.isCancelled else { return }
+        let existingSelf = snapshot
+            .filter { $0.machineId == Self.machineId }
+            .max { $0.updatedAt < $1.updatedAt }
+        let remotes = snapshot.filter { $0.machineId != Self.machineId }
+
+        let projected = SyncAggregate.project(
+            allRecords, creditSamples: syncCreditSamples,
+            cycleBudgets: syncCycleBudgets,
+            accountFingerprint: accountFingerprint,
             exchangeRateSnapshot: exchangeRateSnapshot,
             machineId: Self.machineId, label: nil, updatedAt: Self.nowISO()
         )
-        let syncedSamples = mine.creditSamples ?? []
-        let fp = [
-            "\(mine.rows.count)",
-            "\(mine.rows.reduce(0.0) { $0 + $1.credits })",
-            "\(mine.rows.reduce(0) { $0 + $1.inTok + $1.outTok })",
-            "\(syncedSamples.count)",
-            "\(syncedSamples.first?.resetAtMs ?? 0)",
-            "\(mine.accountFingerprint ?? "")",
-            "\(mine.exchangeRateSnapshot?.providerUpdatedAtUnix ?? 0)",
-            "\(mine.exchangeRateSnapshot?.usdToAUD ?? 0)"
-        ].joined(separator: ":")
-        if !syncPushBlocked && (force || fp != UserDefaults.standard.string(forKey: Self.pushFPKey) || syncError != nil) {
+        let mine = SyncAggregate.reconciledSelfPayload(
+            local: projected, remote: existingSelf,
+            recoverRemoteHistory: needsSelfHistoryRecovery
+        )
+
+        // Put recovered self observations back into SQLite, not just into the
+        // outgoing payload, so navigation and the dashboard survive subsequent
+        // offline launches too. A write failure does not endanger the Gist—the
+        // reconciled outgoing payload still contains its previous observations.
+        var recoveryPersistFailed = false
+        if let accountFingerprint,
+           mine.accountFingerprint == accountFingerprint {
+            let recovered = (mine.creditSamples ?? []).map(\.creditSample)
+            let recoveredBudgets = mine.cycleBudgets ?? []
+            let compactLocal = SyncAggregate.compactCreditSamples(syncCreditSamples)
+            let compactLocalBudgets = SyncAggregate.compactCycleBudgets(
+                syncCycleBudgets
+            )
+            if recovered != compactLocal
+                || recoveredBudgets != compactLocalBudgets {
+                let saved = await Task.detached(priority: .utility) {
+                    CreditSampleStore.saveAll(
+                        recovered, cycleBudgets: recoveredBudgets,
+                        account: accountFingerprint
+                    )
+                }.value
+                guard syncContextIsCurrent(
+                    generation: generation,
+                    serverUsageGeneration: accountGeneration,
+                    serverUsageEnabled: accountUsageEnabled,
+                    accountFingerprint: accountFingerprint
+                ), !Task.isCancelled else { return }
+                if saved {
+                    let newestRecovered = recovered.max {
+                        let lhs = $0.serverAtMs ?? $0.capturedAtMs
+                        let rhs = $1.serverAtMs ?? $1.capturedAtMs
+                        return lhs < rhs
+                    }
+                    let recoveredAt = newestRecovered.map {
+                        $0.serverAtMs ?? $0.capturedAtMs
+                    } ?? .min
+                    let currentAt = serverUsageSample.map {
+                        $0.serverAtMs ?? $0.capturedAtMs
+                    } ?? .min
+                    if let newestRecovered, recoveredAt > currentAt {
+                        serverUsageSample = newestRecovered
+                        creditSamples = Self.loadCycleSamples(
+                            resetAtMs: newestRecovered.resetAtMs,
+                            account: accountFingerprint
+                        )
+                        if selectedCreditCycleDayMs == nil {
+                            selectedCreditCycleSamples = creditSamples
+                        }
+                    }
+                    localCreditHistory = nil
+                    await refreshCreditCycles()
+                    completeSelfHistoryRecovery()
+                } else {
+                    recoveryPersistFailed = true
+                    syncError = "Synced usage was recovered, but couldn’t be restored to local storage. BarPilot will retry."
+                }
+            } else {
+                completeSelfHistoryRecovery()
+            }
+        }
+        guard let fp = SyncAggregate.contentFingerprint(mine) else {
+            syncPushNeedsRetry = true
+            syncError = "Sync data couldn’t be prepared safely. BarPilot will retry."
+            return
+        }
+        let publishDeferredForIdentity = !CreditHistoryLoadPolicy.canPublish(
+            serverUsageEnabled: accountUsageEnabled,
+            accountFingerprint: accountFingerprint
+        )
+        if publishDeferredForIdentity {
+            syncError = "Sync is waiting for BarPilot to verify the connected GitHub account."
+        }
+        let shouldPush = SyncPublishPolicy.shouldPush(
+            force: force,
+            fingerprint: fp,
+            needsRetry: syncPushNeedsRetry,
+            remoteFingerprint: existingSelf.flatMap(
+                SyncAggregate.contentFingerprint
+            )
+        )
+        if !publishDeferredForIdentity && !syncPushBlocked && shouldPush {
             do {
                 try await backend.push(mine)
-                UserDefaults.standard.set(fp, forKey: Self.pushFPKey)
-                syncError = nil
+                guard syncContextIsCurrent(
+                    generation: generation,
+                    serverUsageGeneration: accountGeneration,
+                    serverUsageEnabled: accountUsageEnabled,
+                    accountFingerprint: accountFingerprint
+                ),
+                      !Task.isCancelled else { return }
+                syncPushNeedsRetry = false
             } catch {
+                guard syncContextIsCurrent(
+                    generation: generation,
+                    serverUsageGeneration: accountGeneration,
+                    serverUsageEnabled: accountUsageEnabled,
+                    accountFingerprint: accountFingerprint
+                ),
+                      !Task.isCancelled else { return }
+                syncPushNeedsRetry = true
                 syncError = Self.syncErrorMessage(error)
                 if (error as? SyncError)?.isPermanent == true { syncPushBlocked = true }   // stop hammering GitHub on a permanent failure
                 NSLog("BarPilot sync: push failed (\(error))")
             }
         }
-        if syncPushBlocked { return }   // this account can't sync — don't pull either
-        // Replace the remote cache only on a NON-EMPTY pull, so a transient empty
-        // result (eventual consistency right after our own push) can't wipe it.
-        if let others = try? await backend.pullOthers(excluding: Self.machineId), !others.isEmpty {
-            RemoteStore.clear()
-            for o in others { RemoteStore.save(o) }
-            adoptNewestExchangeRate(from: others)
-            recompute()
+        if syncPushBlocked { return }
+        // A successful pull is the authoritative complete peer snapshot. This
+        // includes an empty list: retaining absent peers would keep deleted or
+        // disconnected Macs contributing forever. Failed pulls throw above and
+        // preserve the last-good cache instead.
+        let cacheSaved = await remoteSnapshotWriter.replaceAll(
+            remotes, generation: generation
+        )
+        guard syncContextIsCurrent(
+            generation: generation,
+            serverUsageGeneration: accountGeneration,
+            serverUsageEnabled: accountUsageEnabled,
+            accountFingerprint: accountFingerprint
+        ), !Task.isCancelled else { return }
+        guard cacheSaved else {
+            syncError = "Multi-Mac usage downloaded, but its local cache couldn’t be updated. BarPilot will retry."
+            DiagLog.write("sync: remote snapshot persist failed")
+            return
+        }
+        remoteAggregates = remotes
+        hasLoadedRemoteAggregateCache = true
+        adoptNewestExchangeRate(from: remoteAggregates)
+        if let localCreditHistory {
+            applyCreditHistory(localCreditHistory)
+        } else {
+            await refreshCreditCycles()
+        }
+        if !syncPushNeedsRetry && !publishDeferredForIdentity
+            && !recoveryPersistFailed {
+            syncError = nil
+        }
+    }
+
+    private func syncContextIsCurrent(
+        generation: Int,
+        serverUsageGeneration accountGeneration: Int,
+        serverUsageEnabled accountUsageEnabled: Bool,
+        accountFingerprint: String?
+    ) -> Bool {
+        syncEnabled
+            && syncGeneration == generation
+            && serverUsageGeneration == accountGeneration
+            && serverUsageEnabled == accountUsageEnabled
+            && serverUsageAccountFingerprint == accountFingerprint
+    }
+
+    private func completeSelfHistoryRecovery() {
+        needsSelfHistoryRecovery = false
+        if let creditStoreIdentity {
+            UserDefaults.standard.set(
+                creditStoreIdentity, forKey: Self.creditStoreIdentityKey
+            )
         }
     }
 
@@ -425,6 +1115,19 @@ final class UsageStore: ObservableObject {
             return "Can’t reach GitHub right now — will keep retrying."
         default:
             return "Sync couldn’t upload — will retry."
+        }
+    }
+
+    private static func syncPullErrorMessage(_ error: Error) -> String {
+        switch error as? SyncError {
+        case .unauthorized:
+            return "Sync authorization is no longer valid. Turn sync off and re-enable."
+        case .forbidden:
+            return "GitHub wouldn’t allow BarPilot to download the sync data."
+        case .encoding:
+            return "GitHub sync data couldn’t be read. BarPilot kept the last good local copy and will retry."
+        default:
+            return "Can’t download multi-Mac usage from GitHub right now — will keep retrying."
         }
     }
 
@@ -458,18 +1161,29 @@ final class UsageStore: ObservableObject {
         }
         guard generation == serverUsageGeneration else { return false }
         let budgetUSD = monthlyBudget
+        let budgetChangedAtMs = budgetUpdatedAtMs
+        let previous = serverUsageAccountFingerprint == fingerprint
+            ? serverUsageSample : nil
+        let transitionNeedsConfirmation = CreditCycleTransitionPolicy
+            .needsConfirmation(previous: previous, current: sample)
 
         guard CreditUsageKeychain.saveToken(token) else {
             serverUsageError = "GitHub authenticated, but the credential couldn’t be saved securely."
             recompute()
             return false
         }
+        if transitionNeedsConfirmation {
+            return finishServerUsageConnectionAwaitingTransition(
+                sample: sample, fingerprint: fingerprint
+            )
+        }
         let saved = await Task.detached(priority: .utility) {
             // Claim pre-attribution rows before the first attributed write, so
             // the opening sample and the existing history share one account.
             CreditSampleStore.adoptUnattributed(account: fingerprint)
             let didSave = CreditSampleStore.save(
-                sample, account: fingerprint, budgetUSD: budgetUSD
+                sample, account: fingerprint, budgetUSD: budgetUSD,
+                budgetUpdatedAtMs: budgetChangedAtMs
             )
             return (
                 didSave,
@@ -496,15 +1210,42 @@ final class UsageStore: ObservableObject {
         )
     }
 
+    /// Reconnect without persisting a boundary response that still carries the
+    /// previous cycle's counter. The normal poll path will accept it only after
+    /// GitHub supplies a value below that prior high-water mark.
+    private func finishServerUsageConnectionAwaitingTransition(
+        sample: CreditSample, fingerprint: String
+    ) -> Bool {
+        resetCreditCycleSelection()
+        resetSpendCalendar()
+        pendingCycleTransitionSample = sample
+        serverUsageAccountFingerprint = fingerprint
+        UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
+        serverUsageEnabled = true
+        UserDefaults.standard.set(true, forKey: Self.serverUsageKey)
+        UserDefaults.standard.set(false, forKey: Self.serverUsageDisconnectedKey)
+        serverUsageError = nil
+        recompute()
+        Task { await refreshCreditCycles() }
+        Task { await refreshServerUsage() }
+        return true
+    }
+
     /// Commit a verified connection. Shared so a failed *local* persist takes
     /// exactly the same path as a successful one.
     private func finishServerUsageConnection(
         sample: CreditSample, fingerprint: String,
         cycles: [CreditCycleSummary]
     ) -> Bool {
+        let accountChanged = serverUsageAccountFingerprint != fingerprint
         resetCreditCycleSelection()
         resetSpendCalendar()
+        pendingCycleTransitionSample = nil
         serverUsageAccountFingerprint = fingerprint
+        if accountChanged {
+            syncCycleBudgets = []
+            localCreditHistory = nil
+        }
         UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
         serverUsageEnabled = true
         UserDefaults.standard.set(true, forKey: Self.serverUsageKey)
@@ -516,13 +1257,19 @@ final class UsageStore: ObservableObject {
         // so a genuinely different account is excluded by the query instead.
         creditSamples = Self.loadCycleSamples(resetAtMs: sample.resetAtMs, account: fingerprint)
         if !creditSamples.contains(sample) { creditSamples.append(sample) }
+        syncCreditSamples = creditSamples
+        upsertLocalCycleBudget(
+            resetDayMs: CreditCycleSummary.dayStart(for: sample.resetAtMs),
+            budgetUSD: monthlyBudget, updatedAtMs: budgetUpdatedAtMs
+        )
+        localCreditHistory = nil
         creditCycles = cycles
         upsertCreditCycle(sample)
         selectedCreditCycleSamples = creditSamples
         serverUsageSample = sample
         serverUsageError = nil
         recompute()
-        Task { await refreshBudgetMigrationCycle() }
+        Task { await refreshCreditCycles() }
         return true
     }
 
@@ -557,18 +1304,111 @@ final class UsageStore: ObservableObject {
     }
 
     private func refreshCreditCycles() async {
-        guard serverUsageEnabled else { return }
+        guard CreditHistoryLoadPolicy.shouldLoad(
+            serverUsageEnabled: serverUsageEnabled,
+            syncEnabled: syncEnabled,
+            accountFingerprint: serverUsageAccountFingerprint
+        ) else { return }
         let account = serverUsageAccountFingerprint
         let generation = serverUsageGeneration
-        let cycles = await Task.detached(priority: .utility) {
-            CreditSampleStore.cycles(account: account)
-        }.value
-        guard serverUsageEnabled, generation == serverUsageGeneration,
+        let active: ActiveCreditHistoryLoad
+        if let existing = activeCreditHistoryLoad,
+           existing.generation == generation,
+           existing.account == account {
+            active = existing
+        } else {
+            let created = ActiveCreditHistoryLoad(
+                id: UUID(),
+                generation: generation,
+                account: account,
+                task: Task.detached(priority: .utility) {
+                    CreditSampleStore.compactedHistory(account: account)
+                }
+            )
+            activeCreditHistoryLoad = created
+            active = created
+        }
+        let stored = await active.task.value
+        if activeCreditHistoryLoad?.id == active.id {
+            activeCreditHistoryLoad = nil
+        }
+        guard CreditHistoryLoadPolicy.shouldLoad(
+            serverUsageEnabled: serverUsageEnabled,
+            syncEnabled: syncEnabled,
+            accountFingerprint: serverUsageAccountFingerprint
+        ), generation == serverUsageGeneration,
               account == serverUsageAccountFingerprint else {
             return
         }
-        creditCycles = cycles
-        if let sample = serverUsageSample { upsertCreditCycle(sample) }
+        guard let stored else {
+            DiagLog.write("credit history: compacted load failed")
+            return
+        }
+        localCreditHistory = stored
+        applyCreditHistory(stored)
+        await refreshBudgetMigrationCycle()
+    }
+
+    /// Rebuild the visible cycle list and rolling rows from an already compacted
+    /// local snapshot plus the current remote cache. This path is intentionally
+    /// database-free because sync can call it every minute.
+    private func applyCreditHistory(
+        _ stored: CreditSampleStore.HistorySnapshot
+    ) {
+        let account = serverUsageAccountFingerprint
+        // The stored snapshot is intentionally stable between rollovers; union
+        // the live in-memory cycle so routine remote recomputes cannot discard
+        // buckets captured since the startup history query.
+        syncCreditSamples = SyncAggregate.compactCreditSamples(
+            stored.samples + creditSamples
+        )
+        syncCycleBudgets = CreditHistoryMergePolicy.cycleBudgets(
+            stored: stored.cycleBudgets, live: syncCycleBudgets
+        )
+
+        // A disconnected dashboard intentionally falls back to local telemetry.
+        // The history load above exists only to keep the sync upload complete;
+        // do not leak retained account-counter rows back into that fallback UI.
+        guard serverUsageEnabled else {
+            previousCreditActivity = []
+            recompute()
+            return
+        }
+
+        let remotes = syncEnabled ? currentRemoteAggregates() : []
+        let remoteSamples: [CreditSample]
+        if let account {
+            remoteSamples = remotes
+                .filter { $0.accountFingerprint == account }
+                .flatMap { $0.creditSamples ?? [] }
+                .map(\.creditSample)
+        } else {
+            remoteSamples = []
+        }
+        creditCycles = SyncAggregate.mergedCreditCycles(
+            local: stored.cycles,
+            additionalSamples: remoteSamples
+                + [serverUsageSample].compactMap { $0 }
+        )
+        refreshCurrentCreditObservation()
+        let liveDay = CreditCycleSummary.liveCycleDay(
+            currentSample: currentServerUsageSample, cycles: creditCycles
+        )
+        previousCreditActivity = CreditTimeline.combinedDailyRows(
+            samplesByCycle: creditCycles.compactMap { cycle in
+                guard cycle.resetDayMs != liveDay else { return nil }
+                let local = stored.samplesByCycle[cycle.resetDayMs] ?? []
+                if let account {
+                    return SyncAggregate.mergedCreditSamples(
+                        local: local,
+                        remotes: remotes,
+                        resetAtMs: cycle.resetAtMs,
+                        accountFingerprint: account
+                    )
+                }
+                return local
+            }
+        )
         if let selectedCreditCycleDayMs,
            !creditCycles.contains(where: {
                $0.resetDayMs == selectedCreditCycleDayMs
@@ -576,21 +1416,26 @@ final class UsageStore: ObservableObject {
             resetCreditCycleSelection()
         }
         recompute()
-        await refreshBudgetMigrationCycle()
     }
 
     func disableServerUsage() {
         serverUsageGeneration += 1
+        let removed = CreditUsageKeychain.deleteToken()
+        transitionToDisconnectedServerUsage(error: removed
+            ? nil
+            : "GitHub is disconnected, but macOS couldn’t remove the saved credential.")
+    }
+
+    private func transitionToDisconnectedServerUsage(error: String?) {
         serverUsageEnabled = false
+        pendingCycleTransitionSample = nil
         budgetMigrationCycleDayMs = nil
+        previousCreditActivity = []
         resetCreditCycleSelection()
         resetSpendCalendar()
         UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
         UserDefaults.standard.set(true, forKey: Self.serverUsageDisconnectedKey)
-        let removed = CreditUsageKeychain.deleteToken()
-        serverUsageError = removed
-            ? nil
-            : "GitHub is disconnected, but macOS couldn’t remove the saved credential."
+        serverUsageError = error
         recompute()
     }
 
@@ -603,6 +1448,7 @@ final class UsageStore: ObservableObject {
     func endServerUsageConnection() {
         isConnectingServerUsage = false
         serverUsageConnectTask = nil
+        if syncEnabled { Task { await syncNow() } }
     }
 
     /// Let the user abandon a device-flow authorization that can't complete —
@@ -670,13 +1516,10 @@ final class UsageStore: ObservableObject {
             return .notNeeded
         }
         guard let token = CreditUsageKeychain.token() else {
-            serverUsageError = "GitHub is disconnected. Connect again from the usage window."
-            serverUsageEnabled = false
-            resetCreditCycleSelection()
-            resetSpendCalendar()
-            UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
-            UserDefaults.standard.set(true, forKey: Self.serverUsageDisconnectedKey)
-            recompute()
+            serverUsageGeneration += 1
+            transitionToDisconnectedServerUsage(
+                error: "GitHub is disconnected. Connect again from the usage window."
+            )
             return .notNeeded
         }
         do {
@@ -685,6 +1528,38 @@ final class UsageStore: ObservableObject {
                   !Task.isCancelled else {
                 return .notNeeded
             }
+            let previous = serverUsageSample
+            var confirmedPendingTransition = false
+            if let pending = pendingCycleTransitionSample {
+                if CreditCycleTransitionPolicy.confirms(
+                    previous: previous ?? pending,
+                    pending: pending,
+                    current: sample
+                ) {
+                    confirmedPendingTransition = true
+                    pendingCycleTransitionSample = nil
+                } else if CreditCycleSummary.dayStart(for: pending.resetAtMs)
+                            == CreditCycleSummary.dayStart(for: sample.resetAtMs) {
+                    // A repeated non-zero value is still indistinguishable from
+                    // the old cycle's cached counter. Keep waiting without ever
+                    // writing it into the new cycle.
+                    serverUsageError = nil
+                    recompute()
+                    return .refreshed
+                } else {
+                    pendingCycleTransitionSample = nil
+                }
+            }
+            if !confirmedPendingTransition,
+               CreditCycleTransitionPolicy.needsConfirmation(
+                   previous: previous, current: sample
+               ) {
+                pendingCycleTransitionSample = sample
+                serverUsageError = nil
+                recompute()
+                return .refreshed
+            }
+
             let resolvedAccountDuringRefresh = serverUsageAccountFingerprint == nil
             if resolvedAccountDuringRefresh {
                 guard let fingerprint = await CreditUsageAPI.accountFingerprint(token: token) else {
@@ -701,14 +1576,18 @@ final class UsageStore: ObservableObject {
                     return .notNeeded
                 }
                 serverUsageAccountFingerprint = fingerprint
+                localCreditHistory = nil
+                syncCycleBudgets = []
                 UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
             }
             let account = serverUsageAccountFingerprint
             let budgetUSD = monthlyBudget
+            let budgetChangedAtMs = self.budgetUpdatedAtMs
             let persisted = await Task.detached(priority: .utility) {
                 if let account { CreditSampleStore.adoptUnattributed(account: account) }
                 let saved = CreditSampleStore.save(
-                    sample, account: account, budgetUSD: budgetUSD
+                    sample, account: account, budgetUSD: budgetUSD,
+                    budgetUpdatedAtMs: budgetChangedAtMs
                 )
                 let cycles = resolvedAccountDuringRefresh
                     ? CreditSampleStore.cycles(account: account)
@@ -725,19 +1604,23 @@ final class UsageStore: ObservableObject {
                 return .notNeeded
             }
             budgetPersistenceError = nil
+            upsertLocalCycleBudget(
+                resetDayMs: CreditCycleSummary.dayStart(for: sample.resetAtMs),
+                budgetUSD: budgetUSD, updatedAtMs: budgetChangedAtMs
+            )
             if let cycles = persisted.1 { creditCycles = cycles }
             upsertCreditCycle(sample)
             // Only treat this as a genuine rollover when the cycle actually moved
             // FORWARD and the counter reset with it. Reacting to any change meant
             // one response whose reset resolved from a different field discarded
             // the cycle's history even though nothing had actually rolled over.
-            let previous = serverUsageSample
-            let rolledOver = previous.map {
-                CreditCycleSummary.dayStart(for: sample.resetAtMs)
-                    > CreditCycleSummary.dayStart(for: $0.resetAtMs)
-                    && sample.creditsUsed < $0.creditsUsed
-            } ?? false
-            if rolledOver {
+            let cycleChanged = CreditCycleTransitionPolicy.changed(
+                previous: previous, current: sample
+            )
+            let rolledOver = CreditCycleTransitionPolicy.rolledOver(
+                previous: previous, current: sample
+            )
+            if rolledOver || confirmedPendingTransition {
                 creditSamples = [sample]
             } else if previous == nil || sample.resetAtMs != previous?.resetAtMs {
                 // First sample of the session, or the reset instant shifted within
@@ -749,6 +1632,9 @@ final class UsageStore: ObservableObject {
             } else {
                 creditSamples.append(sample)
             }
+            if !syncCreditSamples.contains(sample) {
+                syncCreditSamples.append(sample)
+            }
             if selectedCreditCycleDayMs == nil {
                 selectedCreditCycleSamples = creditSamples
             } else if !creditCycles.contains(where: {
@@ -759,7 +1645,14 @@ final class UsageStore: ObservableObject {
             serverUsageSample = sample
             serverUsageError = nil
             recompute()
-            await refreshBudgetMigrationCycle()
+            if cycleChanged || resolvedAccountDuringRefresh {
+                await refreshCreditCycles()
+            } else {
+                await refreshBudgetMigrationCycle()
+            }
+            if resolvedAccountDuringRefresh, syncEnabled {
+                await syncNow()
+            }
             return .refreshed
         } catch {
             guard !Task.isCancelled else { return .notNeeded }
@@ -768,12 +1661,14 @@ final class UsageStore: ObservableObject {
             }
             serverUsageError = Self.serverUsageErrorMessage(error)
             if case .unauthorized = error as? CreditUsageError {
-                serverUsageEnabled = false
-                resetCreditCycleSelection()
-                resetSpendCalendar()
-                UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
-                UserDefaults.standard.set(true, forKey: Self.serverUsageDisconnectedKey)
-                _ = CreditUsageKeychain.deleteToken()
+                let message = serverUsageError
+                serverUsageGeneration += 1
+                let removed = CreditUsageKeychain.deleteToken()
+                transitionToDisconnectedServerUsage(error: removed
+                    ? message
+                    : "GitHub authentication expired, and macOS couldn’t remove the saved credential."
+                )
+                return .notNeeded
             }
             recompute()
             if case .network = error as? CreditUsageError {
@@ -844,13 +1739,39 @@ final class UsageStore: ObservableObject {
     }
 
     var displayTotalCredits: Double { reconciled.totalCredits }
+    var rollingCreditActivity: [ObservedDayCredits] {
+        CreditTimeline.mergedDailyRows([
+            creditTimeline.daily, previousCreditActivity
+        ])
+    }
+    private func refreshCurrentCreditObservation() {
+        // Gated on the connection too: an explicit disconnect drops the headline
+        // to local telemetry. While connected, however, a matching peer may be
+        // the only Mac that observed the current cycle rollover.
+        guard serverUsageEnabled else {
+            resolvedCurrentCreditObservation = nil
+            return
+        }
+        resolvedCurrentCreditObservation = SyncAggregate.currentCreditObservation(
+            local: serverUsageSample,
+            remotes: syncEnabled ? currentRemoteAggregates() : [],
+            accountFingerprint: serverUsageAccountFingerprint
+        )
+    }
+    private var currentServerUsageObservation: CurrentCreditObservation? {
+        resolvedCurrentCreditObservation
+    }
     var currentServerUsageSample: CreditSample? {
-        // Gated on the connection too: a disconnect drops the headline to local
-        // telemetry, so leaving the reset date, chart and daily table rendering
-        // retained server data would contradict it on screen.
-        guard serverUsageEnabled, let sample = serverUsageSample,
-              CreditReconciliation.isCurrentCycle(sample) else { return nil }
-        return sample
+        currentServerUsageObservation?.sample
+    }
+    var currentServerUsageSampleIsRemote: Bool {
+        currentServerUsageObservation?.cameFromRemote == true
+    }
+    var currentServerUsageObservedAt: Date? {
+        guard let sample = currentServerUsageSample else { return nil }
+        return Date(timeIntervalSince1970: Double(
+            sample.serverAtMs ?? sample.capturedAtMs
+        ) / 1000)
     }
     var compactTotalCredits: Double {
         if selectedCreditCycleDayMs != nil {
@@ -864,6 +1785,11 @@ final class UsageStore: ObservableObject {
     private var currentCompactTotalCredits: Double {
         guard serverUsageEnabled, let sample = currentServerUsageSample else {
             return currentMonthReport.totalCredits
+        }
+        guard CreditReconciliation.matchesCurrentCycle(
+            snapshot: sample, report: currentMonthReport, now: Date()
+        ) else {
+            return sample.creditsUsed
         }
         return max(sample.creditsUsed, currentMonthReport.totalCredits)
     }
@@ -907,11 +1833,13 @@ final class UsageStore: ObservableObject {
             return false
         }
         let account = serverUsageAccountFingerprint
+        let updatedAtMs = Int64(Date().timeIntervalSince1970 * 1_000)
         let saved = await Task.detached(priority: .utility) {
             let saved = CreditSampleStore.assignCycleBudgetIfMissing(
                 resetDayMs: resetDayMs,
                 account: account,
-                budgetUSD: budgetUSD
+                budgetUSD: budgetUSD,
+                updatedAtMs: updatedAtMs
             )
             if saved { CreditSampleStore.completeBudgetMigration(account: account) }
             return saved
@@ -922,6 +1850,13 @@ final class UsageStore: ObservableObject {
         }
         selectedHistoricalBudgetUSD = budgetUSD
         budgetMigrationCycleDayMs = nil
+        upsertLocalCycleBudget(
+            resetDayMs: resetDayMs, budgetUSD: budgetUSD,
+            updatedAtMs: updatedAtMs
+        )
+        localCreditHistory = nil
+        await refreshCreditCycles()
+        if syncEnabled { await syncNow() }
         return true
     }
 
@@ -1094,7 +2029,7 @@ final class UsageStore: ObservableObject {
                     CreditSampleStore.loadCycle(
                         resetDayMs: resetDayMs, account: account
                     ),
-                    CreditSampleStore.cycleBudget(
+                    CreditSampleStore.cycleBudgetSnapshot(
                         resetDayMs: resetDayMs, account: account
                     )
                 )
@@ -1109,7 +2044,13 @@ final class UsageStore: ObservableObject {
             }
             selectedCreditCycleDayMs = resetDayMs
             selectedCreditCycleSamples = stored.0
-            selectedHistoricalBudgetUSD = stored.1
+            if let budget = stored.1 {
+                upsertLocalCycleBudget(
+                    resetDayMs: resetDayMs, budgetUSD: budget.budgetUSD,
+                    updatedAtMs: budget.updatedAtMs
+                )
+            }
+            selectedHistoricalBudgetUSD = stored.1?.budgetUSD
             updateCreditCycleView()
             isLoadingCreditCycle = false
         }
@@ -1150,6 +2091,16 @@ final class UsageStore: ObservableObject {
                     ? $0.capturedAtMs < $1.capturedAtMs
                     : lhs < rhs
             }?.creditsUsed
+        if let selectedCreditCycleDayMs,
+           let accountFingerprint = serverUsageAccountFingerprint {
+            selectedHistoricalBudgetUSD = SyncAggregate.cycleBudget(
+                resetDayMs: selectedCreditCycleDayMs,
+                local: syncCycleBudgets,
+                localMachineId: Self.machineId,
+                remotes: syncEnabled ? currentRemoteAggregates() : [],
+                accountFingerprint: accountFingerprint
+            )?.budgetUSD
+        }
     }
 
     private func countCounterSyncMachines() -> Int {
@@ -1170,18 +2121,33 @@ final class UsageStore: ObservableObject {
     var dailyRows: [DailyRow] { reconciled.daily }
 
     var serverUsageIsStale: Bool {
-        guard let sample = serverUsageSample else { return false }
-        return Date().timeIntervalSince(sample.capturedAt) > 5 * 60
+        guard let observedAt = currentServerUsageObservedAt else { return false }
+        return Date().timeIntervalSince(observedAt) > 5 * 60
+    }
+
+    /// A failed direct poll is not a dashboard failure when a fresh matching Mac
+    /// supplied the same authoritative account counter through sync.
+    var serverUsageStatusIsError: Bool {
+        serverUsageError != nil
+            && !(currentServerUsageSampleIsRemote && !serverUsageIsStale)
     }
 
     var serverUsageStatusLabel: String {
         guard serverUsageEnabled else {
             return serverUsageError == nil ? "GitHub · disconnected" : "GitHub · reconnect required"
         }
-        if serverUsageError != nil { return "GitHub · error" }
-        if serverUsageSample == nil { return "GitHub · connecting" }
+        if serverUsageStatusIsError { return "GitHub · error" }
+        if currentServerUsageSample == nil && serverUsageSample == nil {
+            return "GitHub · connecting"
+        }
         if currentServerUsageSample == nil { return "GitHub · awaiting cycle" }
-        if serverUsageIsStale { return "GitHub · stale" }
+        if serverUsageIsStale {
+            return currentServerUsageSampleIsRemote
+                ? "GitHub · synced data stale" : "GitHub · stale"
+        }
+        if currentServerUsageSampleIsRemote {
+            return "GitHub · via sync"
+        }
         return "GitHub · connected"
     }
 
@@ -1190,15 +2156,25 @@ final class UsageStore: ObservableObject {
         recompute()
     }
 
-    private func persistBudget() {
+    private func persistBudget(previousValue: Double) {
         UserDefaults.standard.set(monthlyBudget, forKey: Self.budgetKey)
+        guard monthlyBudget != previousValue else { return }
+        budgetUpdatedAtMs = max(
+            budgetUpdatedAtMs + 1,
+            Int64(Date().timeIntervalSince1970 * 1_000)
+        )
+        UserDefaults.standard.set(
+            budgetUpdatedAtMs, forKey: Self.budgetUpdatedAtKey
+        )
         budgetPersistenceError = nil
         guard serverUsageEnabled, let sample = currentServerUsageSample else {
             return
         }
         let resetDayMs = CreditCycleSummary.dayStart(for: sample.resetAtMs)
         let account = serverUsageAccountFingerprint
+        let accountGeneration = serverUsageGeneration
         let budgetUSD = monthlyBudget
+        let updatedAtMs = budgetUpdatedAtMs
         budgetWriteRevision += 1
         let revision = budgetWriteRevision
         let writer = cycleBudgetWriter
@@ -1207,17 +2183,45 @@ final class UsageStore: ObservableObject {
                 revision: revision,
                 resetDayMs: resetDayMs,
                 account: account,
-                budgetUSD: budgetUSD
+                budgetUSD: budgetUSD,
+                updatedAtMs: updatedAtMs
             )
             guard let self, revision == self.budgetWriteRevision else { return }
             self.budgetPersistenceTask = nil
+            guard BudgetPersistenceCompletionPolicy.shouldApply(
+                revision: revision,
+                latestRevision: self.budgetWriteRevision,
+                accountGeneration: accountGeneration,
+                currentAccountGeneration: self.serverUsageGeneration,
+                account: account,
+                currentAccount: self.serverUsageAccountFingerprint
+            ) else { return }
             if !saved {
                 self.budgetPersistenceError =
                     "The target is saved for this Mac, but the billing-cycle snapshot couldn’t be updated."
                 DiagLog.write("budget: cycle snapshot persist failed")
+            } else {
+                self.upsertLocalCycleBudget(
+                    resetDayMs: resetDayMs, budgetUSD: budgetUSD,
+                    updatedAtMs: updatedAtMs
+                )
+                self.localCreditHistory = nil
+                if self.syncEnabled {
+                    Task { [weak self] in await self?.syncNow() }
+                }
             }
         }
         budgetPersistenceTask = task
+    }
+
+    private func upsertLocalCycleBudget(
+        resetDayMs: Int64, budgetUSD: Double, updatedAtMs: Int64
+    ) {
+        syncCycleBudgets.append(SyncedCycleBudget(
+            resetDayMs: resetDayMs, budgetUSD: budgetUSD,
+            updatedAtMs: updatedAtMs
+        ))
+        syncCycleBudgets = SyncAggregate.compactCycleBudgets(syncCycleBudgets)
     }
 
     var hasPendingBudgetPersistence: Bool { budgetPersistenceTask != nil }
@@ -1349,12 +2353,15 @@ final class UsageStore: ObservableObject {
     }
 
     var compactSpendProjection: SpendProjection? {
-        guard isViewingCurrentCreditCycle else { return nil }
-        var displayReport = currentMonthReport
-        displayReport.totalCredits = currentCompactTotalCredits
-        return SpendProjection.compute(
-            periodKind: .thisMonth, report: displayReport,
-            monthlyBudgetUSD: monthlyBudget, now: Date(),
+        guard isViewingCurrentCreditCycle,
+              let cycle = selectedCreditCycle,
+              let startAt = cycle.startAt else { return nil }
+        return SpendProjection.computeBillingCycle(
+            totalCredits: currentCompactTotalCredits,
+            monthlyBudgetUSD: monthlyBudget,
+            startAt: startAt,
+            resetAt: cycle.resetAt,
+            now: Date(),
             calendar: Self.utcCalendar,
             excludeWeekends: excludeWeekendsFromProjection)
     }

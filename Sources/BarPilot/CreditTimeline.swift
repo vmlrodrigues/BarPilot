@@ -10,6 +10,19 @@ struct ObservedDayCredits: Identifiable {
     }
 }
 
+/// One stable chart slot for every UTC day touched by a billing cycle. Observed
+/// spend is sparse, but the chart is not: keeping future and no-observation days
+/// in the series prevents the graph changing width as the month progresses.
+struct BillingCycleDayCredits: Identifiable {
+    let id: String
+    let day: String
+    let date: Date
+    let credits: Double
+    let hasObservedIncrease: Bool
+    let isFuture: Bool
+    let isCurrentDay: Bool
+}
+
 struct CreditTimeline {
     let daily: [ObservedDayCredits]
     let openingCredits: Double
@@ -113,6 +126,71 @@ struct CreditTimeline {
         return byDay
     }
 
+    /// Merge independently reconciled cycles into one newest-first activity
+    /// history. A UTC day can straddle a non-midnight reset, so both sides are
+    /// summed instead of letting one cycle replace the other.
+    static func mergedDailyRows(
+        _ groups: [[ObservedDayCredits]]
+    ) -> [ObservedDayCredits] {
+        var byDay: [String: Double] = [:]
+        for group in groups {
+            for row in group {
+                byDay[row.day, default: 0] += row.credits
+            }
+        }
+        return byDay.map {
+            ObservedDayCredits(id: $0.key, day: $0.key, credits: $0.value)
+        }.sorted { $0.day > $1.day }
+    }
+
+    static func combinedDailyRows(
+        samplesByCycle: [[CreditSample]]
+    ) -> [ObservedDayCredits] {
+        mergedDailyRows(samplesByCycle.map { build(samples: $0).daily })
+    }
+
+    /// Expand sparse observed-day totals into the complete selected billing
+    /// cycle. The reset instant is exclusive: a midnight reset belongs to the
+    /// next cycle, while a non-midnight reset legitimately leaves a partial
+    /// final UTC day in this one.
+    static func billingCycleDays(
+        daily: [ObservedDayCredits],
+        startAt: Date,
+        resetAt: Date,
+        now: Date = Date()
+    ) -> [BillingCycleDayCredits] {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        guard resetAt > startAt else { return [] }
+
+        let firstDay = calendar.startOfDay(for: startAt)
+        let finalInstant = resetAt.addingTimeInterval(-0.001)
+        let lastDay = calendar.startOfDay(for: finalInstant)
+        let today = calendar.startOfDay(for: now)
+        let byDay = Dictionary(uniqueKeysWithValues: daily.map { ($0.day, $0.credits) })
+        let observedDays = Set(daily.map(\.day))
+        let cycleContainsNow = now >= startAt && now < resetAt
+
+        var result: [BillingCycleDayCredits] = []
+        var date = firstDay
+        while date <= lastDay && result.count < 35 {
+            let day = CreditCycleSummary.utcDayString(for: date)
+            result.append(BillingCycleDayCredits(
+                id: day,
+                day: day,
+                date: date,
+                credits: byDay[day] ?? 0,
+                hasObservedIncrease: observedDays.contains(day),
+                isFuture: cycleContainsNow && date > today,
+                isCurrentDay: cycleContainsNow && date == today
+            ))
+            guard let next = calendar.date(byAdding: .day, value: 1, to: date)
+            else { break }
+            date = next
+        }
+        return result
+    }
+
     static func verify() {
         let hour: Int64 = 60 * 60 * 1000
         let reset = Aggregator.utcMidnightMs("2030-02-01")
@@ -194,5 +272,44 @@ struct CreditTimeline {
         )
         precondition(splitResetDay["2030-01-11"] == 30,
                      "calendar spend must sum both sides of a reset-day boundary")
+
+        let chartStart = Date(timeIntervalSince1970: Double(
+            Aggregator.utcMidnightMs("2030-09-01")) / 1000)
+        let chartReset = Date(timeIntervalSince1970: Double(
+            Aggregator.utcMidnightMs("2030-10-01")) / 1000)
+        let chartNow = Date(timeIntervalSince1970: Double(
+            Aggregator.utcMidnightMs("2030-09-02") + 12 * hour) / 1000)
+        let chartDays = billingCycleDays(
+            daily: [ObservedDayCredits(
+                id: "2030-09-01", day: "2030-09-01", credits: 42
+            )],
+            startAt: chartStart,
+            resetAt: chartReset,
+            now: chartNow
+        )
+        precondition(chartDays.count == 30,
+                     "September must keep all 30 daily chart slots from day one")
+        precondition(chartDays.first?.credits == 42
+                     && chartDays.first?.hasObservedIncrease == true)
+        precondition(chartDays[1].isCurrentDay && !chartDays[1].isFuture)
+        precondition(chartDays[2].isFuture && chartDays.last?.isFuture == true)
+
+        let middayReset = chartReset.addingTimeInterval(Double(12 * hour) / 1000)
+        let partialResetDay = billingCycleDays(
+            daily: [], startAt: chartStart, resetAt: middayReset, now: chartNow
+        )
+        precondition(partialResetDay.count == 31,
+                     "a non-midnight reset must retain its partial final UTC day")
+
+        let combinedRows = mergedDailyRows([
+            [ObservedDayCredits(id: "2030-09-01", day: "2030-09-01", credits: 10)],
+            [
+                ObservedDayCredits(id: "2030-09-01", day: "2030-09-01", credits: 5),
+                ObservedDayCredits(id: "2030-08-31", day: "2030-08-31", credits: 20)
+            ]
+        ])
+        precondition(combinedRows.map(\.day) == ["2030-09-01", "2030-08-31"]
+                     && combinedRows.first?.credits == 15,
+                     "rolling history must retain and combine activity across cycles")
     }
 }

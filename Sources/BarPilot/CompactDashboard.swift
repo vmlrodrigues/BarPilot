@@ -22,6 +22,7 @@ final class PopoverPresentationState: ObservableObject {
 
     func reset() { layer = .base }
 
+    @MainActor
     static func verify() {
         let state = PopoverPresentationState()
         precondition(!state.dismissTopLayer())
@@ -136,6 +137,133 @@ enum PopoverMouseTarget: Equatable {
     }
 }
 
+/// The status item's primary action is intentionally delivered on mouse-down.
+/// If an AppKit tracking session ever tries to send a delayed left mouse-up
+/// action while a user is clicking inside the popover, it must not toggle the
+/// parent window. Right-click retains the standard mouse-up menu timing.
+enum StatusItemActionPolicy {
+    enum Action: Equatable, Sendable {
+        case togglePopover
+        case showContextMenu
+    }
+
+    private final class DeliveryProbe: @unchecked Sendable {
+        var action: Action?
+    }
+
+    static let deliveryEvents: NSEvent.EventTypeMask = [
+        .leftMouseDown, .rightMouseUp
+    ]
+
+    static func action(
+        eventType: NSEvent.EventType?,
+        modifierFlags: NSEvent.ModifierFlags,
+        originatesFromStatusItem: Bool
+    ) -> Action? {
+        guard let eventType else { return .togglePopover }
+        switch eventType {
+        case .leftMouseDown:
+            guard originatesFromStatusItem else { return nil }
+            return modifierFlags.contains(.control)
+                ? .showContextMenu : .togglePopover
+        case .rightMouseUp:
+            return originatesFromStatusItem ? .showContextMenu : nil
+        case .leftMouseUp, .rightMouseDown:
+            return nil
+        default:
+            // Preserve programmatic and accessibility-triggered actions, which
+            // do not arrive as one of the configured mouse-down events.
+            return .togglePopover
+        }
+    }
+
+    /// Keep presentation outside AppKit's status-button tracking callback.
+    @MainActor
+    static func deliver(
+        _ action: Action,
+        perform: @escaping @MainActor @Sendable (Action) -> Void
+    ) {
+        DispatchQueue.main.async {
+            perform(action)
+        }
+    }
+
+    @MainActor
+    static func verify() {
+        precondition(deliveryEvents.contains(.leftMouseDown))
+        precondition(deliveryEvents.contains(.rightMouseUp))
+        precondition(!deliveryEvents.contains(.leftMouseUp))
+        precondition(
+            action(
+                eventType: .leftMouseDown, modifierFlags: [],
+                originatesFromStatusItem: true
+            ) == .togglePopover
+        )
+        precondition(
+            action(
+                eventType: .leftMouseDown, modifierFlags: [.control],
+                originatesFromStatusItem: true
+            ) == .showContextMenu
+        )
+        precondition(
+            action(
+                eventType: .rightMouseUp, modifierFlags: [],
+                originatesFromStatusItem: true
+            ) == .showContextMenu
+        )
+        precondition(
+            action(
+                eventType: .leftMouseDown, modifierFlags: [],
+                originatesFromStatusItem: false
+            ) == nil
+        )
+        precondition(
+            action(
+                eventType: .leftMouseUp, modifierFlags: [],
+                originatesFromStatusItem: true
+            ) == nil
+        )
+        precondition(
+            action(
+                eventType: nil, modifierFlags: [],
+                originatesFromStatusItem: false
+            ) == .togglePopover
+        )
+        precondition(
+            action(
+                eventType: .keyDown, modifierFlags: [.control],
+                originatesFromStatusItem: false
+            ) == .togglePopover
+        )
+        let probe = DeliveryProbe()
+        deliver(.togglePopover) { probe.action = $0 }
+        precondition(
+            probe.action == nil,
+            "status-item presentation must not run inside button tracking"
+        )
+        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+        precondition(
+            probe.action == .togglePopover,
+            "the deferred status-item action must run on the next main-loop turn"
+        )
+    }
+}
+
+enum RecentActivityLayout {
+    static let visibleRows = 5
+    static let rowHeight: CGFloat = 29
+
+    static func listHeight(rowCount: Int) -> CGFloat {
+        CGFloat(min(max(rowCount, 1), visibleRows)) * rowHeight
+    }
+
+    static func verify() {
+        precondition(listHeight(rowCount: 1) == 29)
+        precondition(listHeight(rowCount: 5) == 145)
+        precondition(listHeight(rowCount: 31) == 145)
+    }
+}
+
 struct CompactDashboard: View {
     @EnvironmentObject var store: UsageStore
     let connectGitHub: () -> Void
@@ -165,8 +293,13 @@ struct CompactDashboard: View {
                         }
                         activityCard
                     }
-                    .padding(16)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 16)
                 }
+                // This is a layout boundary, not spare window height: the last
+                // card keeps a standard inset from the independently pinned
+                // footer even when the dashboard has to scroll on a small screen.
+                .padding(.bottom, 16)
                 Divider()
                 footer
             }
@@ -180,7 +313,6 @@ struct CompactDashboard: View {
             }
         }
         .frame(width: 600)
-        .frame(minHeight: 480, maxHeight: .infinity)
         .onExitCommand(perform: dismissTopLayer)
     }
 
@@ -473,7 +605,7 @@ struct CompactDashboard: View {
                         .font(.system(size: 10, weight: .semibold))
                         .tracking(0.7)
                         .foregroundStyle(.secondary)
-                    if let updated = store.currentServerUsageSample?.capturedAt,
+                    if let updated = store.currentServerUsageObservedAt,
                        store.isViewingCurrentCreditCycle {
                         Circle()
                             .fill(statusColor)
@@ -588,10 +720,11 @@ struct CompactDashboard: View {
             }
             DailyCostBarChart(
                 points: timeline.daily,
+                cycle: store.selectedCreditCycle,
                 cost: { store.displayCost(credits: $0) },
                 symbol: store.effectiveCurrency.symbol
             )
-            .frame(height: 150)
+            .frame(height: 118)
         }
     }
 
@@ -606,15 +739,31 @@ struct CompactDashboard: View {
         if store.displayCost(credits: timeline.unallocatedCredits) >= 0.005 {
             return "\(store.costString(credits: timeline.unallocatedCredits)) cannot be assigned to a day."
         }
-        return "Observed increases between saved GitHub counter samples."
+        return store.isViewingCurrentCreditCycle
+            ? "Full billing cycle · future days stay visible."
+            : "Complete billing cycle."
     }
 
     private var dailySection: some View {
         let timeline = store.creditTimeline
+        let activity = store.isViewingCurrentCreditCycle
+            ? store.rollingCreditActivity
+            : timeline.daily
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text("Recent activity")
-                    .font(.subheadline.weight(.semibold))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Recent activity")
+                        .font(.subheadline.weight(.semibold))
+                    Text(activity.count > 5
+                         ? (store.isViewingCurrentCreditCycle
+                            ? "Latest five visible · scroll for full history"
+                            : "Latest five visible · scroll for the full cycle")
+                         : (store.isViewingCurrentCreditCycle
+                            ? "Latest recorded days"
+                            : "Recorded days in this billing cycle"))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 Text("UTC")
                     .font(.caption2.weight(.medium))
@@ -634,36 +783,39 @@ struct CompactDashboard: View {
 
             Divider()
 
-            if timeline.daily.isEmpty {
+            if activity.isEmpty {
                 Text("No complete observed increases yet.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 46)
             } else {
-                VStack(spacing: 0) {
-                    ForEach(timeline.daily) { row in
-                        HStack {
-                            Text(row.day)
-                                .monospacedDigit()
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                            Text(Fmt.credits(row.credits))
-                                .monospacedDigit()
-                                .frame(width: 90, alignment: .trailing)
-                            Text(store.displayCostString(credits: row.credits))
-                                .monospacedDigit()
-                                .frame(width: 90, alignment: .trailing)
+                ScrollView(.vertical) {
+                    LazyVStack(spacing: 0) {
+                        ForEach(activity) { row in
+                            HStack {
+                                Text(activityDayLabel(row))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                Text(Fmt.credits(row.credits))
+                                    .monospacedDigit()
+                                    .frame(width: 90, alignment: .trailing)
+                                Text(store.displayCostString(credits: row.credits))
+                                    .monospacedDigit()
+                                    .frame(width: 90, alignment: .trailing)
+                            }
+                            .font(.callout)
+                            .padding(.vertical, 5)
+                            .padding(.horizontal, 5)
+                            .frame(height: RecentActivityLayout.rowHeight)
+                            .background(
+                                selectedSpendDay == row.day
+                                    ? Color.accentColor.opacity(0.10)
+                                    : Color.clear,
+                                in: RoundedRectangle(cornerRadius: 6)
+                            )
                         }
-                        .font(.callout)
-                        .padding(.vertical, 5)
-                        .padding(.horizontal, 5)
-                        .background(
-                            selectedSpendDay == row.day
-                                ? Color.accentColor.opacity(0.10)
-                                : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 6)
-                        )
                     }
                 }
+                .frame(height: RecentActivityLayout.listHeight(rowCount: activity.count))
             }
 
             if timeline.openingCredits > 0 {
@@ -681,13 +833,25 @@ struct CompactDashboard: View {
         }
     }
 
+    private func activityDayLabel(_ row: ObservedDayCredits) -> String {
+        let currentYear = String(CreditCycleSummary.utcDayString(for: Date()).prefix(4))
+        let rowYear = String(row.day.prefix(4))
+        let formatter = rowYear == currentYear
+            ? Self.activityDayFormatter
+            : Self.activityDayYearFormatter
+        let day = formatter.string(from: row.date)
+        return CreditCycleSummary.utcDayString(for: Date()) == row.day
+            ? "Today, \(day)"
+            : day
+    }
+
     private var footer: some View {
         HStack(spacing: 8) {
             Circle().fill(statusColor).frame(width: 7, height: 7)
             Text(store.serverUsageStatusLabel)
                 .font(.caption2)
-                .foregroundStyle(store.serverUsageError == nil ? Color.secondary : Color.red)
-            if let updated = store.currentServerUsageSample?.capturedAt {
+                .foregroundStyle(store.serverUsageStatusIsError ? Color.red : Color.secondary)
+            if let updated = store.currentServerUsageObservedAt {
                 Text("· GitHub updated \(Fmt.dateTime(Int64(updated.timeIntervalSince1970 * 1000)))")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
@@ -713,7 +877,7 @@ struct CompactDashboard: View {
     }
 
     private var statusColor: Color {
-        if store.serverUsageError != nil { return .red }
+        if store.serverUsageStatusIsError { return .red }
         guard store.serverUsageEnabled else { return .orange }
         if store.currentServerUsageSample == nil || store.serverUsageIsStale { return .orange }
         return .green
@@ -744,6 +908,21 @@ struct CompactDashboard: View {
         formatter.timeZone = TimeZone(identifier: "UTC")
         return formatter
     }()
+
+    private static let activityDayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "EEE, d MMM"
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        return formatter
+    }()
+
+    private static let activityDayYearFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "EEE, d MMM yyyy"
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        return formatter
+    }()
+
 }
 
 private struct SpendHistoryCalendar: View {
@@ -1043,7 +1222,7 @@ private struct CompactBudgetBar: View {
         let budgetUSD = store.compactBudgetUSD
         let budget = (budgetUSD ?? 0) * 100
         let projection = store.compactSpendProjection
-        let hasBudget = budget > 0
+        let hasBudget = (budgetUSD ?? 0) >= BudgetInput.minimumNonZero
 
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
@@ -1077,7 +1256,7 @@ private struct CompactBudgetBar: View {
                 if store.isViewingCurrentCreditCycle {
                     Group {
                         if hasBudget {
-                            Text("\(Int((spent / budget * 100).rounded()))% used")
+                            Text(budgetUsedLabel(spent: spent, budget: budget))
                                 .monospacedDigit()
                         } else {
                             Text("No budget set")
@@ -1088,7 +1267,7 @@ private struct CompactBudgetBar: View {
                 } else {
                     HStack(spacing: 9) {
                         if hasBudget {
-                            Text("\(Int((spent / budget * 100).rounded()))% used")
+                            Text(budgetUsedLabel(spent: spent, budget: budget))
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
                         }
@@ -1112,7 +1291,7 @@ private struct CompactBudgetBar: View {
                 historicalBudgetEditor
             }
 
-            if let budgetUSD, budgetUSD > 0 {
+            if let budgetUSD, budgetUSD >= BudgetInput.minimumNonZero {
                 budgetMeter(
                     spent: spent,
                     budget: budget,
@@ -1188,11 +1367,13 @@ private struct CompactBudgetBar: View {
         return VStack(alignment: .leading, spacing: 0) {
             GeometryReader { geometry in
                 let width = geometry.size.width
-                let currentReach = width * min(spent / maximum, 1)
+                let currentReach = width * boundedFraction(spent, maximum)
                 ZStack(alignment: .leading) {
                     Capsule().fill(Color.secondary.opacity(0.16))
                     if let projection {
-                        let reach = width * min(projection.projectedCredits / maximum, 1)
+                        let reach = width * boundedFraction(
+                            projection.projectedCredits, maximum
+                        )
                         Capsule()
                             .fill(projectionColor(projection).opacity(0.28))
                             .frame(width: reach)
@@ -1209,7 +1390,10 @@ private struct CompactBudgetBar: View {
                 }
                 .overlay(alignment: .leading) {
                     if let projection, projection.projectedCredits > maximum {
-                        let overPercent = projection.projectedCredits / maximum * 100 - 100
+                        let ratio = boundedRatio(
+                            projection.projectedCredits, maximum
+                        )
+                        let overPercent = ratio * 100 - 100
                         let count = overPercent >= 75 ? 3 : (overPercent >= 25 ? 2 : 1)
                         HStack(spacing: -2) {
                             ForEach(0..<count, id: \.self) { _ in
@@ -1235,7 +1419,9 @@ private struct CompactBudgetBar: View {
                     .help(projectionHelp(projection))
             } else if let projection {
                 GeometryReader { geometry in
-                    let fraction = min(1, projection.projectedCredits / maximum)
+                    let fraction = boundedFraction(
+                        projection.projectedCredits, maximum
+                    )
                     let x = geometry.size.width * fraction
                     let flip = x + Self.caretGap + Self.labelWidth > geometry.size.width
                     ZStack(alignment: .topLeading) {
@@ -1264,6 +1450,24 @@ private struct CompactBudgetBar: View {
             budgetUSD: budgetUSD,
             projection: projection
         ))
+    }
+
+    private func budgetUsedLabel(spent: Double, budget: Double) -> String {
+        guard spent.isFinite, budget.isFinite, budget > 0 else { return "— used" }
+        let percentage = spent / budget * 100
+        guard percentage.isFinite else { return ">999,999% used" }
+        return "\(Int(min(percentage.rounded(), 999_999)))% used"
+    }
+
+    private func boundedFraction(_ numerator: Double, _ denominator: Double) -> Double {
+        min(1, boundedRatio(numerator, denominator))
+    }
+
+    private func boundedRatio(_ numerator: Double, _ denominator: Double) -> Double {
+        guard numerator.isFinite, numerator >= 0,
+              denominator.isFinite, denominator > 0 else { return 0 }
+        let ratio = numerator / denominator
+        return ratio.isFinite ? max(0, ratio) : 1_000_000
     }
 
     private func beginEditingHistoricalBudget() {
@@ -1386,11 +1590,13 @@ struct MoneyAxisScale {
 
 private struct DailyCostBarChart: View {
     let points: [ObservedDayCredits]
+    let cycle: CreditCycleSummary?
     /// Credits → cost in the display currency. Injected rather than reading the
     /// store directly so the bar heights and the axis labels are guaranteed to
     /// use one conversion, and the view stays previewable.
     let cost: (Double) -> Double
     let symbol: String
+    @State private var hoveredDay: String?
 
     /// The day keys are UTC and the table below is badged UTC, so the chart must
     /// bin and label in UTC too. With the autoupdating calendar every bar sat one
@@ -1412,37 +1618,88 @@ private struct DailyCostBarChart: View {
 
     /// Keep the label count sane: one tick per day for a short cycle, thinning
     /// out as the month fills up.
+    private var chartPoints: [BillingCycleDayCredits] {
+        guard let cycle, let startAt = cycle.startAt else {
+            return points.map {
+                BillingCycleDayCredits(
+                    id: $0.id, day: $0.day, date: $0.date,
+                    credits: $0.credits, hasObservedIncrease: true,
+                    isFuture: false, isCurrentDay: false
+                )
+            }.sorted { $0.date < $1.date }
+        }
+        return CreditTimeline.billingCycleDays(
+            daily: points, startAt: startAt, resetAt: cycle.resetAt
+        )
+    }
+
     private var dayStride: Int {
-        max(1, Int(ceil(Double(points.count) / 6.0)))
+        max(1, Int(ceil(Double(chartPoints.count) / 6.0)))
     }
 
     /// Computed once per body evaluation rather than inside the axis builder,
     /// which runs for every tick.
     private var scale: MoneyAxisScale {
-        MoneyAxisScale.make(max: points.map { cost($0.credits) }.max() ?? 0)
+        MoneyAxisScale.make(max: chartPoints.map { cost($0.credits) }.max() ?? 0)
+    }
+
+    private var hoveredPoint: BillingCycleDayCredits? {
+        guard let hoveredDay else { return nil }
+        return chartPoints.first { $0.day == hoveredDay }
     }
 
     var body: some View {
-        if points.isEmpty {
+        if chartPoints.isEmpty {
             Text("No complete observed daily increases yet")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
             let scale = self.scale
-            Chart(points.sorted { $0.day < $1.day }) { point in
-                BarMark(
-                    x: .value("Day", point.date, unit: .day, calendar: Self.utcCalendar),
-                    y: .value("Cost", cost(point.credits))
-                )
-                .foregroundStyle(Color.accentColor.gradient)
-                .cornerRadius(3)
-                // Without this VoiceOver reads a bare number with no currency,
-                // which after this change is the whole point of the chart.
-                .accessibilityLabel(Self.accessibilityDayFormat.format(point.date))
-                .accessibilityValue(
-                    Fmt.axisMoney(cost(point.credits), symbol: symbol, decimals: 2)
-                )
+            let hovered = hoveredPoint
+            Chart(chartPoints) { point in
+                if point.hasObservedIncrease {
+                    BarMark(
+                        x: .value("Day", point.date, unit: .day, calendar: Self.utcCalendar),
+                        y: .value("Cost", cost(point.credits))
+                    )
+                    .foregroundStyle(
+                        point.isCurrentDay
+                            ? Color.accentColor
+                            : Color.accentColor.opacity(0.72)
+                    )
+                    .cornerRadius(3)
+                    .accessibilityLabel(Self.accessibilityDayFormat.format(point.date))
+                    .accessibilityValue(
+                        Fmt.axisMoney(cost(point.credits), symbol: symbol, decimals: 2)
+                    )
+                } else {
+                    PointMark(
+                        x: .value("Day", point.date, unit: .day, calendar: Self.utcCalendar),
+                        y: .value("Cost", 0.0)
+                    )
+                    .symbolSize(point.isCurrentDay ? 18 : 10)
+                    .foregroundStyle(
+                        point.isCurrentDay
+                            ? Color.accentColor
+                            : Color.secondary.opacity(point.isFuture ? 0.32 : 0.5)
+                    )
+                    .accessibilityLabel(Self.accessibilityDayFormat.format(point.date))
+                    .accessibilityValue(
+                        point.isFuture ? "Future day" : "No observed increase"
+                    )
+                }
+
+                if let hovered, hovered.id == point.id {
+                    RuleMark(
+                        x: .value(
+                            "Selected day", hovered.date,
+                            unit: .day, calendar: Self.utcCalendar
+                        )
+                    )
+                    .lineStyle(StrokeStyle(lineWidth: 1, dash: [3, 3]))
+                    .foregroundStyle(Color.secondary.opacity(0.45))
+                }
             }
             .chartXAxis {
                 // Whole-day strides, never `.automatic`: with only a few days in
@@ -1468,8 +1725,84 @@ private struct DailyCostBarChart: View {
                     }
                 }
             }
+            .chartOverlay { proxy in
+                GeometryReader { geometry in
+                    let plotFrame = geometry[proxy.plotAreaFrame]
+                    ZStack(alignment: .topLeading) {
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .onContinuousHover { phase in
+                                switch phase {
+                                case .active(let location):
+                                    guard location.x >= plotFrame.minX,
+                                          location.x <= plotFrame.maxX,
+                                          let date: Date = proxy.value(
+                                              atX: location.x - plotFrame.minX
+                                          ) else {
+                                        hoveredDay = nil
+                                        return
+                                    }
+                                    hoveredDay = nearestChartPoint(to: date)?.day
+                                case .ended:
+                                    hoveredDay = nil
+                                }
+                            }
+
+                        if let hovered,
+                           let plotX = proxy.position(forX: hovered.date) {
+                            let halfWidth = Self.hoverLabelWidth / 2
+                            let centerX = min(
+                                max(plotFrame.minX + plotX, halfWidth),
+                                geometry.size.width - halfWidth
+                            )
+                            chartHoverLabel(hovered)
+                                .frame(width: Self.hoverLabelWidth, alignment: .leading)
+                                .position(
+                                    x: centerX,
+                                    y: plotFrame.minY + Self.hoverLabelHeight / 2 + 3
+                                )
+                                .allowsHitTesting(false)
+                        }
+                    }
+                }
+            }
             .environment(\.calendar, Self.utcCalendar)
             .environment(\.timeZone, TimeZone(identifier: "UTC")!)
         }
+    }
+
+    private func nearestChartPoint(to date: Date) -> BillingCycleDayCredits? {
+        chartPoints.min {
+            abs($0.date.timeIntervalSince(date))
+                < abs($1.date.timeIntervalSince(date))
+        }
+    }
+
+    private static let hoverLabelWidth: CGFloat = 190
+    private static let hoverLabelHeight: CGFloat = 48
+
+    @ViewBuilder
+    private func chartHoverLabel(_ point: BillingCycleDayCredits) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(Self.accessibilityDayFormat.format(point.date))
+                .font(.caption2.weight(.semibold))
+            if point.hasObservedIncrease {
+                Text("\(Fmt.credits(point.credits)) credits · \(Fmt.axisMoney(cost(point.credits), symbol: symbol, decimals: 2))")
+                    .font(.caption2)
+            } else {
+                Text(point.isFuture ? "Future day" : "No observed increase")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 7)
+        .padding(.vertical, 5)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 6))
+        .overlay {
+            RoundedRectangle(cornerRadius: 6)
+                .strokeBorder(Color.secondary.opacity(0.18))
+        }
+        .shadow(color: .black.opacity(0.16), radius: 5, y: 2)
+        .accessibilityHidden(true)
     }
 }

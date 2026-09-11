@@ -19,7 +19,7 @@ enum Currency: String, CaseIterable {
 
 /// A provider-versioned USD→AUD quote. The provider timestamp, rather than the
 /// local fetch time, lets multiple Macs deterministically agree on the newest rate.
-struct ExchangeRateSnapshot: Codable, Equatable {
+struct ExchangeRateSnapshot: Codable, Equatable, Sendable {
     var usdToAUD: Double
     var providerUpdatedAtUnix: Int64
     var providerNextUpdateAtUnix: Int64?

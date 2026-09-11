@@ -202,6 +202,7 @@ enum DataSources {
         check("truncated file re-scans from 0", rot.records.count == 1 && rot.records.first?.spanId == "z")
 
         err.write(Data("verify-incremental: \(fail == 0 ? "PASS" : "FAIL") — \(pass) ok, \(fail) failed\n".utf8))
+        if fail > 0 { exit(1) }
     }
 
     // -----------------------------------------------------------------------

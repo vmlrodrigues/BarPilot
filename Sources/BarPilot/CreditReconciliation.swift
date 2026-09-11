@@ -94,15 +94,23 @@ enum CreditReconciliation {
     /// report, so it additionally requires the cycle to line up with that range.
     /// A non-calendar cycle simply falls back to the local report rather than
     /// mixing two different windows.
-    private static func matchesCurrentCycle(snapshot: CreditSample, report: Report, now: Date) -> Bool {
+    static func matchesCurrentCycle(snapshot: CreditSample, report: Report, now: Date) -> Bool {
         guard isCurrentCycle(snapshot, now: now),
               let start = cycleStart(for: snapshot) else { return false }
-        return Aggregator.utcDayStr(Int64(start.timeIntervalSince1970 * 1000)) == report.fromStr
+        let startMs = Int64(start.timeIntervalSince1970 * 1_000)
+        // A local calendar-month report starts at UTC midnight. A 10am reset on
+        // the first still leaves ten hours from the previous cycle in that
+        // report, so matching only the day key is not sufficient.
+        guard startMs == Aggregator.utcMidnightMs(report.fromStr) else {
+            return false
+        }
+        return Aggregator.utcDayStr(startMs) == report.fromStr
             && Aggregator.utcDayStr(Int64(now.timeIntervalSince1970 * 1000)) == report.toStr
     }
 
     static func verify() {
         CreditTimeline.verify()
+        CreditCycleTransitionPolicy.verify()
         let reset = Aggregator.utcMidnightMs("2030-02-01")
         let t0 = Aggregator.utcMidnightMs("2030-01-10")
         let t1 = t0 + 60_000
@@ -135,6 +143,56 @@ enum CreditReconciliation {
         )
         precondition(alternate.creditsUsed == 100.5 && alternate.resetAtMs == reset,
                      "alternate reset fields and numeric strings must remain compatible")
+        func rejectsReset(_ value: String) -> Bool {
+            let invalid = """
+            {
+              "quota_reset_date": "\(value)",
+              "quota_snapshots": {
+                "premium_interactions": { "credits_used": 1 }
+              }
+            }
+            """
+            do {
+                _ = try CreditUsageAPI.parse(
+                    data: Data(invalid.utf8),
+                    capturedAt: Date(
+                        timeIntervalSince1970: Double(t2) / 1_000
+                    )
+                )
+                return false
+            } catch CreditUsageError.invalidResponse {
+                return true
+            } catch {
+                return false
+            }
+        }
+        precondition(rejectsReset("inf"),
+                     "non-finite reset epochs must be rejected without trapping")
+        precondition(rejectsReset("1e309"),
+                     "out-of-range reset epochs must be rejected without trapping")
+        precondition(rejectsReset("2030-02-30"),
+                     "nonexistent calendar reset dates must be rejected")
+        precondition(rejectsReset("2029-12-01"),
+                     "an expired reset boundary must be rejected")
+        precondition(rejectsReset("2099-01-01"),
+                     "a reset outside the current billing window must be rejected")
+        let skewedServerFixture = """
+        {
+          "quota_reset_date": "2030-02-01",
+          "quota_snapshots": {
+            "premium_interactions": {
+              "credits_used": 1,
+              "timestamp_utc": "2099-01-01T00:00:00Z"
+            }
+          }
+        }
+        """
+        let skewedServer = try! CreditUsageAPI.parse(
+            data: Data(skewedServerFixture.utf8),
+            capturedAt: Date(timeIntervalSince1970: Double(t2) / 1_000)
+        )
+        precondition(skewedServer.serverAtMs == nil,
+                     "an implausible optional server clock must be ignored")
 
         var report = Report.empty
         report.fromStr = "2030-01-01"
@@ -191,14 +249,16 @@ enum CreditReconciliation {
         )
         precondition(!unaligned.isCurrentCycle && unaligned.totalCredits == 80,
                      "an anniversary cycle must not overlay the calendar-month report")
-        // A same-day-aligned cycle with a time-of-day reset still overlays: the
-        // day keys match the local range, and the dashboard needs it to work.
+        // A same-day but non-midnight start still contains hours from the prior
+        // cycle in the local report, so the authoritative counter must stand
+        // alone rather than being maxed against that mixed window.
         let alignedWithTime = build(
             report: offset, periodKind: .thisMonth,
             snapshot: sample(resetISO: "2030-02-01T08:00:00Z"), now: midCycle
         )
-        precondition(alignedWithTime.isCurrentCycle,
-                     "a time-of-day reset on an aligned day must still overlay")
+        precondition(!alignedWithTime.isCurrentCycle
+                     && alignedWithTime.totalCredits == offset.totalCredits,
+                     "a non-midnight cycle must not overlay a calendar-day report")
         verifyAccountRetention()
         print("credit reconciliation verification passed")
     }
@@ -254,6 +314,12 @@ enum CreditReconciliation {
             "a valid current sample must remain authoritative for live-cycle identity")
 
         CreditSampleStore.withTemporaryStore {
+            let storeIdentity = CreditSampleStore.storeIdentity()
+            precondition(
+                storeIdentity != nil
+                    && CreditSampleStore.storeIdentity() == storeIdentity,
+                "the credit database identity must remain stable across opens"
+            )
             // History captured before rows carried an account.
             for i in 0..<3 {
                 precondition(
@@ -273,6 +339,14 @@ enum CreditReconciliation {
                     account: old
                 ) == nil,
                 "pre-migration history must not invent a budget snapshot")
+            precondition(
+                !CreditSampleStore.setCycleBudget(
+                    resetDayMs: CreditCycleSummary.dayStart(for: reset),
+                    account: old, budgetUSD: 0.001,
+                    updatedAtMs: base
+                ),
+                "storage must reject a target below the supported minimum"
+            )
 
             // Reconnecting under a *different-looking* fingerprint for the same
             // account must adopt, not discard.
@@ -321,9 +395,34 @@ enum CreditReconciliation {
                              resetAtMs: priorReset, creditsUsed: 40),
                 account: new)
             CreditSampleStore.save(
+                CreditSample(capturedAtMs: base - 1_500_000, serverAtMs: nil,
+                             resetAtMs: priorReset, creditsUsed: 90),
+                account: new)
+            CreditSampleStore.save(
                 CreditSample(capturedAtMs: base - 1_000_000, serverAtMs: nil,
                              resetAtMs: priorReset, creditsUsed: 75),
                 account: new)
+            let boundary = base - CreditCycleSummary.dayMs
+            let boundarySamples = [
+                CreditSample(
+                    capturedAtMs: boundary + 60_000,
+                    serverAtMs: boundary - 60_000,
+                    resetAtMs: priorReset, creditsUsed: 10
+                ),
+                CreditSample(
+                    capturedAtMs: boundary + 120_000,
+                    serverAtMs: boundary - 30_000,
+                    resetAtMs: priorReset, creditsUsed: 20
+                ),
+                CreditSample(
+                    capturedAtMs: boundary + 43_200_000,
+                    serverAtMs: boundary + 43_200_000,
+                    resetAtMs: priorReset, creditsUsed: 30
+                )
+            ]
+            for sample in boundarySamples {
+                CreditSampleStore.save(sample, account: new)
+            }
             let cycles = CreditSampleStore.cycles(account: new)
             precondition(cycles.map(\.resetAtMs) == [reset, priorReset],
                          "stored billing cycles must be newest first")
@@ -341,6 +440,34 @@ enum CreditReconciliation {
             precondition(coalesced.count == 2
                          && coalesced.first?.latestSample.creditsUsed == 95,
                          "same-day reset variants must remain one billing cycle")
+            let compactedHistory = CreditSampleStore.compactedHistory(account: new)!
+            precondition(
+                compactedHistory.cycles.count == 2
+                    && compactedHistory.cycles.first?.latestSample.creditsUsed == 95
+                    && compactedHistory.cycles.last?.latestSample.creditsUsed == 75,
+                "one-pass history loading must preserve every cycle's final counter"
+            )
+            precondition(
+                compactedHistory.samplesByCycle[
+                    CreditCycleSummary.dayStart(for: reset)
+                ]?.map(\.creditsUsed) == [10, 95],
+                "history loading must compact dense polls while retaining the cycle close"
+            )
+            let compactedPrior = compactedHistory.samplesByCycle[
+                CreditCycleSummary.dayStart(for: priorReset)
+            ] ?? []
+            precondition(
+                compactedPrior.contains { $0.creditsUsed == 90 },
+                "completed history must retain a same-day high-water observation"
+            )
+            precondition(
+                compactedPrior.contains(boundarySamples[1]),
+                "server time must own SQL compaction across a UTC-day boundary"
+            )
+            precondition(
+                !compactedHistory.samples.contains(otherSample),
+                "compacted history must remain isolated to the selected account"
+            )
             precondition(
                 CreditSampleStore.loadCycle(
                     resetDayMs: CreditCycleSummary.dayStart(for: reset),
@@ -364,7 +491,8 @@ enum CreditReconciliation {
             let priorResetDay = CreditCycleSummary.dayStart(for: priorReset)
             precondition(
                 CreditSampleStore.assignCycleBudgetIfMissing(
-                    resetDayMs: priorResetDay, account: new, budgetUSD: 125
+                    resetDayMs: priorResetDay, account: new, budgetUSD: 125,
+                    updatedAtMs: base + 800_000
                 ),
                 "the missed pre-migration cycle must accept one assignment")
             precondition(
@@ -374,7 +502,8 @@ enum CreditReconciliation {
                 "the one-time historical assignment must persist")
             precondition(
                 !CreditSampleStore.assignCycleBudgetIfMissing(
-                    resetDayMs: priorResetDay, account: new, budgetUSD: 999
+                    resetDayMs: priorResetDay, account: new, budgetUSD: 999,
+                    updatedAtMs: base + 900_000
                 ),
                 "the migration repair must never overwrite an assigned budget")
             CreditSampleStore.completeBudgetMigration(account: new)
@@ -388,7 +517,8 @@ enum CreditReconciliation {
                 "the one-time repair must disappear instead of moving backward")
             precondition(
                 CreditSampleStore.setCycleBudget(
-                    resetDayMs: resetDay, account: new, budgetUSD: 175
+                    resetDayMs: resetDay, account: new, budgetUSD: 175,
+                    updatedAtMs: base + 1_000_000
                 ),
                 "the active cycle budget must follow a current target change")
             precondition(
@@ -396,11 +526,96 @@ enum CreditReconciliation {
                     resetDayMs: resetDay, account: new
                 ) == 175,
                 "the active cycle target update must persist")
+            let laterPoll = CreditSample(
+                capturedAtMs: base + 1_200_000, serverAtMs: nil,
+                resetAtMs: reset, creditsUsed: 100
+            )
+            precondition(CreditSampleStore.save(
+                laterPoll, account: new, budgetUSD: 175,
+                budgetUpdatedAtMs: base + 1_000_000
+            ))
+            precondition(
+                CreditSampleStore.cycleBudgetSnapshot(
+                    resetDayMs: resetDay, account: new
+                )?.updatedAtMs == base + 1_000_000,
+                "routine polling must not advance the budget edit timestamp"
+            )
             precondition(
                 CreditSampleStore.cycleBudget(
                     resetDayMs: resetDay, account: other
                 ) == 222,
                 "updating one account must not alter another account")
+
+            let peerOnlyResetDay = Aggregator.utcMidnightMs("2031-01-01")
+            precondition(
+                CreditSampleStore.loadCycle(
+                    resetDayMs: peerOnlyResetDay, account: new
+                ).isEmpty,
+                "the peer-only fixture must have no local counter rows"
+            )
+            precondition(
+                CreditSampleStore.setCycleBudget(
+                    resetDayMs: peerOnlyResetDay, account: new,
+                    budgetUSD: 210, updatedAtMs: base + 1_300_000
+                ),
+                "a peer-only current cycle must accept a local budget edit"
+            )
+            precondition(
+                CreditSampleStore.cycleBudgetSnapshot(
+                    resetDayMs: peerOnlyResetDay, account: new
+                ) == SyncedCycleBudget(
+                    resetDayMs: peerOnlyResetDay, budgetUSD: 210,
+                    updatedAtMs: base + 1_300_000
+                ),
+                "a budget must persist independently of local counter observations"
+            )
+            precondition(
+                CreditSampleStore.compactedHistory(account: new)?
+                    .cycleBudgets.contains(where: {
+                        $0.resetDayMs == peerOnlyResetDay && $0.budgetUSD == 210
+                    }) == true,
+                "peer-only cycle budgets must be available to sync publication"
+            )
+
+            let recoveryAccount = "recovered-self-payload"
+            let recoveryReset = Aggregator.utcMidnightMs("2031-02-01")
+            let recoveredSamples = [
+                CreditSample(
+                    capturedAtMs: recoveryReset - 120_000,
+                    serverAtMs: recoveryReset - 125_000,
+                    resetAtMs: recoveryReset, creditsUsed: 40
+                ),
+                CreditSample(
+                    capturedAtMs: recoveryReset - 60_000,
+                    serverAtMs: recoveryReset - 65_000,
+                    resetAtMs: recoveryReset, creditsUsed: 45
+                )
+            ]
+            let recoveredBudget = SyncedCycleBudget(
+                resetDayMs: CreditCycleSummary.dayStart(for: recoveryReset),
+                budgetUSD: 180,
+                updatedAtMs: recoveryReset - 60_000
+            )
+            precondition(
+                CreditSampleStore.saveAll(
+                    recoveredSamples, cycleBudgets: [recoveredBudget],
+                    account: recoveryAccount
+                ),
+                "recovered self history must save atomically"
+            )
+            precondition(
+                CreditSampleStore.load(
+                    resetAtMs: recoveryReset, account: recoveryAccount
+                ) == recoveredSamples,
+                "recovered self history must reload intact"
+            )
+            precondition(
+                CreditSampleStore.cycleBudget(
+                    resetDayMs: recoveredBudget.resetDayMs,
+                    account: recoveryAccount
+                ) == recoveredBudget.budgetUSD,
+                "recovered self history must restore its cycle budget"
+            )
         }
     }
 }

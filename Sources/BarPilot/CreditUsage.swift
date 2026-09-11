@@ -27,6 +27,11 @@ struct CreditSample: Equatable {
 }
 
 enum CreditUsageAPI {
+    private static let earliestSupportedUnixSeconds = 946_684_800.0 // 2000-01-01
+    private static let latestSupportedUnixSeconds = 4_102_444_800.0 // 2100-01-01
+    private static let maximumCycleAheadSeconds: TimeInterval = 40 * 24 * 60 * 60
+    private static let maximumServerClockSkewSeconds: TimeInterval = 24 * 60 * 60
+
     /// Equality key for preventing observations from different Copilot accounts
     /// being merged. It has to be deterministic across Macs, so no per-install
     /// salt is possible — and a plain SHA-256 over GitHub's small, dense numeric
@@ -116,17 +121,57 @@ enum CreditUsageAPI {
               let premium = snapshots["premium_interactions"] as? [String: Any],
               let credits = number(premium["credits_used"]),
               credits.isFinite, credits >= 0,
-              let reset = resetDate(root: root, premium: premium) else {
+              let capturedAtMs = timestampMilliseconds(capturedAt),
+              let reset = resetDate(root: root, premium: premium),
+              let resetAtMs = timestampMilliseconds(reset),
+              reset > capturedAt,
+              reset.timeIntervalSince(capturedAt) <= maximumCycleAheadSeconds else {
             throw CreditUsageError.invalidResponse
         }
 
-        let serverAt = (premium["timestamp_utc"] as? String).flatMap(parseISO)
-        return CreditSample(
-            capturedAtMs: Int64(capturedAt.timeIntervalSince1970 * 1000),
-            serverAtMs: serverAt.map { Int64($0.timeIntervalSince1970 * 1000) },
-            resetAtMs: Int64(reset.timeIntervalSince1970 * 1000),
+        let serverAtMs: Int64? = (premium["timestamp_utc"] as? String)
+            .flatMap(parseISO)
+            .flatMap { serverAt in
+                guard abs(serverAt.timeIntervalSince(capturedAt))
+                        <= maximumServerClockSkewSeconds else { return nil }
+                return timestampMilliseconds(serverAt)
+            }
+        let sample = CreditSample(
+            capturedAtMs: capturedAtMs,
+            serverAtMs: serverAtMs,
+            resetAtMs: resetAtMs,
             creditsUsed: credits
         )
+        guard isPlausible(sample) else {
+            throw CreditUsageError.invalidResponse
+        }
+        return sample
+    }
+
+    /// Semantic timestamp validation shared with untrusted sync payloads. The
+    /// absolute range alone is insufficient: a current reset paired with a
+    /// capture in 2099 would otherwise outrank every genuine observation.
+    static func isPlausible(_ sample: CreditSample) -> Bool {
+        let capturedAt = Date(
+            timeIntervalSince1970: Double(sample.capturedAtMs) / 1_000
+        )
+        let resetAt = Date(
+            timeIntervalSince1970: Double(sample.resetAtMs) / 1_000
+        )
+        guard timestampMilliseconds(capturedAt) != nil,
+              timestampMilliseconds(resetAt) != nil,
+              sample.creditsUsed.isFinite,
+              sample.creditsUsed >= 0,
+              resetAt > capturedAt,
+              resetAt.timeIntervalSince(capturedAt)
+                <= maximumCycleAheadSeconds else { return false }
+        guard let serverAtMs = sample.serverAtMs else { return true }
+        let serverAt = Date(
+            timeIntervalSince1970: Double(serverAtMs) / 1_000
+        )
+        return timestampMilliseconds(serverAt) != nil
+            && abs(serverAt.timeIntervalSince(capturedAt))
+                <= maximumServerClockSkewSeconds
     }
 
     private static func number(_ value: Any?) -> Double? {
@@ -148,7 +193,13 @@ enum CreditUsageAPI {
         }
         var utc = Calendar(identifier: .gregorian)
         utc.timeZone = TimeZone(identifier: "UTC")!
-        return utc.date(from: DateComponents(year: year, month: month, day: day))
+        guard let date = utc.date(
+            from: DateComponents(year: year, month: month, day: day)
+        ) else { return nil }
+        let resolved = utc.dateComponents([.year, .month, .day], from: date)
+        guard resolved.year == year, resolved.month == month,
+              resolved.day == day else { return nil }
+        return date
     }
 
     private static func resetDate(root: [String: Any], premium: [String: Any]) -> Date? {
@@ -160,10 +211,20 @@ enum CreditUsageAPI {
         ]
         for value in values {
             if let string = value as? String, let date = parseISO(string) { return date }
-            if let epoch = number(value), epoch > 0 {
-                return Date(timeIntervalSince1970: epoch > 10_000_000_000 ? epoch / 1000 : epoch)
+            if let epoch = number(value), epoch.isFinite, epoch > 0 {
+                let seconds = epoch > 10_000_000_000 ? epoch / 1000 : epoch
+                let date = Date(timeIntervalSince1970: seconds)
+                if timestampMilliseconds(date) != nil { return date }
             }
         }
         return nil
+    }
+
+    private static func timestampMilliseconds(_ date: Date) -> Int64? {
+        let seconds = date.timeIntervalSince1970
+        guard seconds.isFinite,
+              seconds >= earliestSupportedUnixSeconds,
+              seconds <= latestSupportedUnixSeconds else { return nil }
+        return Int64(seconds * 1_000)
     }
 }

@@ -19,7 +19,7 @@ USD→AUD exchange-rate fetch.
 
 ## What it shows
 
-- **Menu bar:** `$ <total cost>` for the current month, always visible. A warning
+- **Menu bar:** `$ <total cost>` for the current billing cycle, always visible. A warning
   glyph indicates that GitHub is disconnected, stale, or unavailable and the
   displayed figure may be the incomplete local fallback.
 - **Detail window** (click the menu-bar item):
@@ -29,16 +29,18 @@ USD→AUD exchange-rate fetch.
     cost comparisons. It also shows sortable LM Arena community-preference ranks,
     reasoning-mode details, ratings, and vote counts. The catalogue is cached for
     offline use.
-  - A daily credit-usage bar chart built from persisted GitHub samples.
-  - An observed daily-spend table. Opening usage and unsampled growth crossing a
-    UTC day boundary remain separate rather than being assigned without evidence.
-  - **Monthly budget bar:** set one USD budget from the menu-bar icon's
-    right-click menu → **Set Monthly Budget…**. The bar shows current spend,
-    projected month-end spend, and the budget marker. Its label uses the selected
-    display currency while calculations remain canonical in USD. The 100% budget
-    marker sits at 70% of the track, leaving visible room to measure projections
-    up to roughly 143% of budget. Budget and projected-spend labels always use the
-    same currency so their difference matches the chart.
+  - A full billing-cycle daily cost chart built from persisted GitHub samples.
+    Every day remains visible from the start of the cycle; hover a bar or date to
+    see its exact credits and cost.
+  - **Recent activity** opens on the latest five observed days and remains
+    scrollable through the complete retained history. Opening usage and unsampled
+    growth crossing a UTC day boundary stay separate rather than being assigned
+    without evidence.
+  - **Monthly budget bar:** set the target under **Settings → Spending**. The bar
+    shows current spend, projected cycle-end spend, and the budget marker in the
+    selected currency. Each completed billing cycle retains the target that was
+    active at the time; the immediately preceding pre-migration cycle has one
+    subtle repair affordance when its original target is unknown.
   - A temporary **legacy telemetry** view retains Summary, Models, Daily,
     Sessions, and Top during the transition. It is explicitly marked incomplete
     and scheduled for removal.
@@ -90,18 +92,41 @@ remains unallocated. Failed polls never write a zero.
 
 GitHub connection is the dashboard’s normal setup state, not an optional usage
 mode. If no credential is available, the window explains the local fallback and
-offers **Connect GitHub**. The right-click menu provides the secondary
-**Connect GitHub…** or **Disconnect GitHub** account action. Disconnecting removes
-only this credential; saved observations and multi-machine sync remain intact.
+offers **Connect GitHub**. Connection management also lives under
+**Settings → GitHub**. Disconnecting removes only this credential; saved
+observations and multi-machine sync remain intact.
+Billing-cycle boundaries and daily activity are attributed in UTC so travelling
+does not move usage between days or change historical periods. Reset times are
+still displayed in the Mac's current local timezone.
 
 Optional **Multi-Machine Sync** stores a compact versioned payload in a secret
-gist. Each Mac publishes only observations it captured itself: every counter
-cycle’s first observation captured in each 15-minute interval.
+gist. Each Mac publishes only observations it captured itself: 15-minute detail
+for the live cycle and correction-aware daily boundaries for completed cycles,
+plus the budget recorded for each cycle. Budget snapshots carry their actual
+edit time and resolve simultaneous cross-Mac changes deterministically; ordinary
+usage polling does not change their precedence. They are stored independently of
+counter observations, so a budget can be changed and synced even when that cycle
+has only been observed on another Mac.
 Matching observations are unioned and de-duplicated, never summed, because every
 Mac is observing the same account-wide counter. A key-derived account fingerprint
 prevents observations from different Copilot accounts being merged. It is
 deterministic (so Macs can match) but derived with PBKDF2, so it cannot be
 enumerated back to the account it identifies.
+
+Every sync validates the complete Gist before writing. When a durable database
+identity shows that SQLite recreated the local store, the existing payload for
+this Mac restores its saved observations and historical budget references. Gist
+discovery is paginated, and the selected Gist id is retained per GitHub account
+after simultaneous creators have converged on the oldest copy. The preflight
+read also repairs a stale copy of this Mac's file and prevents an
+older BarPilot build from overwriting a schema it does not understand. A fresh
+matching observation from another Mac can drive the current dashboard when this
+Mac missed a cycle rollover. The same validation and size limits apply before
+upload and after download, including bounds on numeric fields and the complete
+machine snapshot, so BarPilot never publishes a file it cannot consume. Cache
+replacement runs outside the UI actor and late cache or budget writes are
+discarded after sync or account generations change. Cached peer cycles are
+recombined with local history regardless of which launch read finishes first.
 
 ## Legacy telemetry sources
 
@@ -208,9 +233,13 @@ If you truly see nothing, confirm it's running: `pgrep -lf BarPilot`.
   and every few hours. When one is found it downloads the notarised DMG, verifies
   it's signed by the same developer, then installs it and relaunches — silently, in
   the background. (Only Developer ID release builds self-update; dev builds don't.)
-- **Start at Login:** toggle it from the right-click menu to have BarPilot launch
-  automatically when you log in.
-- **Currency:** show costs in **US $** or **Australian $** (right-click → Currency).
+- **Global shortcut:** record an optional system-wide key combination under
+  **Settings → General** to toggle the usage window without Accessibility or
+  Input Monitoring permission.
+- **Start at Login:** toggle it under **Settings → General** to have BarPilot
+  launch automatically when you log in.
+- **Currency:** switch between **US $** and **Australian $** on the dashboard or
+  under **Settings → Spending**.
   The USD→AUD rate is fetched from a public service on launch and refreshed daily
   (cached for offline use); your monthly budget stays in USD and is shown converted
   and rounded to a whole dollar when displaying AUD.
@@ -222,9 +251,8 @@ If you truly see nothing, confirm it's running: `pgrep -lf BarPilot`.
   and are never published or synced.
 - **Left-click** the menu-bar icon to open the usage window; **right-click** (or
   control-click) it for a menu with **Open Usage Window**, **Refresh Now**,
-  **Set Monthly Budget…**, **Currency**, **Start at Login**, **GitHub Credit
-  Total**, **Check for Updates**, and **Quit BarPilot**. (You can also quit from
-  the button in the window footer.)
+  **Settings…**, **Check for Updates**, **What’s New**, **Save Diagnostics…**,
+  and **Quit BarPilot**. (You can also quit from the button in the window footer.)
 
 ## License
 

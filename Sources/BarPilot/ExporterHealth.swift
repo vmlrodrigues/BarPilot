@@ -98,5 +98,6 @@ enum ExporterHealth {
         check("recovery clears the warning",                   !v(true, hour, 5, 60).isWarning)
 
         err.write(Data("verify-watchdog: \(fail == 0 ? "PASS" : "FAIL") — \(pass) ok, \(fail) failed\n".utf8))
+        if fail > 0 { exit(1) }
     }
 }

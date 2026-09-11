@@ -269,7 +269,18 @@ struct SpendProjection {
     var pctOfBudget: Double { hasBudget ? projectedCredits / budgetCredits * 100 : 0 }
 
     private static let endFormatter: DateFormatter = {
-        let f = DateFormatter(); f.dateFormat = "MMM d"; return f
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "MMM d"
+        return f
+    }()
+
+    private static let utcEndFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "MMM d"
+        f.timeZone = TimeZone(identifier: "UTC")!
+        return f
     }()
 
     /// Working days in the `days` calendar days starting at `start`.
@@ -331,6 +342,57 @@ struct SpendProjection {
             daysElapsed: elapsed, daysInPeriod: daysInPeriod,
             endLabel: endFormatter.string(from: endDate),
             excludesWeekends: excludeWeekends)
+    }
+
+    /// Project an account counter across its actual GitHub billing cycle. This
+    /// deliberately does not assume that the cycle begins on day one or ends at
+    /// the end of the current calendar month.
+    static func computeBillingCycle(
+        totalCredits: Double,
+        monthlyBudgetUSD: Double,
+        startAt: Date,
+        resetAt: Date,
+        now: Date,
+        calendar: Calendar,
+        excludeWeekends: Bool = false
+    ) -> SpendProjection? {
+        guard totalCredits > 0, resetAt > startAt,
+              now >= startAt, now < resetAt else { return nil }
+        let cycleDays = calendar.dateComponents(
+            [.day], from: startAt, to: resetAt
+        ).day ?? 0
+        let elapsedDays = (calendar.dateComponents(
+            [.day], from: startAt, to: now
+        ).day ?? 0) + 1
+        guard cycleDays > 0 else { return nil }
+        let calendarElapsed = min(cycleDays, max(1, elapsedDays))
+        guard calendarElapsed < cycleDays else { return nil }
+
+        let daysInPeriod: Int
+        let elapsed: Int
+        if excludeWeekends {
+            let firstDay = calendar.startOfDay(for: startAt)
+            daysInPeriod = workdays(
+                from: firstDay, days: cycleDays, calendar: calendar
+            )
+            elapsed = workdays(
+                from: firstDay, days: calendarElapsed, calendar: calendar
+            )
+            guard elapsed > 0, elapsed < daysInPeriod else { return nil }
+        } else {
+            daysInPeriod = cycleDays
+            elapsed = calendarElapsed
+        }
+
+        return SpendProjection(
+            projectedCredits: totalCredits / Double(elapsed)
+                * Double(daysInPeriod),
+            budgetCredits: monthlyBudgetUSD * 100,
+            daysElapsed: elapsed,
+            daysInPeriod: daysInPeriod,
+            endLabel: utcEndFormatter.string(from: resetAt),
+            excludesWeekends: excludeWeekends
+        )
     }
 
     // Headless regression check (--verify-projection): asserts compute() on
@@ -429,9 +491,33 @@ struct SpendProjection {
               compute(periodKind: .previousMonth, report: report(days: 10, credits: 300),
                       monthlyBudgetUSD: 150, now: now, calendar: cal, excludeWeekends: true) == nil)
 
+        // Jun 25 -> Jul 25 is a 30-day anniversary cycle. On Jul 15,
+        // 21 cycle days have started; July's 15/31 calendar ratio is irrelevant.
+        let anniversaryStart = cal.date(
+            from: DateComponents(year: 2025, month: 6, day: 25)
+        )!
+        let anniversaryReset = cal.date(
+            from: DateComponents(year: 2025, month: 7, day: 25)
+        )!
+        if let p = computeBillingCycle(
+            totalCredits: 2_100, monthlyBudgetUSD: 150,
+            startAt: anniversaryStart, resetAt: anniversaryReset,
+            now: now, calendar: cal
+        ) {
+            check("anniversary projection uses 21/30 cycle days",
+                  p.daysElapsed == 21 && p.daysInPeriod == 30)
+            check("anniversary projection ends at reset",
+                  p.endLabel == "Jul 25")
+            check("anniversary projection uses cycle pace",
+                  abs(p.projectedCredits - 3_000) < 1e-6)
+        } else {
+            check("anniversary cycle returns a projection", false)
+        }
+
         BudgetInput.verify(check)
 
         err.write(Data("verify-projection: \(fail == 0 ? "PASS" : "FAIL") — \(pass) ok, \(fail) failed\n".utf8))
+        if fail > 0 { exit(1) }
     }
 }
 

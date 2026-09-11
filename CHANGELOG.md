@@ -2,7 +2,112 @@
 
 All notable changes to BarPilot are documented here.
 
-## [Unreleased]
+## [0.12.0] — 2026-09-11
+
+### Added
+- **Daily activity now keeps its full billing-cycle shape from day one.** Future
+  days remain visible in the chart, while Recent activity opens on the latest
+  five recorded days and retains the complete scrollable history across cycles.
+  Hovering any chart day shows its date and observed credits and cost.
+
+### Fixed
+- **Travel no longer changes a billing cycle's projected end date.** Billing
+  cycle boundaries remain UTC-based in every timezone, including zones on the
+  opposite side of the date line.
+- **Account rollover and disconnection now leave one coherent local view.** A
+  changed GitHub reset boundary quarantines an ambiguous old counter until a
+  lower new-cycle value confirms the rollover, including during reconnection,
+  while missing, expired, or disconnected credentials clear the active
+  account's rolling activity without deleting saved history.
+- **Malformed GitHub reset timestamps are rejected safely.** Non-finite,
+  out-of-range, expired, implausibly distant and impossible calendar dates can
+  no longer reach storage or be normalised into a different billing boundary;
+  an optional server timestamp with impossible clock skew is ignored.
+- **Every built-in verifier now fails the build when a check fails.** The normal
+  verification gate also runs projection checks in Los Angeles and Auckland so
+  timezone-dependent regressions cannot pass silently.
+- **Sync startup and persistence now remain deterministic under slow I/O.** A
+  cached peer snapshot that arrives after local history is reapplied before the
+  first offline view is published; remote-cache replacement runs away from the
+  UI actor and is generation-gated across disable/re-enable. Budget writes are
+  likewise tied to the account generation that initiated them, so a late write
+  from a disconnected account cannot mutate the newly connected account. A
+  late history read cannot roll back a newer target edit, and quitting waits for
+  the local target write without waiting for its follow-up network sync.
+- **Malformed sync values can no longer overflow report arithmetic.** Incoming
+  timestamps, aggregate counters, cycle targets, machine count and remote-cache
+  size are bounded before storage or aggregation. Sub-cent scientific-notation
+  budgets and invalid legacy target rows are discarded consistently, and
+  percentage rendering remains finite defensively.
+- **Billing-cycle totals and forecasts no longer borrow calendar-month math.**
+  Anniversary and non-midnight cycles trust GitHub's counter instead of mixing
+  in telemetry from another cycle, and projected spend now uses the actual
+  cycle start and reset rather than the current calendar month.
+- **Historical budget references now survive sync and database recovery.** Sync
+  schema v3 carries one compact target snapshot per billing cycle, restores it
+  atomically with recovered observations, and makes remote-only cycles display
+  the budget they were measured against. Cycle targets are stored independently
+  of local counter observations, so editing a cycle first discovered from a peer
+  persists and republishes correctly. Target conflicts use the time the budget
+  was actually edited, with a stable machine tie-breaker; routine credit polling
+  can no longer make an unchanged target appear newer.
+- **Gist discovery now converges and remains durable.** A Mac missing from the
+  canonical Gist republishes even when its content fingerprint is unchanged,
+  and an existing but stale machine file is repaired by comparing its downloaded
+  content rather than trusting a local fingerprint cache. Two
+  simultaneous first-time creators converge on the oldest copy before pinning
+  its id, discovery scans every page safely, and cached ids are scoped to the
+  authenticated GitHub account.
+- **Multi-Mac sync remains fast and safe as history grows.** The live billing
+  cycle keeps detailed 15-minute observations while completed cycles retain
+  daily boundaries and high-water observations, using GitHub's observation
+  timestamp for correct UTC attribution, with a 6,144-observation defensive
+  payload limit sized for the complete thirteen-cycle retention window. The
+  same limit, field validation, and an encoded-size ceiling are enforced by one
+  shared gate before either upload or download data can reach storage or charts.
+  BarPilot therefore cannot publish a payload it would later reject itself.
+  Pulled data is decoded once and recombined from memory instead of reopening
+  SQLite during every dashboard refresh.
+- **Turning sync off now cancels work already in flight.** Late GitHub responses
+  from an obsolete sync session cannot update the local cache or status, pull
+  failures, malformed remote files, missing authorization and local cache-write
+  failures are shown rather than silently reported as healthy, absent peers are
+  removed after a successful pull, and startup will not publish until the
+  complete saved history has loaded successfully—even when account usage is
+  disconnected but multi-Mac sync remains enabled. Publishing also waits while
+  an enabled account's identity is unresolved, and account changes invalidate
+  any older in-flight sync before it can update GitHub or the local cache.
+- **Sync change detection now covers the complete payload.** A stable SHA-256
+  digest catches changes to individual model rows, historical counter samples,
+  machine metadata and exchange-rate data while ignoring the presentation-only
+  update timestamp. Cross-Mac cycle selection also uses GitHub server time ahead
+  of potentially skewed local clocks.
+- **Sync now recovers before it publishes.** Every machine validates the complete
+  Gist before writing. A durable database identity triggers one-time recovery of
+  its own prior observations after local-store recreation without resurrecting
+  normally pruned rows, and a downgraded build cannot erase a newer schema. A
+  fresh matching observation from another Mac can also drive the current-cycle
+  dashboard when this Mac missed rollover.
+- **Sync regressions can no longer pass verification silently.** Aggregate and
+  remote-cache mismatches now fail the verification process, and the normal
+  verification command always exercises atomic cache replacement in an isolated
+  temporary database. Unsupported cached schemas are rejected as a whole.
+- **The first Model prices click after a long idle no longer closes the usage
+  window.** The menu-bar button now validates the complete gesture, rejects
+  stale mouse-up actions originating from popover content, and waits until
+  AppKit finishes button tracking before presenting the window.
+- **Rolling history is complete across synced Macs.** Each Mac now publishes
+  compacted observations for every retained local billing cycle, preserves each
+  cycle's closing value, and discovers cycles captured only by another matching
+  Mac without ever re-publishing pulled data.
+- **Long-lived installs no longer load every minute-level counter sample at
+  startup.** One compact database query supplies all retained cycle summaries
+  and rolling activity instead of reopening the database and materialising the
+  entire sample set once per cycle.
+- **The dashboard now fits short screens and keeps deliberate footer spacing.**
+  Its height never exceeds the usable display, and the inset between the final
+  card and the pinned footer belongs to the layout instead of an incidental
+  hard-coded window height.
 
 ## [0.11.1] — 2026-09-08
 

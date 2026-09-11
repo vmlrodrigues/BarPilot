@@ -102,6 +102,30 @@ struct CreditCycleSummary: Identifiable, Equatable {
 // ---------------------------------------------------------------------------
 
 enum CreditSampleStore {
+    struct HistorySnapshot {
+        let cycles: [CreditCycleSummary]
+        let samplesByCycle: [Int64: [CreditSample]]
+        let cycleBudgets: [SyncedCycleBudget]
+
+        var samples: [CreditSample] {
+            samplesByCycle.values.flatMap { $0 }
+                .sorted { $0.capturedAtMs < $1.capturedAtMs }
+        }
+    }
+
+    /// Stable identity stored inside the database itself. UsageStore mirrors it
+    /// in preferences; a mismatch proves that SQLite created a replacement file
+    /// and enables one-time recovery from this machine's remote payload.
+    static func storeIdentity() -> String? {
+        let key = "credit_history_store_id"
+        if let existing = SpanCache.getMeta(key), !existing.isEmpty {
+            return existing
+        }
+        let created = UUID().uuidString
+        SpanCache.setMeta(key, created)
+        return SpanCache.getMeta(key) == created ? created : nil
+    }
+
     private static func open() -> OpaquePointer? {
         let path = SpanCache.path
         try? FileManager.default.createDirectory(
@@ -139,10 +163,86 @@ enum CreditSampleStore {
         // Existing rows intentionally remain NULL: the original target cannot
         // be reconstructed safely from today's preference.
         sqlite3_exec(db, "ALTER TABLE credit_samples ADD COLUMN budget_usd REAL", nil, nil, nil)
+        // This timestamp advances only when the target changes. For existing
+        // snapshots, the observation timestamp is the safest one-time estimate.
+        sqlite3_exec(
+            db,
+            "ALTER TABLE credit_samples ADD COLUMN budget_updated_at_ms INTEGER",
+            nil, nil, nil
+        )
+        sqlite3_exec(db, """
+        UPDATE credit_samples
+        SET budget_updated_at_ms = captured_at_ms
+        WHERE budget_usd IS NOT NULL AND budget_updated_at_ms IS NULL;
+        """, nil, nil, nil)
         sqlite3_exec(db, """
         CREATE INDEX IF NOT EXISTS idx_credit_samples_account_cycle
             ON credit_samples(account, reset_at_ms, captured_at_ms);
+        CREATE TABLE IF NOT EXISTS credit_cycle_budgets (
+            account_key   TEXT NOT NULL,
+            reset_day_ms  INTEGER NOT NULL,
+            budget_usd    REAL NOT NULL,
+            updated_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (account_key, reset_day_ms)
+        );
+        CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
         """, nil, nil, nil)
+        // Move the former observation-attached snapshots into first-class cycle
+        // metadata once. INSERT OR IGNORE plus newest-first ordering retains the
+        // latest legacy snapshot for each account/cycle without overwriting a
+        // budget already written by the new model.
+        var migrationStmt: OpaquePointer?
+        let migrationKey = "credit_cycle_budget_table_v1"
+        if sqlite3_prepare_v2(
+            db, "SELECT 1 FROM meta WHERE key=?", -1, &migrationStmt, nil
+        ) == SQLITE_OK {
+            sqlite3_bind_text(
+                migrationStmt, 1, migrationKey, -1, sqliteTransient
+            )
+            let migrationNeeded = sqlite3_step(migrationStmt) != SQLITE_ROW
+            sqlite3_finalize(migrationStmt)
+            migrationStmt = nil
+            if migrationNeeded,
+               sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK {
+                let migrated = sqlite3_exec(db, """
+                INSERT OR IGNORE INTO credit_cycle_budgets
+                    (account_key, reset_day_ms, budget_usd, updated_at_ms)
+                SELECT COALESCE(account, ''),
+                       (reset_at_ms / \(CreditCycleSummary.dayMs))
+                           * \(CreditCycleSummary.dayMs),
+                       budget_usd, budget_updated_at_ms
+                FROM credit_samples
+                WHERE budget_usd IS NOT NULL
+                  AND budget_updated_at_ms IS NOT NULL
+                  AND budget_usd >= 0
+                  AND budget_usd <= \(BudgetInput.maximum)
+                  AND (budget_usd = 0
+                       OR budget_usd >= \(BudgetInput.minimumNonZero))
+                ORDER BY budget_updated_at_ms DESC, captured_at_ms DESC;
+                """, nil, nil, nil) == SQLITE_OK
+                var marker: OpaquePointer?
+                let markerPrepared = sqlite3_prepare_v2(
+                    db,
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES(?,'complete')",
+                    -1, &marker, nil
+                ) == SQLITE_OK
+                if markerPrepared {
+                    sqlite3_bind_text(
+                        marker, 1, migrationKey, -1, sqliteTransient
+                    )
+                }
+                let markerWritten = markerPrepared
+                    && sqlite3_step(marker) == SQLITE_DONE
+                sqlite3_finalize(marker)
+                if migrated && markerWritten {
+                    sqlite3_exec(db, "COMMIT", nil, nil, nil)
+                } else {
+                    sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+                }
+            }
+        } else {
+            sqlite3_finalize(migrationStmt)
+        }
         return db
     }
 
@@ -153,19 +253,95 @@ enum CreditSampleStore {
         guard SpanCache.getMeta(adoptionKey) == nil else { return 0 }
         guard let db = open() else { return 0 }
         defer { sqlite3_close(db) }
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK
+        else { return 0 }
+        var committed = false
+        defer {
+            if !committed { sqlite3_exec(db, "ROLLBACK", nil, nil, nil) }
+        }
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(
             db, "UPDATE credit_samples SET account = ? WHERE account IS NULL", -1, &stmt, nil
         ) == SQLITE_OK else { return 0 }
         sqlite3_bind_text(stmt, 1, account, -1, sqliteTransient)
         let ok = sqlite3_step(stmt) == SQLITE_DONE
+        let adoptedCount = Int(sqlite3_changes(db))
         sqlite3_finalize(stmt)
         guard ok else { return 0 }
+
+        var legacyBudgets: [SyncedCycleBudget] = []
+        guard sqlite3_prepare_v2(
+            db,
+            "SELECT reset_day_ms,budget_usd,updated_at_ms FROM credit_cycle_budgets WHERE account_key=''",
+            -1, &stmt, nil
+        ) == SQLITE_OK else { return 0 }
+        var step = sqlite3_step(stmt)
+        while step == SQLITE_ROW {
+            legacyBudgets.append(SyncedCycleBudget(
+                resetDayMs: sqlite3_column_int64(stmt, 0),
+                budgetUSD: sqlite3_column_double(stmt, 1),
+                updatedAtMs: sqlite3_column_int64(stmt, 2)
+            ))
+            step = sqlite3_step(stmt)
+        }
+        sqlite3_finalize(stmt)
+        let validLegacyBudgets = legacyBudgets.filter {
+            isValidBudget($0.budgetUSD) && $0.updatedAtMs > 0
+        }
+        guard step == SQLITE_DONE,
+              validLegacyBudgets.allSatisfy({
+                  upsertCycleBudget(
+                      db, resetDayMs: $0.resetDayMs, account: account,
+                      budgetUSD: $0.budgetUSD, updatedAtMs: $0.updatedAtMs
+                  )
+              }),
+              sqlite3_exec(
+                  db, "DELETE FROM credit_cycle_budgets WHERE account_key=''",
+                  nil, nil, nil
+              ) == SQLITE_OK,
+              sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else {
+            return 0
+        }
+        committed = true
         SpanCache.setMeta(adoptionKey, account)
-        return Int(sqlite3_changes(db))
+        return adoptedCount
     }
 
     private static let adoptionKey = "credit_samples_account_adopted"
+
+    private static func accountKey(_ account: String?) -> String {
+        account ?? ""
+    }
+
+    /// Insert or advance one first-class cycle target. A cycle budget is valid
+    /// even when this Mac has not captured a counter observation for that cycle.
+    private static func upsertCycleBudget(
+        _ db: OpaquePointer?, resetDayMs: Int64, account: String?,
+        budgetUSD: Double, updatedAtMs: Int64
+    ) -> Bool {
+        guard isValidBudget(budgetUSD), updatedAtMs > 0 else { return false }
+        var stmt: OpaquePointer?
+        let sql = """
+        INSERT INTO credit_cycle_budgets
+            (account_key, reset_day_ms, budget_usd, updated_at_ms)
+        VALUES (?,?,?,?)
+        ON CONFLICT(account_key, reset_day_ms) DO UPDATE SET
+            budget_usd = excluded.budget_usd,
+            updated_at_ms = excluded.updated_at_ms
+        WHERE excluded.updated_at_ms >= credit_cycle_budgets.updated_at_ms
+        """
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return false
+        }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_text(
+            stmt, 1, accountKey(account), -1, sqliteTransient
+        )
+        sqlite3_bind_int64(stmt, 2, resetDayMs)
+        sqlite3_bind_double(stmt, 3, budgetUSD)
+        sqlite3_bind_int64(stmt, 4, updatedAtMs)
+        return sqlite3_step(stmt) == SQLITE_DONE
+    }
 
     /// Run `body` against a throwaway database so verification never touches the
     /// user's real samples. Uses the existing `BARPILOT_CACHE_PATH` override.
@@ -187,22 +363,41 @@ enum CreditSampleStore {
     static func save(
         _ sample: CreditSample,
         account: String?,
-        budgetUSD: Double? = nil
+        budgetUSD: Double? = nil,
+        budgetUpdatedAtMs: Int64? = nil
     ) -> Bool {
         if let budgetUSD, !isValidBudget(budgetUSD) { return false }
+        let budgetTimestamp = budgetUSD.map { _ in
+            budgetUpdatedAtMs ?? sample.capturedAtMs
+        }
+        if let budgetTimestamp, budgetTimestamp <= 0 { return false }
         guard let db = open() else { return false }
         defer { sqlite3_close(db) }
+        let transactionStarted = budgetUSD != nil
+            && sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK
+        guard budgetUSD == nil || transactionStarted else { return false }
+        var committed = !transactionStarted
+        defer {
+            if transactionStarted && !committed {
+                sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            }
+        }
         var stmt: OpaquePointer?
         let sql = """
         INSERT INTO credit_samples
-            (captured_at_ms, server_at_ms, reset_at_ms, credits_used, account, budget_usd)
-        VALUES (?,?,?,?,?,?)
+            (captured_at_ms, server_at_ms, reset_at_ms, credits_used, account,
+             budget_usd, budget_updated_at_ms)
+        VALUES (?,?,?,?,?,?,?)
         ON CONFLICT(captured_at_ms) DO UPDATE SET
             server_at_ms = excluded.server_at_ms,
             reset_at_ms = excluded.reset_at_ms,
             credits_used = excluded.credits_used,
             account = excluded.account,
-            budget_usd = COALESCE(excluded.budget_usd, credit_samples.budget_usd)
+            budget_usd = COALESCE(excluded.budget_usd, credit_samples.budget_usd),
+            budget_updated_at_ms = COALESCE(
+                excluded.budget_updated_at_ms,
+                credit_samples.budget_updated_at_ms
+            )
         """
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return false }
         defer { sqlite3_finalize(stmt) }
@@ -215,25 +410,146 @@ enum CreditSampleStore {
         else { sqlite3_bind_null(stmt, 5) }
         if let budgetUSD { sqlite3_bind_double(stmt, 6, budgetUSD) }
         else { sqlite3_bind_null(stmt, 6) }
-        return sqlite3_step(stmt) == SQLITE_DONE
+        if let budgetTimestamp { sqlite3_bind_int64(stmt, 7, budgetTimestamp) }
+        else { sqlite3_bind_null(stmt, 7) }
+        guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+        if let budgetUSD, let budgetTimestamp {
+            let resetDayMs = CreditCycleSummary.dayStart(for: sample.resetAtMs)
+            guard upsertCycleBudget(
+                db, resetDayMs: resetDayMs, account: account,
+                budgetUSD: budgetUSD, updatedAtMs: budgetTimestamp
+            ) else { return false }
+        }
+        if transactionStarted {
+            guard sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else {
+                return false
+            }
+            committed = true
+        }
+        return true
+    }
+
+    /// Restore a compact set of observations recovered from this machine's
+    /// remote payload. One transaction avoids thousands of database opens; a
+    /// recovered budget replaces local metadata only when it is at least as new.
+    @discardableResult
+    static func saveAll(
+        _ samples: [CreditSample],
+        cycleBudgets: [SyncedCycleBudget] = [],
+        account: String
+    ) -> Bool {
+        guard !samples.isEmpty || !cycleBudgets.isEmpty else { return true }
+        guard let db = open() else { return false }
+        defer { sqlite3_close(db) }
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK
+        else { return false }
+        var committed = false
+        defer {
+            if !committed { sqlite3_exec(db, "ROLLBACK", nil, nil, nil) }
+        }
+        let sql = """
+        INSERT INTO credit_samples
+            (captured_at_ms, server_at_ms, reset_at_ms, credits_used, account, budget_usd)
+        VALUES (?,?,?,?,?,NULL)
+        ON CONFLICT(captured_at_ms) DO UPDATE SET
+            server_at_ms = excluded.server_at_ms,
+            reset_at_ms = excluded.reset_at_ms,
+            credits_used = excluded.credits_used,
+            account = excluded.account
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return false
+        }
+        defer { sqlite3_finalize(stmt) }
+        for sample in samples {
+            guard sqlite3_reset(stmt) == SQLITE_OK,
+                  sqlite3_clear_bindings(stmt) == SQLITE_OK,
+                  sqlite3_bind_int64(stmt, 1, sample.capturedAtMs) == SQLITE_OK
+            else { return false }
+            if let serverAtMs = sample.serverAtMs {
+                guard sqlite3_bind_int64(stmt, 2, serverAtMs) == SQLITE_OK else {
+                    return false
+                }
+            } else {
+                guard sqlite3_bind_null(stmt, 2) == SQLITE_OK else { return false }
+            }
+            guard sqlite3_bind_int64(stmt, 3, sample.resetAtMs) == SQLITE_OK,
+                  sqlite3_bind_double(stmt, 4, sample.creditsUsed) == SQLITE_OK,
+                  sqlite3_bind_text(
+                      stmt, 5, account, -1, sqliteTransient
+                  ) == SQLITE_OK,
+                  sqlite3_step(stmt) == SQLITE_DONE else {
+                return false
+            }
+        }
+        let budgetSQL = """
+        UPDATE credit_samples
+        SET budget_usd = ?, budget_updated_at_ms = ?
+        WHERE reset_at_ms >= ? AND reset_at_ms < ? AND account = ?
+          AND (budget_updated_at_ms IS NULL OR budget_updated_at_ms <= ?)
+        """
+        var budgetStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            db, budgetSQL, -1, &budgetStmt, nil
+        ) == SQLITE_OK else { return false }
+        defer { sqlite3_finalize(budgetStmt) }
+        for budget in SyncAggregate.compactCycleBudgets(cycleBudgets) {
+            guard upsertCycleBudget(
+                      db, resetDayMs: budget.resetDayMs, account: account,
+                      budgetUSD: budget.budgetUSD,
+                      updatedAtMs: budget.updatedAtMs
+                  ),
+                  sqlite3_reset(budgetStmt) == SQLITE_OK,
+                  sqlite3_clear_bindings(budgetStmt) == SQLITE_OK,
+                  sqlite3_bind_double(
+                      budgetStmt, 1, budget.budgetUSD
+                  ) == SQLITE_OK,
+                  sqlite3_bind_int64(
+                      budgetStmt, 2, budget.updatedAtMs
+                  ) == SQLITE_OK,
+                  sqlite3_bind_int64(
+                      budgetStmt, 3, budget.resetDayMs
+                  ) == SQLITE_OK,
+                  sqlite3_bind_int64(
+                      budgetStmt, 4,
+                      budget.resetDayMs + CreditCycleSummary.dayMs
+                  ) == SQLITE_OK,
+                  sqlite3_bind_text(
+                      budgetStmt, 5, account, -1, sqliteTransient
+                  ) == SQLITE_OK,
+                  sqlite3_bind_int64(
+                      budgetStmt, 6, budget.updatedAtMs
+                  ) == SQLITE_OK,
+                  sqlite3_step(budgetStmt) == SQLITE_DONE else {
+                return false
+            }
+        }
+        guard sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else {
+            return false
+        }
+        committed = true
+        return true
     }
 
     /// The most recently recorded target for one account-scoped cycle. A nil
     /// result is meaningful: it identifies pre-migration history whose target
     /// is unknowable until the user supplies it explicitly.
     static func cycleBudget(resetDayMs: Int64, account: String?) -> Double? {
+        cycleBudgetSnapshot(resetDayMs: resetDayMs, account: account)?.budgetUSD
+    }
+
+    static func cycleBudgetSnapshot(
+        resetDayMs: Int64, account: String?
+    ) -> SyncedCycleBudget? {
         guard let db = open() else { return nil }
         defer { sqlite3_close(db) }
-        let end = resetDayMs + CreditCycleSummary.dayMs
-        let accountClause = account.map {
-            "(account IS NULL OR account = '\(escape($0))')"
-        } ?? "account IS NULL"
+        let key = accountKey(account)
         let sql = """
-        SELECT budget_usd
-        FROM credit_samples
-        WHERE reset_at_ms >= \(resetDayMs) AND reset_at_ms < \(end)
-          AND \(accountClause) AND budget_usd IS NOT NULL
-        ORDER BY captured_at_ms DESC
+        SELECT budget_usd, updated_at_ms
+        FROM credit_cycle_budgets
+        WHERE reset_day_ms = ? AND (account_key = ? OR account_key = '')
+        ORDER BY CASE WHEN account_key = ? THEN 0 ELSE 1 END
         LIMIT 1
         """
         var stmt: OpaquePointer?
@@ -241,9 +557,17 @@ enum CreditSampleStore {
             return nil
         }
         defer { sqlite3_finalize(stmt) }
+        sqlite3_bind_int64(stmt, 1, resetDayMs)
+        sqlite3_bind_text(stmt, 2, key, -1, sqliteTransient)
+        sqlite3_bind_text(stmt, 3, key, -1, sqliteTransient)
         guard sqlite3_step(stmt) == SQLITE_ROW else { return nil }
         let value = sqlite3_column_double(stmt, 0)
-        return isValidBudget(value) ? value : nil
+        let updatedAtMs = sqlite3_column_int64(stmt, 1)
+        guard isValidBudget(value), updatedAtMs > 0 else { return nil }
+        return SyncedCycleBudget(
+            resetDayMs: resetDayMs, budgetUSD: value,
+            updatedAtMs: updatedAtMs
+        )
     }
 
     /// Apply an explicitly chosen target to every observation in a cycle. This
@@ -254,16 +578,25 @@ enum CreditSampleStore {
     static func setCycleBudget(
         resetDayMs: Int64,
         account: String?,
-        budgetUSD: Double
+        budgetUSD: Double,
+        updatedAtMs: Int64
     ) -> Bool {
-        guard isValidBudget(budgetUSD), let db = open() else { return false }
+        guard isValidBudget(budgetUSD), updatedAtMs > 0,
+              let db = open() else { return false }
         defer { sqlite3_close(db) }
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK
+        else { return false }
+        var committed = false
+        defer {
+            if !committed { sqlite3_exec(db, "ROLLBACK", nil, nil, nil) }
+        }
         let end = resetDayMs + CreditCycleSummary.dayMs
         let accountClause = account.map {
             "(account IS NULL OR account = '\(escape($0))')"
         } ?? "account IS NULL"
         let sql = """
-        UPDATE credit_samples SET budget_usd = ?
+        UPDATE credit_samples
+        SET budget_usd = ?, budget_updated_at_ms = ?
         WHERE reset_at_ms >= \(resetDayMs) AND reset_at_ms < \(end)
           AND \(accountClause)
         """
@@ -273,7 +606,17 @@ enum CreditSampleStore {
         }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_double(stmt, 1, budgetUSD)
-        return sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) > 0
+        sqlite3_bind_int64(stmt, 2, updatedAtMs)
+        guard sqlite3_step(stmt) == SQLITE_DONE,
+              upsertCycleBudget(
+                  db, resetDayMs: resetDayMs, account: account,
+                  budgetUSD: budgetUSD, updatedAtMs: updatedAtMs
+              ),
+              sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else {
+            return false
+        }
+        committed = true
+        return true
     }
 
     /// One-time repair for the cycle immediately preceding this migration.
@@ -283,29 +626,43 @@ enum CreditSampleStore {
     static func assignCycleBudgetIfMissing(
         resetDayMs: Int64,
         account: String?,
-        budgetUSD: Double
+        budgetUSD: Double,
+        updatedAtMs: Int64
     ) -> Bool {
-        guard isValidBudget(budgetUSD), let db = open() else { return false }
+        guard isValidBudget(budgetUSD), updatedAtMs > 0,
+              let db = open() else { return false }
         defer { sqlite3_close(db) }
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK
+        else { return false }
+        var committed = false
+        defer {
+            if !committed { sqlite3_exec(db, "ROLLBACK", nil, nil, nil) }
+        }
         let end = resetDayMs + CreditCycleSummary.dayMs
-        let escapedAccount = account.map(escape)
-        let accountClause = escapedAccount.map {
-            "(account IS NULL OR account = '\($0)')"
+        let accountClause = account.map {
+            "(account IS NULL OR account = '\(escape($0))')"
         } ?? "account IS NULL"
-        let existingAccountClause = escapedAccount.map {
-            "(existing.account IS NULL OR existing.account = '\($0)')"
-        } ?? "existing.account IS NULL"
+        var insertStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            db,
+            "INSERT OR IGNORE INTO credit_cycle_budgets(account_key,reset_day_ms,budget_usd,updated_at_ms) VALUES(?,?,?,?)",
+            -1, &insertStmt, nil
+        ) == SQLITE_OK else { return false }
+        sqlite3_bind_text(
+            insertStmt, 1, accountKey(account), -1, sqliteTransient
+        )
+        sqlite3_bind_int64(insertStmt, 2, resetDayMs)
+        sqlite3_bind_double(insertStmt, 3, budgetUSD)
+        sqlite3_bind_int64(insertStmt, 4, updatedAtMs)
+        let inserted = sqlite3_step(insertStmt) == SQLITE_DONE
+            && sqlite3_changes(db) == 1
+        sqlite3_finalize(insertStmt)
+        guard inserted else { return false }
         let sql = """
-        UPDATE credit_samples SET budget_usd = ?
+        UPDATE credit_samples
+        SET budget_usd = ?, budget_updated_at_ms = ?
         WHERE reset_at_ms >= \(resetDayMs) AND reset_at_ms < \(end)
           AND \(accountClause)
-          AND NOT EXISTS (
-              SELECT 1 FROM credit_samples AS existing
-              WHERE existing.reset_at_ms >= \(resetDayMs)
-                AND existing.reset_at_ms < \(end)
-                AND \(existingAccountClause)
-                AND existing.budget_usd IS NOT NULL
-          )
         """
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
@@ -313,7 +670,13 @@ enum CreditSampleStore {
         }
         defer { sqlite3_finalize(stmt) }
         sqlite3_bind_double(stmt, 1, budgetUSD)
-        return sqlite3_step(stmt) == SQLITE_DONE && sqlite3_changes(db) > 0
+        sqlite3_bind_int64(stmt, 2, updatedAtMs)
+        guard sqlite3_step(stmt) == SQLITE_DONE,
+              sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else {
+            return false
+        }
+        committed = true
+        return true
     }
 
     /// Persist the single pre-migration cycle eligible for repair. Keeping the
@@ -418,6 +781,146 @@ enum CreditSampleStore {
         return Array(load(whereClause: clause, limit: nil).reversed())
     }
 
+    /// Load retained history in one database pass, already compacted to the
+    /// representation used for sync and rolling activity. The newest cycle
+    /// keeps 15-minute buckets; completed cycles keep each UTC day's first,
+    /// high-water and last observation. This avoids opening SQLite once per
+    /// cycle and avoids materialising either minute-level polls or obsolete
+    /// detailed history.
+    /// The final observation in every cycle is always retained.
+    static func compactedHistory(account: String?) -> HistorySnapshot? {
+        guard let db = open() else { return nil }
+        defer { sqlite3_close(db) }
+        let accountClause = account.map {
+            "(account IS NULL OR account = '\(escape($0))')"
+        } ?? "account IS NULL"
+        let bucketMs: Int64 = 15 * 60 * 1000
+        let sql = """
+        WITH source AS (
+            SELECT captured_at_ms, server_at_ms, reset_at_ms, credits_used,
+                   (reset_at_ms / \(CreditCycleSummary.dayMs)) AS reset_day,
+                   COALESCE(server_at_ms, captured_at_ms) AS effective_at,
+                   (COALESCE(server_at_ms, captured_at_ms)
+                       / \(CreditCycleSummary.dayMs)) AS observed_day
+            FROM credit_samples
+            WHERE \(accountClause)
+        ),
+        ranked AS (
+            SELECT captured_at_ms, server_at_ms, reset_at_ms, credits_used,
+                   reset_day,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY reset_day,
+                                    (effective_at / \(bucketMs))
+                       ORDER BY effective_at ASC, captured_at_ms ASC
+                   ) AS bucket_rank,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY reset_day, observed_day
+                       ORDER BY effective_at ASC, captured_at_ms ASC
+                   ) AS day_first_rank,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY reset_day, observed_day
+                       ORDER BY effective_at DESC, captured_at_ms DESC
+                   ) AS day_last_rank,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY reset_day, observed_day
+                       ORDER BY credits_used DESC, effective_at DESC,
+                                captured_at_ms DESC
+                   ) AS day_peak_rank,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY reset_day
+                       ORDER BY effective_at DESC, captured_at_ms DESC
+                   ) AS cycle_last_rank,
+                   MAX(reset_day) OVER () AS newest_reset_day
+            FROM source
+        )
+        SELECT captured_at_ms, server_at_ms, reset_at_ms, credits_used,
+               reset_day, cycle_last_rank
+        FROM ranked
+        WHERE (reset_day = newest_reset_day
+               AND (bucket_rank = 1 OR cycle_last_rank = 1))
+           OR (reset_day != newest_reset_day
+               AND (day_first_rank = 1 OR day_peak_rank = 1
+                    OR day_last_rank = 1
+                    OR cycle_last_rank = 1))
+        ORDER BY reset_day DESC,
+                 COALESCE(server_at_ms, captured_at_ms) ASC,
+                 captured_at_ms ASC
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return nil
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var samplesByCycle: [Int64: [CreditSample]] = [:]
+        var latestByCycle: [Int64: CreditSample] = [:]
+        var stepResult = sqlite3_step(stmt)
+        while stepResult == SQLITE_ROW {
+            let sample = CreditSample(
+                capturedAtMs: sqlite3_column_int64(stmt, 0),
+                serverAtMs: sqlite3_column_type(stmt, 1) == SQLITE_NULL
+                    ? nil : sqlite3_column_int64(stmt, 1),
+                resetAtMs: sqlite3_column_int64(stmt, 2),
+                creditsUsed: sqlite3_column_double(stmt, 3)
+            )
+            let resetDay = sqlite3_column_int64(stmt, 4)
+                * CreditCycleSummary.dayMs
+            samplesByCycle[resetDay, default: []].append(sample)
+            if sqlite3_column_int64(stmt, 5) == 1 {
+                latestByCycle[resetDay] = sample
+            }
+            stepResult = sqlite3_step(stmt)
+        }
+        // A mid-query SQLite failure is not a smaller valid history. Returning
+        // nil prevents callers from publishing or presenting a partial snapshot.
+        guard stepResult == SQLITE_DONE else { return nil }
+        let budgetAccountKey = accountKey(account)
+        let budgetSQL = """
+        SELECT reset_day_ms, budget_usd, updated_at_ms
+        FROM credit_cycle_budgets
+        WHERE account_key = ? OR account_key = ''
+        ORDER BY CASE WHEN account_key = ? THEN 0 ELSE 1 END,
+                 updated_at_ms DESC
+        """
+        var budgetStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            db, budgetSQL, -1, &budgetStmt, nil
+        ) == SQLITE_OK else { return nil }
+        defer { sqlite3_finalize(budgetStmt) }
+        sqlite3_bind_text(
+            budgetStmt, 1, budgetAccountKey, -1, sqliteTransient
+        )
+        sqlite3_bind_text(
+            budgetStmt, 2, budgetAccountKey, -1, sqliteTransient
+        )
+        var budgetsByCycle: [Int64: SyncedCycleBudget] = [:]
+        var budgetStep = sqlite3_step(budgetStmt)
+        while budgetStep == SQLITE_ROW {
+            let resetDayMs = sqlite3_column_int64(budgetStmt, 0)
+            let budget = SyncedCycleBudget(
+                resetDayMs: resetDayMs,
+                budgetUSD: sqlite3_column_double(budgetStmt, 1),
+                updatedAtMs: sqlite3_column_int64(budgetStmt, 2)
+            )
+            if budgetsByCycle[resetDayMs] == nil,
+               isValidBudget(budget.budgetUSD), budget.updatedAtMs > 0 {
+                budgetsByCycle[resetDayMs] = budget
+            }
+            budgetStep = sqlite3_step(budgetStmt)
+        }
+        guard budgetStep == SQLITE_DONE else { return nil }
+        let cycles = latestByCycle
+            .map { CreditCycleSummary(latestSample: $0.value) }
+            .sorted { $0.resetDayMs > $1.resetDayMs }
+        return HistorySnapshot(
+            cycles: cycles,
+            samplesByCycle: samplesByCycle,
+            cycleBudgets: SyncAggregate.compactCycleBudgets(
+                Array(budgetsByCycle.values)
+            )
+        )
+    }
+
     /// One latest observation per stored billing cycle, newest cycle first.
     /// Reset instants on the same UTC day are one cycle: the API has several
     /// reset fields and their time-of-day can differ within a real cycle.
@@ -482,7 +985,8 @@ enum CreditSampleStore {
     }
 
     private static func isValidBudget(_ value: Double) -> Bool {
-        value.isFinite && value >= 0
+        value.isFinite && value >= 0 && value <= BudgetInput.maximum
+            && (value == 0 || value >= BudgetInput.minimumNonZero)
     }
 
     static func count() -> Int {
@@ -500,6 +1004,11 @@ enum CreditSampleStore {
         let cutoff = Int64(Date().timeIntervalSince1970 * 1000)
                    - Int64(months) * 31 * 24 * 60 * 60 * 1000
         sqlite3_exec(db, "DELETE FROM credit_samples WHERE captured_at_ms < \(cutoff)", nil, nil, nil)
+        sqlite3_exec(
+            db,
+            "DELETE FROM credit_cycle_budgets WHERE reset_day_ms < \(cutoff)",
+            nil, nil, nil
+        )
     }
 
     private static func load(whereClause: String, limit: Int?) -> [CreditSample] {

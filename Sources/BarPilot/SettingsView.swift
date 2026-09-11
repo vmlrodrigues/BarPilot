@@ -492,6 +492,9 @@ enum BudgetInput: Equatable {
     /// A monthly spend target in the millions is a typo, not an intention —
     /// most often a mistyped entry appended to the existing figure.
     static let maximum: Double = 1_000_000
+    /// Prevent tiny scientific-notation values from producing an infinite
+    /// percentage when the dashboard divides a normal spend by the target.
+    static let minimumNonZero: Double = 0.01
 
     /// Grouped for display so the ceiling in the error message is legible.
     static var maximumText: String {
@@ -510,6 +513,7 @@ enum BudgetInput: Equatable {
             .replacingOccurrences(of: " ", with: "")
         guard !cleaned.isEmpty, let value = Double(cleaned),
               value.isFinite, value >= 0 else { return .invalid }
+        guard value == 0 || value >= minimumNonZero else { return .invalid }
         guard value <= maximum else { return .tooLarge }
         return .ok(value)
     }
@@ -524,6 +528,7 @@ enum BudgetInput: Equatable {
         check("text rejected", parse("abc") == .invalid)
         check("negative rejected", parse("-5") == .invalid)
         check("infinity rejected", parse("inf") == .invalid)
+        check("sub-cent scientific notation rejected", parse("1e-300") == .invalid)
         // The regression: a mistyped entry appended to the existing figure.
         check("fat-fingered millions rejected", parse("12001000") == .tooLarge)
         check("at the ceiling is allowed", parse("1000000") == .ok(1_000_000))

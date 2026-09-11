@@ -65,7 +65,10 @@ struct AppMain {
         // Dev-only: layered Escape routing for nested popover overlays.
         if CommandLine.arguments.contains("--verify-presentation") {
             PopoverPresentationState.verify()
+            PopoverSizePolicy.verify()
+            RecentActivityLayout.verify()
             AppDelegate.verifyPopoverCloseTriggerRetention()
+            StatusItemActionPolicy.verify()
             exit(0)
         }
         // Support report — state, a timed load, and the recent reload log (#24).
@@ -94,6 +97,24 @@ struct AppMain {
 // SwiftPM-built, hand-assembled .app bundle. The window UI itself is still
 // SwiftUI (DetailView), hosted in an NSPopover.
 // ---------------------------------------------------------------------------
+
+enum PopoverSizePolicy {
+    /// The comfortable dashboard viewport. Content/footer separation is owned
+    /// by the SwiftUI layout, so this is only a screen-size preference—not a
+    /// pixel-level spacer or minimum-size requirement.
+    static let comfortableHeight: CGFloat = 806
+
+    static func height(available: CGFloat) -> CGFloat {
+        max(0, min(comfortableHeight, available))
+    }
+
+    static func verify() {
+        precondition(height(available: 1_000) == 806)
+        precondition(height(available: 700) == 700)
+        precondition(height(available: 320) == 320)
+        precondition(height(available: -20) == 0)
+    }
+}
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -132,8 +153,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.font = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
             button.title = (Updater.isDevBuild ? " (D) " : " ") + store.menuBarTitle
             button.target = self
-            button.action = #selector(statusButtonClicked)
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.action = #selector(statusButtonClicked(_:))
+            // Act at the start of the click. Opening an application-defined
+            // popover from mouse-up can leave the status button's tracking
+            // session alive long enough to reinterpret a later content mouse-up
+            // as a second toggle after the app has been idle.
+            // Keep right-click on mouse-up so the native context-menu gesture
+            // retains its standard macOS timing.
+            button.sendAction(on: StatusItemActionPolicy.deliveryEvents)
         }
         statusItem = item
 
@@ -205,12 +232,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Left-click toggles the window; right-click (or control-click) shows a menu.
-    @objc private func statusButtonClicked() {
+    @objc private func statusButtonClicked(_ sender: NSButton) {
         let event = NSApp.currentEvent
-        if event?.type == .rightMouseUp || event?.modifierFlags.contains(.control) == true {
-            showContextMenu()
-        } else {
-            togglePopover(nil)
+        guard sender === statusItem.button,
+              let action = StatusItemActionPolicy.action(
+                eventType: event?.type,
+                modifierFlags: event?.modifierFlags ?? [],
+                originatesFromStatusItem: event?.window === statusItem.button?.window
+              ) else {
+            // This is safe for public diagnostics: it records no coordinates,
+            // window titles, application names or user data.
+            DiagLog.write("ignored stale status-item action")
+            return
+        }
+        // The status item delivers its primary action on mouse-down. Present on
+        // the next main-loop turn, after AppKit has finished button tracking, so
+        // a later click inside the popover cannot be mistaken for the tail of
+        // the status-item gesture after a long idle period.
+        StatusItemActionPolicy.deliver(action) { [weak self] action in
+            guard let self else { return }
+            switch action {
+            case .showContextMenu:
+                self.showContextMenu()
+            case .togglePopover:
+                self.togglePopover(nil)
+            }
         }
     }
 
@@ -707,7 +753,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func desiredContentSize() -> NSSize {
         let screen = statusItem.button?.window?.screen ?? NSScreen.main
         let available = (screen?.visibleFrame.height ?? 800) - 8
-        return NSSize(width: 600, height: min(700, max(480, available)))
+        // The approved dashboard layout needs room for the complete chart and
+        // five Recent activity rows. Keep that viewport when the display can
+        // accommodate it, while still fitting smaller screens safely.
+        return NSSize(
+            width: 600,
+            height: PopoverSizePolicy.height(available: available)
+        )
     }
 }
 
