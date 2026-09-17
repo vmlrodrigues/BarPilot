@@ -1,62 +1,68 @@
-# BarPilot
+<p align="center">
+  <img src="AppIcon.png" width="112" alt="BarPilot app icon">
+</p>
 
-![Platform](https://img.shields.io/badge/platform-macOS%2013.0%2B-brightgreen)
-![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2B-black?logo=apple&logoColor=white)
-[![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+<h1 align="center">BarPilot</h1>
 
-[![Download for Mac](https://img.shields.io/badge/Download_for_Mac-007AFF?style=for-the-badge&logo=apple&logoColor=white)](https://github.com/vmlrodrigues/BarPilot/releases/latest/download/BarPilot.dmg)
+<p align="center">
+  A native macOS menu-bar app for tracking GitHub Copilot usage and spend.
+</p>
 
-A macOS **menu-bar app** that shows your GitHub Copilot AIU credit **cost** at a
-glance. Click the menu-bar item to open a compact current-cycle dashboard with
-credits, USD and AUD values, budget progress, and an observed daily-usage chart.
+<p align="center">
+  <img alt="macOS 13 or later" src="https://img.shields.io/badge/platform-macOS%2013.0%2B-brightgreen">
+  <img alt="Apple silicon" src="https://img.shields.io/badge/Apple_Silicon-M1%2B-black?logo=apple&amp;logoColor=white">
+  <img alt="Developer ID notarised" src="https://img.shields.io/badge/Notarised-Developer%20ID-success">
+  <a href="https://github.com/vmlrodrigues/BarPilot/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/vmlrodrigues/BarPilot?label=latest"></a>
+  <a href="LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/Licence-MIT-blue"></a>
+</p>
 
-Written in **Swift / SwiftUI**, fully self-contained with **no external
-dependencies**. The primary dashboard stores GitHub’s account credit counter
-locally; the deprecated detail view reads Copilot OTel telemetry directly from
-disk. Network access is limited to GitHub authentication and credit totals,
-optional private-gist sync, app updates, model-pricing catalogue updates, and the
-USD→AUD exchange-rate fetch.
+<p align="center">
+  <a href="https://github.com/vmlrodrigues/BarPilot/releases/latest/download/BarPilot.dmg"><img alt="Download BarPilot for Mac" src="https://img.shields.io/badge/Download_for_Mac-007AFF?style=for-the-badge&amp;logo=apple&amp;logoColor=white"></a>
+</p>
+
+BarPilot keeps the current Copilot billing cycle in the menu bar, with the full
+breakdown one click away. It is built with SwiftUI and AppKit, contains no web
+view, and stays out of the Dock. The dashboard keeps spend, budget progress and
+daily activity primary; model prices, billing history and multi-Mac sync remain
+close at hand without crowding the normal view.
+
+Version **0.12.0** adds a complete billing-cycle activity chart, five-day recent
+activity with scrollable history, cycle-specific historical budgets, stronger
+multi-Mac recovery and sync validation, reliable model-price presentation after
+long idle periods, and correct cycle projections while travelling.
+See the [0.12.0 release notes](https://github.com/vmlrodrigues/BarPilot/releases/tag/v0.12.0).
+
+> [!NOTE]
+> BarPilot is an independent, unofficial tool. It is not made or endorsed by
+> GitHub or Microsoft. Its primary dashboard uses an internal GitHub account
+> endpoint that may change or stop working in a future GitHub release.
 
 ## What it shows
 
-- **Menu bar:** `$ <total cost>` for the current billing cycle, always visible. A warning
-  glyph indicates that GitHub is disconnected, stale, or unavailable and the
-  displayed figure may be the incomplete local fallback.
-- **Detail window** (click the menu-bar item):
-  - Current billing-cycle credits and their value in both USD and AUD.
-  - A **Model prices…** dialogue with current input, cached-input, cache-write
-    and output rates; local favourites; provider/search filters; and workload
-    cost comparisons. It also shows sortable LM Arena community-preference ranks,
-    reasoning-mode details, ratings, and vote counts. The catalogue is cached for
-    offline use.
-  - A full billing-cycle daily cost chart built from persisted GitHub samples.
-    Every day remains visible from the start of the cycle; hover a bar or date to
-    see its exact credits and cost.
-  - **Recent activity** opens on the latest five observed days and remains
-    scrollable through the complete retained history. Opening usage and unsampled
-    growth crossing a UTC day boundary stay separate rather than being assigned
-    without evidence.
-  - **Monthly budget bar:** set the target under **Settings → Spending**. The bar
-    shows current spend, projected cycle-end spend, and the budget marker in the
-    selected currency. Each completed billing cycle retains the target that was
-    active at the time; the immediately preceding pre-migration cycle has one
-    subtle repair affordance when its original target is unknown.
-  - A temporary **legacy telemetry** view retains Summary, Models, Daily,
-    Sessions, and Top during the transition. It is explicitly marked incomplete
-    and scheduled for removal.
-  - A first-run **Connect GitHub** card authenticates the current-cycle account
-    counter. BarPilot does not interrupt startup with a sign-in dialog; the
-    dashboard remains usable with its temporary local fallback until connected.
-  - The legacy footer shows each telemetry source's status — **green** = data flowing,
-    **orange** = telemetry enabled but no traces yet, **grey** = telemetry not
-    enabled. If either source's OTel telemetry isn't configured, a warning with
-    an **Enable…** button appears: it shows exactly what will change (VS Code
-    `settings.json` keys; a Copilot LaunchAgent + helper script in `~/Library`),
-    then configures it natively on your confirmation. After enabling, restart
-    VS Code and relaunch the Copilot app.
+- Current billing-cycle credits and spend in USD or AUD, directly in the menu
+  bar and in a compact dashboard.
+- Monthly budget progress with an anchored cycle-end projection and the target
+  that applied to each completed billing cycle.
+- A full-cycle daily cost chart that keeps future days visible. Hover any bar or
+  date for its exact observed credits and cost.
+- The latest five active days at a glance, with the complete retained history
+  still available by scrolling.
+- Previous billing cycles with their own totals, daily activity and historical
+  budget reference.
+- Current GitHub Copilot model prices with search, provider filters, local
+  favourites, workload comparison and sortable LM Arena community-preference
+  rankings. The last valid catalogue remains available offline.
+- Optional private-Gist sync that combines observations from multiple Macs
+  without double-counting the account-wide total.
+- Clear disconnected, stale and unavailable states while preserving the last
+  trustworthy reading.
+- A temporary, explicitly marked legacy telemetry view for per-model and
+  per-session detail during the transition to GitHub-backed usage data.
 
-Credits are shown to 2 decimal places; cost in your selected currency — USD by
-default, or AUD (100 credits = $1.00 USD).
+The menu bar normally shows the current cycle's cost. A warning glyph appears
+when GitHub is disconnected, stale or unavailable, so an incomplete local
+fallback is never presented as current account data. Credits are shown to two
+decimal places; 100 credits equal US$1.00.
 
 > [!NOTE]
 > **On first launch the menu-bar icon may not be visible if your menu bar is
