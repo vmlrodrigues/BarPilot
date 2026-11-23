@@ -4,6 +4,8 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+## [0.13.0] — 2026-11-23
+
 ### Removed
 - **Legacy local telemetry usage** (#57): removed attribution tabs, telemetry
   ingestion, backfill, exporter monitoring and setup controls. Current usage

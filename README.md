@@ -26,11 +26,10 @@ view, and stays out of the Dock. The dashboard keeps spend, budget progress and
 daily activity primary; model prices, billing history and multi-Mac sync remain
 close at hand without crowding the normal view.
 
-Version **0.12.0** adds a complete billing-cycle activity chart, five-day recent
-activity with scrollable history, cycle-specific historical budgets, stronger
-multi-Mac recovery and sync validation, reliable model-price presentation after
-long idle periods, and correct cycle projections while travelling.
-See the [0.12.0 release notes](https://github.com/vmlrodrigues/BarPilot/releases/tag/v0.12.0).
+Version **0.13.0** uses GitHub account counters for Copilot usage and retires
+local telemetry and attribution. It also improves billing-cycle rollover,
+startup at login, and recovery after interrupted updates.
+See the [0.13.0 release notes](https://github.com/vmlrodrigues/BarPilot/releases/tag/v0.13.0).
 
 > [!NOTE]
 > BarPilot is an independent, unofficial tool. It is not made or endorsed by
