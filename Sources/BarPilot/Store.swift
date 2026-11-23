@@ -1347,10 +1347,8 @@ final class UsageStore: ObservableObject {
         } else {
             remoteSamples = []
         }
-        creditCycles = SyncAggregate.mergedCreditCycles(
-            local: stored.cycles,
-            additionalSamples: remoteSamples + creditSamples
-                + [serverUsageSample].compactMap { $0 }
+        creditCycles = stored.mergingCycles(
+            with: remoteSamples + creditSamples + [serverUsageSample].compactMap { $0 }
         )
         savedCreditActivityByCycle = Dictionary(uniqueKeysWithValues: creditCycles.map { cycle in
             let local = stored.samplesByCycle[cycle.resetDayMs] ?? []

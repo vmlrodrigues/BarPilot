@@ -381,10 +381,43 @@ struct CreditCycleNavigation {
                 resetAtMs: CreditCycle.utcMidnightMs("2030-04-01"), creditsUsed: 0
             )
             precondition(CreditSampleStore.save(followingCycle, account: "fixture"))
-            let completed = CreditSampleStore.compactedHistory(account: "fixture")
-            precondition(completed?.samplesByCycle[currentReset]?.contains(firstAfter) == true,
+            guard let completed = CreditSampleStore.compactedHistory(account: "fixture") else {
+                preconditionFailure("completed history unavailable")
+            }
+            precondition(completed.samplesByCycle[currentReset]?.contains(firstAfter) == true,
                          "the boundary observation must survive compaction of the completed cycle")
             precondition(SyncAggregate.compactCreditSamples(all + [followingCycle]).contains(firstAfter))
+
+            let lateClose = CreditSample(
+                capturedAtMs: january31 + 9 * minute, serverAtMs: nil,
+                resetAtMs: previousReset, creditsUsed: 105
+            )
+            let latePeer = SyncAggregate.project(
+                creditSamples: [lateClose], accountFingerprint: "fixture",
+                machineId: "late-rollover-peer", label: nil, updatedAt: ""
+            )
+            let lateSamples = latePeer.creditSamples?.map(\.creditSample) ?? []
+            let beforePeer = completed.mergingCycles(with: [followingCycle])
+            let afterPeer = completed.mergingCycles(with: lateSamples + [followingCycle])
+            precondition(afterPeer.first { $0.id == currentReset }?.startAt(in: afterPeer) == spend.observedAt,
+                         "a late peer close must use the next eligible boundary in retained local history")
+
+            func januarySpend(_ cycles: [CreditCycleSummary], peers: [MachineSyncPayload]) -> Double? {
+                let eligible = cycles.filter {
+                    CreditCycleSummary.overlapsUTCMonth($0, containing: spend.observedAt, in: cycles)
+                }
+                let samples = eligible.map { cycle in
+                    SyncAggregate.mergedCreditSamples(
+                        local: completed.samplesByCycle[cycle.id] ?? [], remotes: peers,
+                        resetAtMs: cycle.resetAtMs, accountFingerprint: "fixture"
+                    )
+                }
+                return CreditTimeline.combinedDaily(samplesByCycle: samples, monthKey: "2030-01")["2030-01-31"]
+            }
+
+            precondition(januarySpend(beforePeer, peers: []) == 90)
+            precondition(januarySpend(afterPeer, peers: [latePeer]) == 95,
+                         "the calendar should add the peer's five credits without dropping the newer cycle")
         }
     }
 }
@@ -533,6 +566,15 @@ enum CreditSampleStore {
         var samples: [CreditSample] {
             samplesByCycle.values.flatMap { $0 }
                 .sorted { $0.capturedAtMs < $1.capturedAtMs }
+        }
+
+        func mergingCycles(with additionalSamples: [CreditSample]) -> [CreditCycleSummary] {
+            // A peer's later prior-cycle reading can invalidate the boundary
+            // in a saved summary while leaving a later retained row eligible.
+            SyncAggregate.mergedCreditCycles(
+                local: cycles,
+                additionalSamples: samplesByCycle.values.flatMap { $0 } + additionalSamples
+            )
         }
     }
 

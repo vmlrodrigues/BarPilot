@@ -231,8 +231,9 @@ final class Updater {
 
         if restoring {
             let restored = installation.withInstallLock {
-                guard !hasRunningApp(at: installation.installed, excluding: parent) else { return false }
-                return installation.restoreInterruptedExchange()
+                installation.restoreInterruptedExchange {
+                    hasRunningApp(at: installation.installed, excluding: parent)
+                }
             } ?? false
             // On failure leave the recorded backup alone. Opening the candidate
             // here could immediately start another recovery attempt.
@@ -267,22 +268,23 @@ final class Updater {
         // this process. An exchange needs an exclusive lock on this inode.
         guard let lease = startupLease ?? (try? BundleLease(at: installed, operation: LOCK_SH)),
               isRunningFromInstalledBundle(installed) else { return false }
-        startupLease = lease
-        guard isReleaseBuild else { return true }
-        guard let state = UpdateInstallation.withInstallLock(at: installed, timeout: 0, {
-            UpdateInstallation.startupState(at: installed, cleanSettled: true)
-        }) else {
-            // The live installer expects only its own replacement to run.
-            // An ordinary launch at the swapped path can wait for that launch.
-            if case .restore(let attempt) = UpdateInstallation.startupState(at: installed),
-               attempt.id != confirmationID { return false }
-            return true
+        if isReleaseBuild {
+            if let state = UpdateInstallation.withInstallLock(at: installed, timeout: 0, {
+                UpdateInstallation.startupState(at: installed, cleanSettled: true)
+            }) {
+                if case .restore(let attempt) = state,
+                   let helper = launchHelper(restoreArgument, installation: attempt) {
+                    installer = helper
+                    return false
+                }
+            } else if case .restore(let attempt) = UpdateInstallation.startupState(at: installed),
+                      attempt.id != confirmationID {
+                // A live helper owns recovery or its own replacement launch.
+                return false
+            }
         }
-        guard case .restore(let attempt) = state,
-              !hasRunningApp(at: installed),
-              let helper = launchHelper(restoreArgument, installation: attempt) else { return true }
-        installer = helper
-        return false
+        startupLease = lease
+        return true
     }
 
     /// Called from the first main-queue turn after the delegate has finished launch.
@@ -477,6 +479,7 @@ final class Updater {
         let id: UUID
         private static let stagingPrefix = ".BarPilot-update-"
         private static let disposalPrefix = ".BarPilot-settled-"
+        private static let journalSuffix = ".transaction"
 
         var stagingDirectory: URL {
             installed.deletingLastPathComponent()
@@ -496,10 +499,10 @@ final class Updater {
         }
 
         private var journalURL: URL {
-            stagingDirectory.appendingPathComponent(installed.lastPathComponent + ".transaction")
+            stagingDirectory.appendingPathComponent(installed.lastPathComponent + Self.journalSuffix)
         }
 
-        private struct Journal: Codable {
+        private struct Journal: Codable, Equatable {
             let id: UUID
             let installedPath: String
             let original: BundleIdentity
@@ -530,15 +533,36 @@ final class Updater {
             return lstat(url.path, &metadata) == 0 || errno != ENOENT
         }
 
+        private static func isDirectory(_ url: URL) -> Bool {
+            var metadata = stat()
+            return lstat(url.path, &metadata) == 0 && metadata.st_mode & S_IFMT == S_IFDIR
+        }
+
         private func readJournal() -> Journal? {
             var metadata = stat()
-            guard lstat(stagingDirectory.path, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFDIR,
+            guard Self.isDirectory(stagingDirectory),
                   lstat(journalURL.path, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFREG,
                   let data = try? Data(contentsOf: journalURL),
                   let journal = try? PropertyListDecoder().decode(Journal.self, from: data),
                   journal.id == id, journal.installedPath == installed.path,
                   journal.original != journal.candidate else { return nil }
             return journal
+        }
+
+        private func hasRenamedPendingCandidate(_ current: BundleIdentity) -> Bool {
+            guard Self.isDirectory(stagingDirectory),
+                  let names = try? FileManager.default.contentsOfDirectory(atPath: stagingDirectory.path) else {
+                return false
+            }
+            let parent = installed.deletingLastPathComponent()
+            return names.contains { name in
+                guard name.hasSuffix(Self.journalSuffix), name != journalURL.lastPathComponent else { return false }
+                let recordedName = String(name.dropLast(Self.journalSuffix.count))
+                guard !recordedName.isEmpty, recordedName != ".", recordedName != ".." else { return false }
+                let recorded = Self(installed: parent.appendingPathComponent(recordedName, isDirectory: true), id: id)
+                guard let journal = recorded.readJournal(), journal.committedPID == nil else { return false }
+                return current.hasSameDirectory(as: journal.candidate)
+            }
         }
 
         private static func sync(_ url: URL, directory: Bool) -> Bool {
@@ -589,9 +613,13 @@ final class Updater {
             guard !parent.lastPathComponent.hasPrefix(stagingPrefix),
                   !parent.lastPathComponent.hasPrefix(disposalPrefix) else { return .deferMaintenance }
             var pending: UpdateInstallation?
+            let current = BundleIdentity(installed)
             for name in children where name.hasPrefix(stagingPrefix) {
                 guard let id = UUID(uuidString: String(name.dropFirst(stagingPrefix.count))) else { continue }
                 let attempt = UpdateInstallation(installed: installed, id: id)
+                // A rename retains the directory identity but cannot authorize
+                // cleanup or recovery at a path outside the journal.
+                if let current, attempt.hasRenamedPendingCandidate(current) { return .deferMaintenance }
                 guard exists(attempt.journalURL) else { continue }
                 guard let journal = attempt.readJournal() else { return .deferMaintenance }
                 switch (attempt.layout(journal), journal.committedPID) {
@@ -652,15 +680,36 @@ final class Updater {
             }
         }
 
-        func restoreInterruptedExchange() -> Bool {
-            guard let journal = readJournal(), journal.committedPID == nil else { return false }
-            return restore(journal)
+        @MainActor
+        func restoreInterruptedExchange(
+            timeout: TimeInterval = 2, installedIsRunning: () -> Bool = { false }
+        ) -> Bool {
+            guard let journal = readJournal() else { return false }
+            return restore(journal, timeout: timeout, installedIsRunning: installedIsRunning)
         }
 
-        private func restore(_ journal: Journal) -> Bool {
-            guard exchangeBundles(journal, from: .replacement) == .exchanged else { return false }
-            if syncExchangeDirectories() { cleanSettled(journal) }
-            return true
+        @MainActor
+        private func restore(
+            _ journal: Journal, timeout: TimeInterval = 2, installedIsRunning: () -> Bool
+        ) -> Bool {
+            var restored = false
+            // Keep the installation lock while an ordinary launch sees the
+            // pending transaction and exits. Running the main loop lets
+            // LaunchServices report that exit before the next exchange attempt.
+            _ = Updater.waitOnMain(for: timeout) {
+                guard journal.committedPID == nil, readJournal() == journal,
+                      layout(journal) == .replacement else { return true }
+                guard !installedIsRunning() else { return false }
+                switch exchangeBundles(journal, from: .replacement) {
+                case .exchanged:
+                    restored = true
+                    if syncExchangeDirectories() { cleanSettled(journal) }
+                    return true
+                case .failed: return true
+                case .installedBusy: return false
+                }
+            }
+            return restored
         }
 
         func acknowledgeStartup(pid: pid_t) -> Bool {
@@ -784,7 +833,8 @@ final class Updater {
                 switch candidateState(expectedIdentifier: expectedIdentifier) {
                 case .ready:
                     runTool("/usr/bin/xattr", ["-dr", "com.apple.quarantine", staged.path])
-                    return install(launch: launch, reopen: reopenAfterUnlock, waitForStartup: waitForStartup)
+                    return install(installedIsRunning: installedIsRunning, launch: launch,
+                                   reopen: reopenAfterUnlock, waitForStartup: waitForStartup)
                 case .stale:
                     discardStaging()
                     return reopenAfterUnlock(installed)
@@ -815,6 +865,7 @@ final class Updater {
 
         @MainActor
         func install(
+            installedIsRunning: () -> Bool = { false },
             launch: (URL, [String]) -> ReplacementLaunch, reopen: (URL) -> Bool,
             waitForStartup: (() -> Bool) -> Bool
         ) -> Bool {
@@ -846,7 +897,7 @@ final class Updater {
             }
 
             guard syncExchangeDirectories() else {
-                if restore(journal) { _ = reopen(installed) }
+                if restore(journal, installedIsRunning: installedIsRunning) { _ = reopen(installed) }
                 return false
             }
             switch launch(installed, [Updater.startupArgument, id.uuidString]) {
@@ -878,7 +929,7 @@ final class Updater {
                 NSLog("BarPilot: replacement launch outcome unknown. Original app kept in staging.")
                 return false
             }
-            guard restore(journal) else {
+            guard restore(journal, installedIsRunning: installedIsRunning) else {
                 NSLog("BarPilot: could not restore the original app after a failed relaunch")
                 return false
             }
@@ -902,6 +953,11 @@ final class Updater {
                 birthSeconds = metadata.st_birthtimespec.tv_sec
                 birthNanoseconds = metadata.st_birthtimespec.tv_nsec
                 info = try? Data(contentsOf: url.appendingPathComponent("Contents/Info.plist"))
+            }
+
+            func hasSameDirectory(as other: Self) -> Bool {
+                volume == other.volume && inode == other.inode
+                    && birthSeconds == other.birthSeconds && birthNanoseconds == other.birthNanoseconds
             }
         }
 
@@ -1146,9 +1202,19 @@ final class Updater {
             reopened = content(at: app) == "update"
             return reopened
         }
-        let rejectedUpdate = rejected.install(launch: { _, _ in .rejected },
-                                              reopen: reopenOriginal, waitForStartup: checkImmediately)
+        var rejectedLaunchLease: BundleLease?
+        var rejectedLaunchChecks = 0
+        let rejectedUpdate = rejected.install(installedIsRunning: {
+            rejectedLaunchChecks += 1
+            precondition(content(at: installed) == "rejected update")
+            if rejectedLaunchChecks == 2 { rejectedLaunchLease = nil }
+            return false
+        }, launch: { app, _ in
+            rejectedLaunchLease = try! BundleLease(at: app, operation: LOCK_SH)
+            return .rejected
+        }, reopen: reopenOriginal, waitForStartup: checkImmediately)
         precondition(!rejectedUpdate && reopened)
+        precondition(rejectedLaunchChecks == 2 && rejectedLaunchLease == nil)
         precondition(!fm.fileExists(atPath: rejected.stagingDirectory.path))
 
         reopened = false
@@ -1170,15 +1236,27 @@ final class Updater {
             do {
                 let running = try BundleLease(at: installed, operation: LOCK_SH)
                 withExtendedLifetime(running) {
-                    precondition(!attempt.restoreInterruptedExchange(), "rollback must wait for the candidate to exit")
+                    precondition(!attempt.restoreInterruptedExchange(timeout: 0),
+                                 "rollback must wait for the candidate to exit")
                 }
             }
+            var lateLaunchLease: BundleLease? = try BundleLease(at: installed, operation: LOCK_SH)
+            var runningChecks = 0
             let restarted = UpdateInstallation.withInstallLock(at: installed, timeout: 0) {
                 guard case .restore(let recovered) = UpdateInstallation.startupState(at: installed, cleanSettled: true),
                       recovered.id == attempt.id else { return false }
-                return recovered.restoreInterruptedExchange()
+                return recovered.restoreInterruptedExchange {
+                    runningChecks += 1
+                    precondition(content(at: installed) == "undetermined update")
+                    if runningChecks == 1 { return true }
+                    // LaunchServices can stop reporting the process before the
+                    // kernel releases its shared lease during exit.
+                    if runningChecks == 3 { lateLaunchLease = nil }
+                    return false
+                }
             }
             precondition(restarted == true && content(at: installed) == "update")
+            precondition(runningChecks == 3 && lateLaunchLease == nil)
             precondition(!fm.fileExists(atPath: attempt.stagingDirectory.path))
             guard case .ready = UpdateInstallation.startupState(at: installed) else {
                 preconditionFailure("the original must be usable after interrupted-update recovery")
@@ -1226,6 +1304,36 @@ final class Updater {
             try plist.write(to: directory.appendingPathComponent("Info.plist"))
         }
         try writeMetadata(at: installed, version: "2.0.0")
+        let renamedAttempt = UpdateInstallation(installed: installed, id: UUID())
+        try createBundle(at: renamedAttempt.staged, content: "renamed update")
+        try writeMetadata(at: renamedAttempt.staged, version: "3.0.0")
+        precondition(!renamedAttempt.install(launch: { _, _ in .unresolved },
+            reopen: { _ in preconditionFailure("launch unresolved") }, waitForStartup: checkImmediately))
+        let renamed = fixture.appendingPathComponent("Renamed.app", isDirectory: true)
+        let separate = fixture.appendingPathComponent("Separate.app", isDirectory: true)
+        try fm.moveItem(at: installed, to: renamed)
+        try writeMetadata(at: separate, version: "3.0.0")
+        let renamedInstall = UpdateInstallation(installed: renamed, id: UUID())
+        let separateInstall = UpdateInstallation(installed: separate, id: UUID())
+        for version in ["3.0.0", "3.0.1"] {
+            try writeMetadata(at: renamed, version: version)
+            let defersRenamedMaintenance = renamedInstall.withInstallLock(timeout: 0) {
+                if case .deferMaintenance = UpdateInstallation.startupState(at: renamed, cleanSettled: true) {
+                    return true
+                }
+                return false
+            }
+            precondition(defersRenamedMaintenance == true)
+            precondition(!renamedInstall.canBeginInstall({ true }))
+            precondition(separateInstall.canBeginInstall({ true }))
+            precondition(content(at: renamed) == "renamed update")
+            precondition(content(at: renamedAttempt.staged) == "confirmed update")
+            precondition(!fm.fileExists(atPath: installed.path))
+        }
+        try writeMetadata(at: renamed, version: "3.0.0")
+        try fm.moveItem(at: renamed, to: installed)
+        precondition(renamedAttempt.restoreInterruptedExchange())
+
         let superseded = UpdateInstallation(installed: installed, id: UUID())
         try createBundle(at: superseded.staged, content: "candidate update")
         try writeMetadata(at: superseded.staged, version: "3.0.0")
