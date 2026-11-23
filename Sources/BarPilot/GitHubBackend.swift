@@ -1,3 +1,4 @@
+import CoreFoundation
 import Foundation
 
 // ---------------------------------------------------------------------------
@@ -155,15 +156,14 @@ struct GitHubBackend: SyncBackend {
         }
     }
 
-    /// Our sync gist id (found by the marker in its description), or nil.
-    private func findGistId() async throws -> String? {
+    /// Validate both discovery and the Gist detail before using it for sync.
+    private func findPrivateGist() async throws -> (id: String, body: [String: Any])? {
         if let gistIDKey,
            let cached = UserDefaults.standard.string(forKey: gistIDKey) {
             do {
-                let data = try await send(authed(URL(
-                    string: "https://api.github.com/gists/\(cached)"
-                )!), expect: 200)
-                if Self.isMarkedGist(data) { return cached }
+                if let gist = try await fetchPrivateGist(id: cached) {
+                    return (cached, gist)
+                }
                 UserDefaults.standard.removeObject(forKey: gistIDKey)
             } catch SyncError.notFound {
                 // A reconnect may use a different GitHub account, or the user
@@ -180,34 +180,44 @@ struct GitHubBackend: SyncBackend {
             let data = try await send(authed(url), expect: 200)
             guard let gists = try? JSONSerialization.jsonObject(with: data)
                 as? [[String: Any]] else { throw SyncError.network }
-            candidates += gists.filter(Self.isMarkedGist)
+            candidates += gists.filter(Self.isPrivateSyncGist)
             if gists.count < 100 { break }
             if page == Self.maximumGistDiscoveryPages {
                 // Do not create a second sync store when discovery was capped.
                 throw SyncError.network
             }
         }
-        let selected = Self.oldestMarkedGistID(candidates)
-        if let selected, let gistIDKey {
+        guard let selected = Self.oldestPrivateGistID(candidates) else { return nil }
+        guard let gist = try await fetchPrivateGist(id: selected) else {
+            throw SyncError.encoding
+        }
+        if let gistIDKey {
             UserDefaults.standard.set(selected, forKey: gistIDKey)
         }
-        return selected
+        return (selected, gist)
     }
 
-    private static func isMarkedGist(_ gist: [String: Any]) -> Bool {
-        (gist["description"] as? String)?.contains(gistMarker) == true
-    }
-
-    private static func isMarkedGist(_ data: Data) -> Bool {
+    private func fetchPrivateGist(id: String) async throws -> [String: Any]? {
+        let data = try await send(authed(URL(
+            string: "https://api.github.com/gists/\(id)"
+        )!), expect: 200)
         guard let gist = try? JSONSerialization.jsonObject(with: data)
-            as? [String: Any] else { return false }
-        return isMarkedGist(gist)
+            as? [String: Any] else { throw SyncError.encoding }
+        guard gist["id"] as? String == id, Self.isPrivateSyncGist(gist) else { return nil }
+        return gist
+    }
+
+    private static func isPrivateSyncGist(_ gist: [String: Any]) -> Bool {
+        guard let visibility = gist["public"] as? NSNumber,
+              CFGetTypeID(visibility) == CFBooleanGetTypeID(),
+              !visibility.boolValue else { return false }
+        return (gist["description"] as? String)?.contains(gistMarker) == true
     }
 
     /// Deterministic convergence when an enable race produced duplicates.
-    static func oldestMarkedGistID(_ gists: [[String: Any]]) -> String? {
+    private static func oldestPrivateGistID(_ gists: [[String: Any]]) -> String? {
         gists
-            .filter(isMarkedGist)
+            .filter(isPrivateSyncGist)
             .min {
                 ($0["created_at"] as? String ?? "")
                     < ($1["created_at"] as? String ?? "")
@@ -217,27 +227,42 @@ struct GitHubBackend: SyncBackend {
     static func verifyDiscoveryPolicy() {
         let newest: [String: Any] = [
             "id": "new", "created_at": "2030-02-01T00:00:00Z",
-            "description": gistDescription
+            "description": gistDescription, "public": false
         ]
         let oldest: [String: Any] = [
             "id": "old", "created_at": "2030-01-01T00:00:00Z",
-            "description": gistDescription
+            "description": gistDescription, "public": false
         ]
         let unrelated: [String: Any] = [
             "id": "other", "created_at": "2020-01-01T00:00:00Z",
-            "description": "another application"
+            "description": "another application", "public": false
         ]
-        precondition(oldestMarkedGistID([newest, unrelated, oldest]) == "old",
-                     "duplicate discovery must converge on the oldest sync Gist")
+        let publicGist: [String: Any] = [
+            "id": "public", "created_at": "2020-01-01T00:00:00Z",
+            "description": gistDescription, "public": true
+        ]
+        let unknownVisibility: [String: Any] = [
+            "id": "unknown", "created_at": "2020-02-01T00:00:00Z",
+            "description": gistDescription
+        ]
+        let malformedVisibility = unknownVisibility.merging(["public": 0]) { _, new in new }
+        precondition(
+            oldestPrivateGistID([newest, unrelated, oldest, publicGist, unknownVisibility]) == "old",
+            "duplicate discovery must converge on the oldest private sync Gist"
+        )
+        precondition(oldestPrivateGistID([publicGist, unknownVisibility, malformedVisibility]) == nil,
+                     "discovery requires an explicit private visibility flag")
+        precondition(!isPrivateSyncGist(publicGist) && isPrivateSyncGist(oldest),
+                     "Gist details must be validated as private")
     }
 
     func push(_ payload: MachineSyncPayload) async throws {
         guard let data = SyncAggregate.encodeSupportedPayload(payload),
               let json = String(data: data, encoding: .utf8) else { throw SyncError.encoding }
         let files: [String: Any] = ["machine-\(payload.machineId).json": ["content": json]]
-        if let id = try await findGistId() {
+        if let gist = try await findPrivateGist() {
             let body = try JSONSerialization.data(withJSONObject: ["files": files])
-            _ = try await send(authed(URL(string: "https://api.github.com/gists/\(id)")!, "PATCH", body), expect: 200)
+            _ = try await send(authed(URL(string: "https://api.github.com/gists/\(gist.id)")!, "PATCH", body), expect: 200)
         } else {
             let body = try JSONSerialization.data(withJSONObject: ["description": Self.gistDescription, "public": false, "files": files])
             _ = try await send(authed(URL(string: "https://api.github.com/gists")!, "POST", body), expect: 201)
@@ -248,10 +273,8 @@ struct GitHubBackend: SyncBackend {
     }
 
     func pullAll() async throws -> [MachineSyncPayload] {
-        guard let id = try await findGistId() else { return [] }
-        let data = try await send(authed(URL(string: "https://api.github.com/gists/\(id)")!), expect: 200)
-        guard let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let files = j["files"] as? [String: Any] else { throw SyncError.network }
+        guard let gist = try await findPrivateGist() else { return [] }
+        guard let files = gist.body["files"] as? [String: Any] else { throw SyncError.network }
         let machineFiles = files.filter { $0.key.hasPrefix("machine-") }
         guard machineFiles.count <= SyncAggregate.maximumMachinePayloads else {
             throw SyncError.encoding

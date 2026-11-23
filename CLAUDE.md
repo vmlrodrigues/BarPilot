@@ -64,7 +64,7 @@ Other headless modes — run the relevant ones after touching their area:
 | `--verify-wake-refresh` | visible-wake freshness and bounded retry rules (#39) |
 | `--verify-shortcut` | global shortcut validation and persistence encoding (#40) |
 | `--verify-telemetry-cleanup` | removal of BarPilot's old Copilot telemetry agent, helper and matching session variables only |
-| `--verify-startup` | non-reentrant build identity detection and release-signature gating |
+| `--verify-startup` | build identity, release-signature gating and recoverable update replacement |
 | `--diagnose` | support report: state, a timed load, recent reload log |
 
 Every `--verify-*` command exits nonzero when any assertion fails. `make verify`
@@ -306,8 +306,10 @@ column or date reveals that day’s date, credits and display-currency cost.
   `credit_samples.account` records which account observed each row, and
   `Store.loadCycleSamples` reads by UTC reset day + account. Exact reset instants
   remain stored, but same-day variants are coalesced for navigation because the
-  API's reset fields can disagree on time-of-day. Rollover is committed only when
-  the reset day moves forward *and* the counter drops. The former baseline
+  API's reset fields can disagree on time-of-day. Near a reset, a sample for the
+  new cycle needs a lower counter if the previous cycle ended above zero. A
+  post-reset observation after a zero-usage cycle can be accepted immediately.
+  The confirmation window ends after 24 hours. The former baseline
   pointer is **deleted, not repurposed** — it was the only account-isolation
   mechanism, so it had to be shoved forward on every reconnect, and any change to
   fingerprint derivation made the *same* account look new and hid the whole cycle.
@@ -317,7 +319,7 @@ column or date reveals that day’s date, credits and display-currency cost.
 - **`DiagLog` and `--diagnose` carry no monetary or credit figures.** The reload
   line records a connection-state label, not the total, because
   `--diagnose` output is documented as safe to paste into a public issue.
-- **Telemetry retirement preserves the application database.** On launch,
+- **Telemetry retirement preserves the application database.** On release launch,
   `CreditSampleStore.retireLegacyTelemetry` transactionally drops only `spans`
   and known telemetry ingestion/backfill metadata. `credit_samples`, cycle
   budgets, account-adoption keys, migration keys and database identity remain.
@@ -330,13 +332,12 @@ column or date reveals that day’s date, credits and display-currency cost.
   final 30% to visualize projections up to about 143% of budget. Fill widths and
   the marker use that same fixed scale; budget and projection labels use the
   selected display currency and retain actual over-budget values.
-- **Auto-update is a built-in GitHub-Releases updater (NOT Sparkle)** —
-  `Updater.swift`. Silent: checks the Releases API, downloads the notarised DMG,
-  verifies Team ID `9N354A3UZK` + Gatekeeper, swaps the bundle via a detached
-  helper script, relaunches. Gated to Developer ID builds (`isDeveloperIDSigned`)
-  so dev builds never self-update. Sparkle rejected as too heavy for a
-  hand-assembled SwiftPM bundle. **The app now makes network calls** (GitHub) —
-  do not claim usage data is read locally.
+- **Auto-update uses GitHub Releases.** `Updater.swift` runs one check at a time
+  across manual and scheduled triggers. It stages the bundle beside the running
+  app, verifies its identity, Developer ID signature and Gatekeeper assessment,
+  and uses a helper process to exchange the two bundles atomically. The helper
+  retains the original bundle until the relaunch command succeeds. Developer ID
+  release builds use this updater.
 - **Start at Login** via `SMAppService.mainApp` (`LoginItem.swift`), toggled from
   Settings — no third-party dependency.
 - **Currency (USD/AUD):** everything is computed/stored in USD; AUD is a

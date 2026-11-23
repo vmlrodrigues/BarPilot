@@ -270,8 +270,13 @@ struct CompactDashboard: View {
     let openSettings: () -> Void
     let closePopover: () -> Void
     @ObservedObject var presentationState: PopoverPresentationState
-    @State private var selectedSpendDay: String?
-    @State private var selectedSpendCredits: Double?
+    @State private var spendDaySelection: SpendDaySelection?
+
+    private struct SpendDaySelection {
+        let date: Date
+        let accountSession: Int
+        let calendarSamples: [Int64: [CreditSample]]
+    }
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -289,8 +294,8 @@ struct CompactDashboard: View {
                         if store.compactTotalCredits != nil {
                             CompactBudgetBar()
                         }
-                        if selectedSpendDay != nil {
-                            selectedDayCard
+                        if let selection = currentSpendDaySelection {
+                            selectedDayCard(selection)
                         }
                         activityCard
                     }
@@ -314,7 +319,21 @@ struct CompactDashboard: View {
             }
         }
         .frame(width: 600)
+        .onChange(of: store.creditHistorySelectionID) { _ in
+            spendDaySelection = nil
+            showingSpendCalendar = false
+        }
         .onExitCommand(perform: dismissTopLayer)
+    }
+
+    private var currentSpendDaySelection: SpendDaySelection? {
+        guard store.serverUsageEnabled, let selection = spendDaySelection,
+              selection.accountSession == store.creditHistorySelectionID else { return nil }
+        return selection
+    }
+
+    private var selectedSpendDay: String? {
+        currentSpendDaySelection.map { CreditCycleSummary.utcDayString(for: $0.date) }
     }
 
     /// Escape unwinds exactly one presentation level. Handling it here avoids
@@ -435,8 +454,7 @@ struct CompactDashboard: View {
     private var cycleNavigator: some View {
         HStack(spacing: 12) {
             Button {
-                selectedSpendDay = nil
-                selectedSpendCredits = nil
+                spendDaySelection = nil
                 showingSpendCalendar = false
                 store.selectOlderCreditCycle()
             } label: {
@@ -462,12 +480,11 @@ struct CompactDashboard: View {
                 .frame(minWidth: 150)
             }
             .buttonStyle(.plain)
-            .disabled(store.selectedCreditCycle == nil)
+            .disabled(!store.canOpenSpendCalendar)
             .help("Choose a date and inspect observed daily spend")
 
             Button {
-                selectedSpendDay = nil
-                selectedSpendCredits = nil
+                spendDaySelection = nil
                 showingSpendCalendar = false
                 store.selectNewerCreditCycle()
             } label: {
@@ -504,7 +521,7 @@ struct CompactDashboard: View {
 
     private var cycleRangeLabel: String {
         guard let cycle = store.selectedCreditCycle,
-              let start = cycle.startAt else {
+              let start = store.selectedCreditCycleStart else {
             return "Billing cycle"
         }
         return "\(Self.cycleDateFormatter.string(from: start)) – \(Self.cycleDateFormatter.string(from: cycle.resetAt))"
@@ -522,9 +539,10 @@ struct CompactDashboard: View {
                     guard store.selectCreditCycle(containingUTCDate: date) else {
                         return
                     }
-                    let day = CreditCycleSummary.utcDayString(for: date)
-                    selectedSpendDay = day
-                    selectedSpendCredits = store.spendCalendarDailyCredits[day]
+                    spendDaySelection = SpendDaySelection(
+                        date: date, accountSession: store.creditHistorySelectionID,
+                        calendarSamples: store.calendarSamples(on: date)
+                    )
                     showingSpendCalendar = false
                 },
                 close: { showingSpendCalendar = false }
@@ -544,28 +562,24 @@ struct CompactDashboard: View {
     }
 
     private var calendarInitialDate: Date {
-        if let selectedSpendDay {
-            return Date(
-                timeIntervalSince1970:
-                    Double(CreditCycle.utcMidnightMs(selectedSpendDay)) / 1000
-            )
-        }
-        return store.selectedCreditCycle?.startAt ?? Date()
+        currentSpendDaySelection?.date ?? store.selectedCreditCycleStart ?? Date()
     }
 
-    private var selectedDayCard: some View {
+    private func selectedDayCard(_ selection: SpendDaySelection) -> some View {
         HStack(spacing: 10) {
             Image(systemName: "calendar.badge.checkmark")
                 .foregroundStyle(.tint)
             VStack(alignment: .leading, spacing: 2) {
-                Text(selectedSpendDayLabel)
+                Text("\(Self.selectedDayFormatter.string(from: selection.date)) · UTC")
                     .font(.subheadline.weight(.semibold))
                 if store.isLoadingCreditCycle {
                     Text("Loading billing-cycle history…")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                } else if let selectedSpendCredits {
-                    Text("\(Fmt.credits(selectedSpendCredits)) credits · \(store.costString(credits: selectedSpendCredits)) observed")
+                } else if let credits = store.observedCredits(
+                    on: selection.date, calendarSamples: selection.calendarSamples
+                ) {
+                    Text("\(Fmt.credits(credits)) credits · \(store.costString(credits: credits)) observed")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
@@ -576,8 +590,7 @@ struct CompactDashboard: View {
             }
             Spacer()
             Button {
-                selectedSpendDay = nil
-                selectedSpendCredits = nil
+                spendDaySelection = nil
             } label: {
                 Image(systemName: "xmark")
             }
@@ -586,15 +599,6 @@ struct CompactDashboard: View {
         }
         .padding(10)
         .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
-    }
-
-    private var selectedSpendDayLabel: String {
-        guard let selectedSpendDay else { return "Selected day" }
-        let date = Date(
-            timeIntervalSince1970:
-                Double(CreditCycle.utcMidnightMs(selectedSpendDay)) / 1000
-        )
-        return "\(Self.selectedDayFormatter.string(from: date)) · UTC"
     }
 
     private var spendSummary: some View {
@@ -718,7 +722,8 @@ struct CompactDashboard: View {
             }
             DailyCostBarChart(
                 points: timeline.daily,
-                cycle: store.selectedCreditCycle,
+                cycleStart: store.selectedCreditCycleStart,
+                cycleReset: store.selectedCreditCycle?.resetAt,
                 cost: { store.displayCost(credits: $0) },
                 symbol: store.effectiveCurrency.symbol
             )
@@ -1048,7 +1053,7 @@ private struct SpendHistoryCalendar: View {
         var months: Set<Date> = []
         let today = Self.monthStart(Date())
         for cycle in store.creditCycles {
-            guard let start = cycle.startAt else { continue }
+            guard let start = cycle.startAt(in: store.creditCycles) else { continue }
             var month = Self.monthStart(start)
             let last = Self.monthStart(
                 cycle.resetAt.addingTimeInterval(-0.001)
@@ -1516,7 +1521,7 @@ private struct CompactBudgetBar: View {
     }
 
     private var selectedCycleMonthLabel: String {
-        guard let start = store.selectedCreditCycle?.startAt else {
+        guard let start = store.selectedCreditCycleStart else {
             return "previous cycle"
         }
         return Self.budgetMonthFormatter.string(from: start)
@@ -1593,7 +1598,8 @@ struct MoneyAxisScale {
 
 private struct DailyCostBarChart: View {
     let points: [ObservedDayCredits]
-    let cycle: CreditCycleSummary?
+    let cycleStart: Date?
+    let cycleReset: Date?
     /// Credits → cost in the display currency. Injected rather than reading the
     /// store directly so the bar heights and the axis labels are guaranteed to
     /// use one conversion, and the view stays previewable.
@@ -1622,7 +1628,7 @@ private struct DailyCostBarChart: View {
     /// Keep the label count sane: one tick per day for a short cycle, thinning
     /// out as the month fills up.
     private var chartPoints: [BillingCycleDayCredits] {
-        guard let cycle, let startAt = cycle.startAt else {
+        guard let cycleStart, let cycleReset else {
             return points.map {
                 BillingCycleDayCredits(
                     id: $0.id, day: $0.day, date: $0.date,
@@ -1632,7 +1638,7 @@ private struct DailyCostBarChart: View {
             }.sorted { $0.date < $1.date }
         }
         return CreditTimeline.billingCycleDays(
-            daily: points, startAt: startAt, resetAt: cycle.resetAt
+            daily: points, startAt: cycleStart, resetAt: cycleReset
         )
     }
 

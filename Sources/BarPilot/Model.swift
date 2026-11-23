@@ -55,20 +55,22 @@ struct SpendProjection {
     ) -> SpendProjection? {
         guard totalCredits > 0, resetAt > startAt,
               now >= startAt, now < resetAt else { return nil }
-        let cycleDays = calendar.dateComponents(
-            [.day], from: startAt, to: resetAt
-        ).day ?? 0
-        let elapsedDays = (calendar.dateComponents(
-            [.day], from: startAt, to: now
+        // Count the calendar dates on which the cycle can incur spend. The
+        // reset is exclusive, so a midnight reset does not add another day.
+        let firstDay = calendar.startOfDay(for: startAt)
+        let lastDay = calendar.startOfDay(for: resetAt.addingTimeInterval(-0.001))
+        let today = calendar.startOfDay(for: now)
+        let cycleDays = (calendar.dateComponents(
+            [.day], from: firstDay, to: lastDay
         ).day ?? 0) + 1
-        guard cycleDays > 0 else { return nil }
-        let calendarElapsed = min(cycleDays, max(1, elapsedDays))
+        let calendarElapsed = (calendar.dateComponents(
+            [.day], from: firstDay, to: today
+        ).day ?? 0) + 1
         guard calendarElapsed < cycleDays else { return nil }
 
         let daysInPeriod: Int
         let elapsed: Int
         if excludeWeekends {
-            let firstDay = calendar.startOfDay(for: startAt)
             daysInPeriod = workdays(
                 from: firstDay, days: cycleDays, calendar: calendar
             )
@@ -149,6 +151,28 @@ struct SpendProjection {
         )!
         precondition(anniversary.daysElapsed == 21 && anniversary.daysInPeriod == 30)
         precondition(anniversary.endLabel == "Jul 25" && anniversary.projectedCredits == 3_000)
+        let partialStart = calendar.date(from: DateComponents(
+            year: 2030, month: 3, day: 31, hour: 18
+        ))!
+        let partialReset = calendar.date(from: DateComponents(
+            year: 2030, month: 4, day: 30, hour: 8
+        ))!
+        let partialNow = calendar.date(from: DateComponents(
+            year: 2030, month: 4, day: 28, hour: 18
+        ))!
+        let partial = computeBillingCycle(
+            totalCredits: 2_900, monthlyBudgetUSD: 150,
+            startAt: partialStart, resetAt: partialReset, now: partialNow,
+            calendar: calendar
+        )
+        precondition(partial?.daysElapsed == 29 && partial?.daysInPeriod == 31
+                        && partial?.projectedCredits == 3_100,
+                     "non-midnight endpoints must count both partial UTC days")
+        precondition(computeBillingCycle(
+            totalCredits: 2_900, monthlyBudgetUSD: 150,
+            startAt: partialStart, resetAt: partialReset,
+            now: calendar.startOfDay(for: partialReset), calendar: calendar
+        ) == nil, "the projection must stop on the final partial UTC day")
         BudgetInput.verify { name, passed in
             precondition(passed, name)
         }

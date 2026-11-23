@@ -19,16 +19,21 @@ struct CreditCycleSummary: Identifiable, Equatable {
     var resetAt: Date { latestSample.resetAt }
     var startAt: Date? { CreditCycle.cycleStart(for: latestSample) }
 
-    static func dayStart(for resetAtMs: Int64) -> Int64 {
-        resetAtMs / dayMs * dayMs
+    func startAt(in cycles: [CreditCycleSummary]) -> Date? {
+        guard let estimate = startAt else { return nil }
+        // Monthly date arithmetic can clamp to a shorter month's last day.
+        // Prefer the preceding observed reset when it fits the monthly cadence.
+        // Three days cover the difference in month lengths. The extra day
+        // allows the API's reset fields to differ in time-of-day.
+        guard let preceding = cycles.first(where: { $0.resetDayMs < resetDayMs }),
+              preceding.resetAt <= latestSample.capturedAt,
+              abs(preceding.resetAt.timeIntervalSince(estimate)) < 4 * 86_400
+        else { return estimate }
+        return preceding.resetAt
     }
 
-    static func liveCycleDay(
-        currentSample: CreditSample?,
-        cycles: [CreditCycleSummary]
-    ) -> Int64? {
-        currentSample.map { dayStart(for: $0.resetAtMs) }
-            ?? cycles.first?.resetDayMs
+    static func dayStart(for resetAtMs: Int64) -> Int64 {
+        resetAtMs / dayMs * dayMs
     }
 
     /// A UTC calendar day can straddle a non-midnight billing reset. Choose the
@@ -38,18 +43,9 @@ struct CreditCycleSummary: Identifiable, Equatable {
         containingUTCDate date: Date,
         in cycles: [CreditCycleSummary]
     ) -> CreditCycleSummary? {
-        let dateMs = Int64(date.timeIntervalSince1970 * 1000)
-        let dayStartMs = dayStart(for: dateMs)
-        let dayEndMs = dayStartMs + dayMs
         var best: (cycle: CreditCycleSummary, overlap: Int64)?
         for cycle in cycles {
-            guard let start = cycle.startAt else { continue }
-            let startMs = Int64(start.timeIntervalSince1970 * 1000)
-            let endMs = cycle.resetAtMs
-            let overlap = max(
-                0,
-                min(dayEndMs, endMs) - max(dayStartMs, startMs)
-            )
+            let overlap = cycle.overlapOnUTCDay(date, in: cycles)
             if overlap > (best?.overlap ?? 0) {
                 best = (cycle, overlap)
             }
@@ -57,11 +53,21 @@ struct CreditCycleSummary: Identifiable, Equatable {
         return best?.cycle
     }
 
+    func overlapOnUTCDay(_ date: Date, in cycles: [CreditCycleSummary]) -> Int64 {
+        guard let start = startAt(in: cycles) else { return 0 }
+        let dateMs = Int64(date.timeIntervalSince1970 * 1000)
+        let dayStartMs = Self.dayStart(for: dateMs)
+        let dayEndMs = dayStartMs + Self.dayMs
+        let startMs = Int64(start.timeIntervalSince1970 * 1000)
+        return max(0, min(dayEndMs, resetAtMs) - max(dayStartMs, startMs))
+    }
+
     static func overlapsUTCMonth(
         _ cycle: CreditCycleSummary,
-        containing date: Date
+        containing date: Date,
+        in cycles: [CreditCycleSummary]
     ) -> Bool {
-        guard let start = cycle.startAt else { return false }
+        guard let start = cycle.startAt(in: cycles) else { return false }
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "UTC")!
         guard let monthStart = calendar.date(
@@ -90,6 +96,67 @@ struct CreditCycleSummary: Identifiable, Equatable {
             format: "%04d-%02d-%02d",
             parts.year ?? 0, parts.month ?? 0, parts.day ?? 0
         )
+    }
+}
+
+struct CreditCycleNavigation {
+    let older: CreditCycleSummary?
+    let newer: CreditCycleSummary?
+    let canReturnToCurrent: Bool
+
+    init(cycles: [CreditCycleSummary], selectedDay: Int64?, now: Date = Date()) {
+        let completed = cycles.filter { $0.resetAt <= now }
+        if let selectedDay {
+            older = completed.first { $0.resetDayMs < selectedDay }
+            newer = completed.last { $0.resetDayMs > selectedDay }
+            canReturnToCurrent = newer == nil
+        } else {
+            older = completed.first
+            newer = nil
+            canReturnToCurrent = false
+        }
+    }
+
+    static func verify() {
+        let hour: Int64 = 60 * 60 * 1000
+        func date(_ day: String) -> Date {
+            Date(timeIntervalSince1970: Double(CreditCycle.utcMidnightMs(day)) / 1000)
+        }
+        func cycle(_ end: String) -> CreditCycleSummary {
+            let reset = CreditCycle.utcMidnightMs(end) + 18 * hour
+            return CreditCycleSummary(latestSample: CreditSample(
+                capturedAtMs: reset - hour, serverAtMs: nil,
+                resetAtMs: reset, creditsUsed: 50
+            ))
+        }
+
+        let november = cycle("2029-11-30")
+        let january = cycle("2030-01-31")
+        let february = cycle("2030-02-28")
+        let march = cycle("2030-03-31")
+        let now = date("2030-03-03")
+        let historical = [february, january]
+        let withCurrent = [march] + historical
+
+        precondition(february.startAt(in: historical) == january.resetAt)
+        precondition(february.startAt(in: [february, november]) == february.startAt)
+        precondition(CreditCycleSummary.cycle(containingUTCDate: date("2030-01-29"),
+                                              in: historical) == january,
+                     "the February cycle must not claim days before the known January reset")
+        let split = date("2030-01-31")
+        precondition(january.overlapOnUTCDay(split, in: historical) == 18 * hour)
+        precondition(february.overlapOnUTCDay(split, in: historical) == 6 * hour)
+        precondition(CreditCycleSummary.cycle(containingUTCDate: split, in: historical) == january)
+
+        let offline = CreditCycleNavigation(cycles: historical, selectedDay: nil, now: now)
+        let online = CreditCycleNavigation(cycles: withCurrent, selectedDay: nil, now: now)
+        precondition(offline.older == february && online.older == february,
+                     "the older arrow must enter the latest completed cycle even without a live reading")
+        let latest = CreditCycleNavigation(cycles: historical, selectedDay: february.resetDayMs, now: now)
+        precondition(latest.older == january && latest.newer == nil && latest.canReturnToCurrent,
+                     "the newer arrow from the latest completed cycle must return to the current view")
+        let older = CreditCycleNavigation(cycles: historical, selectedDay: january.resetDayMs, now: now)
+        precondition(older.older == nil && older.newer == february && !older.canReturnToCurrent)
     }
 }
 

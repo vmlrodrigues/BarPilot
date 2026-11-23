@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import Darwin
 import Security
 
 // ---------------------------------------------------------------------------
@@ -19,6 +20,9 @@ import Security
 final class Updater {
     private static let repo = "vmlrodrigues/BarPilot"
     private static let teamID = "9N354A3UZK"
+    static let installArgument = "--apply-staged-update"
+    @MainActor private static var isChecking = false
+    @MainActor private static var installer: Process?
     private let interval: TimeInterval = 6 * 60 * 60   // re-check every 6 hours
     private var timer: Timer?
 
@@ -41,9 +45,14 @@ final class Updater {
             NSLog("BarPilot: update check skipped (development build)")
             return
         }
-        Task.detached(priority: .background) {
+        Task { @MainActor in
             if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
-            await performCheck()
+            guard !isChecking, installer?.isRunning != true else { return }
+            isChecking = true
+            defer { isChecking = false }
+            await Task.detached(priority: .background) {
+                await performCheck()
+            }.value
         }
     }
 
@@ -57,8 +66,8 @@ final class Updater {
         guard let dmg = await Self.download(latest.dmgURL) else { return }
         defer { try? FileManager.default.removeItem(at: dmg) }
 
-        guard let staged = Self.mountExtractAndVerify(dmg: dmg) else { return }
-        await MainActor.run { Self.installAndRelaunch(staged: staged) }
+        guard let installation = Self.mountExtractAndVerify(dmg: dmg) else { return }
+        await MainActor.run { Self.installAndRelaunch(installation) }
     }
 
     // MARK: GitHub API
@@ -96,28 +105,33 @@ final class Updater {
 
     // MARK: Mount + verify (synchronous; runs off the main thread)
 
-    /// Mounts the DMG, copies BarPilot.app out, detaches, and verifies the copy
-    /// is signed by our Developer ID team and notarised. Returns staged app or nil.
-    private static func mountExtractAndVerify(dmg: URL) -> URL? {
+    /// Stage beside the installed bundle so the final exchange uses one filesystem.
+    /// An unwritable installation is detected before the running app quits.
+    private static func mountExtractAndVerify(dmg: URL) -> UpdateInstallation? {
         guard let mount = hdiutilAttach(dmg) else { return nil }
         defer { _ = runTool("/usr/bin/hdiutil", ["detach", mount, "-force"]) }
 
         let appInDMG = URL(fileURLWithPath: mount).appendingPathComponent("BarPilot.app")
         guard FileManager.default.fileExists(atPath: appInDMG.path) else { return nil }
 
-        let stageDir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("BarPilot-stage-\(UUID().uuidString)")
-        let staged = stageDir.appendingPathComponent("BarPilot.app")
-        try? FileManager.default.createDirectory(at: stageDir, withIntermediateDirectories: true)
-
-        guard runTool("/usr/bin/ditto", [appInDMG.path, staged.path]).status == 0 else {
-            try? FileManager.default.removeItem(at: stageDir); return nil
+        let installation = UpdateInstallation(
+            installed: Bundle.main.bundleURL.resolvingSymlinksInPath(), id: UUID()
+        )
+        do {
+            try FileManager.default.createDirectory(
+                at: installation.stagingDirectory, withIntermediateDirectories: false,
+                attributes: [.posixPermissions: 0o700]
+            )
+        } catch {
+            NSLog("BarPilot: cannot stage an update beside the installed app")
+            return nil
         }
-        guard verify(app: staged) else {
-            NSLog("BarPilot: update rejected — signature/team/Gatekeeper check failed")
-            try? FileManager.default.removeItem(at: stageDir); return nil
+        guard runTool("/usr/bin/ditto", [appInDMG.path, installation.staged.path]).status == 0,
+              installation.candidateState(expectedIdentifier: Bundle.main.bundleIdentifier) == .ready else {
+            installation.discardStaging()
+            return nil
         }
-        return staged
+        return installation
     }
 
     private static func verify(app: URL) -> Bool {
@@ -148,38 +162,172 @@ final class Updater {
     // MARK: Install + relaunch
 
     @MainActor
-    private static func installAndRelaunch(staged: URL) {
-        let dest = Bundle.main.bundleURL
-        let pid = ProcessInfo.processInfo.processIdentifier
-
-        // Detached helper: wait for us to quit, swap the bundle, relaunch, clean up.
-        let script = """
-        #!/bin/sh
-        while /bin/kill -0 \(pid) 2>/dev/null; do /bin/sleep 0.3; done
-        /usr/bin/ditto "\(staged.path)" "\(dest.path).new" || exit 1
-        /bin/rm -rf "\(dest.path)"
-        /bin/mv "\(dest.path).new" "\(dest.path)"
-        /usr/bin/xattr -dr com.apple.quarantine "\(dest.path)" 2>/dev/null
-        /bin/rm -rf "\(staged.deletingLastPathComponent().path)"
-        /usr/bin/open "\(dest.path)"
-        """
-        let scriptURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("barpilot-update-\(UUID().uuidString).sh")
+    private static func installAndRelaunch(_ installation: UpdateInstallation) {
+        guard let executable = Bundle.main.executableURL else {
+            installation.discardStaging()
+            return
+        }
+        // Start the current executable in helper mode. It performs the swap
+        // after this application exits and takes every argument literally.
+        let helper = Process()
+        helper.executableURL = executable
+        helper.arguments = [
+            installArgument, installation.id.uuidString,
+            String(ProcessInfo.processInfo.processIdentifier),
+        ]
+        helper.standardOutput = FileHandle.nullDevice
+        helper.standardError = FileHandle.nullDevice
         do {
-            try script.write(to: scriptURL, atomically: true, encoding: .utf8)
-            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: scriptURL.path)
+            try helper.run()
         } catch {
-            try? FileManager.default.removeItem(at: staged.deletingLastPathComponent()); return
+            installation.discardStaging()
+            NSLog("BarPilot: could not start the update helper")
+            return
         }
-
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/sh")
-        task.arguments = ["-c", "nohup \"\(scriptURL.path)\" >/dev/null 2>&1 &"]
-        do { try task.run(); task.waitUntilExit() } catch {
-            try? FileManager.default.removeItem(at: staged.deletingLastPathComponent()); return
-        }
+        installer = helper
         NSLog("BarPilot: installing update and relaunching")
         NSApp.terminate(nil)
+    }
+
+    static func applyStagedUpdate(_ arguments: ArraySlice<String>) -> Bool {
+        guard !isDevBuild, arguments.count == 2,
+              let id = UUID(uuidString: arguments[arguments.startIndex]),
+              let parent = Int32(arguments[arguments.startIndex + 1]), parent > 1,
+              getppid() == parent || getppid() == 1
+        else { return false }
+        let installation = UpdateInstallation(
+            installed: Bundle.main.bundleURL.resolvingSymlinksInPath(), id: id
+        )
+        let expectedIdentifier = Bundle.main.bundleIdentifier
+        let deadline = ProcessInfo.processInfo.systemUptime + 120
+        // An exited parent can still have a PID until launchd reaps it. The
+        // helper has already been reparented when the old app's exit is final.
+        while getppid() == parent {
+            guard ProcessInfo.processInfo.systemUptime < deadline else {
+                installation.discardStaging()
+                NSLog("BarPilot: timed out waiting for the app to quit before updating")
+                return false
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+
+        let installed = installation.withInstallLock {
+            func relaunch(_ app: URL, newInstance: Bool) -> Bool {
+                // Start the replacement, rather than activating the helper.
+                // On failure, let LaunchServices reuse an already open app.
+                let arguments = newInstance ? ["-n", app.path] : [app.path]
+                return runTool("/usr/bin/open", arguments).status == 0
+            }
+            // The helper may be invoked directly, and another helper may have
+            // installed a newer build. Read and verify again under the lock.
+            switch installation.candidateState(expectedIdentifier: expectedIdentifier) {
+            case .ready:
+                runTool("/usr/bin/xattr", ["-dr", "com.apple.quarantine", installation.staged.path])
+                return installation.install(relaunch: relaunch)
+            case .stale:
+                installation.discardStaging()
+                return true
+            case .invalid:
+                installation.discardStaging()
+                _ = relaunch(installation.installed, newInstance: false)
+                return false
+            }
+        }
+        if let installed { return installed }
+        installation.discardStaging()
+        NSLog("BarPilot: unable to acquire the update installation lock")
+        return false
+    }
+
+    private struct UpdateInstallation: Sendable {
+        let installed: URL
+        let id: UUID
+
+        var stagingDirectory: URL {
+            installed.deletingLastPathComponent()
+                .appendingPathComponent(".BarPilot-update-\(id.uuidString)", isDirectory: true)
+        }
+
+        var staged: URL {
+            stagingDirectory.appendingPathComponent(installed.lastPathComponent, isDirectory: true)
+        }
+
+        func discardStaging() {
+            try? FileManager.default.removeItem(at: stagingDirectory)
+        }
+
+        func withInstallLock<T>(timeout: TimeInterval = 30, _ work: () -> T) -> T? {
+            // Use a directory descriptor so the lock has a stable inode across
+            // exchanges and leaves no lock file. Close releases the lock.
+            let parent = installed.deletingLastPathComponent()
+            let descriptor = Darwin.open(parent.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+            guard descriptor >= 0 else { return nil }
+            defer { _ = Darwin.close(descriptor) }
+            let deadline = ProcessInfo.processInfo.systemUptime + timeout
+            while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+                guard errno == EWOULDBLOCK, ProcessInfo.processInfo.systemUptime < deadline else {
+                    return nil
+                }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            return work()
+        }
+
+        enum CandidateState: Equatable { case ready, stale, invalid }
+
+        func candidateState(expectedIdentifier: String?) -> CandidateState {
+            // Bundle.main may have cached metadata before a competing updater
+            // exchanged the files. Read the installed version from disk.
+            func info(_ app: URL) -> [String: Any]? {
+                let plist = app.appendingPathComponent("Contents/Info.plist")
+                guard let data = try? Data(contentsOf: plist) else { return nil }
+                return (try? PropertyListSerialization.propertyList(from: data, format: nil))
+                    as? [String: Any]
+            }
+            guard let identifier = expectedIdentifier,
+                  let current = info(installed), let candidate = info(staged),
+                  current["CFBundleIdentifier"] as? String == identifier,
+                  candidate["CFBundleIdentifier"] as? String == identifier,
+                  let currentVersion = current["CFBundleShortVersionString"] as? String,
+                  let candidateVersion = candidate["CFBundleShortVersionString"] as? String else {
+                NSLog("BarPilot: update rejected — unexpected bundle identity or version")
+                return .invalid
+            }
+            guard Updater.isNewer(candidateVersion, than: currentVersion) else { return .stale }
+            return Updater.verify(app: staged) ? .ready : .invalid
+        }
+
+        func install(relaunch: (URL, Bool) -> Bool) -> Bool {
+            guard exchangeBundles() else {
+                NSLog("BarPilot: could not replace the installed app")
+                discardStaging()
+                _ = relaunch(installed, false)
+                return false
+            }
+            if relaunch(installed, true) {
+                discardStaging()
+                return true
+            }
+            guard exchangeBundles() else {
+                // Leave the original app in staging if rollback itself fails.
+                NSLog("BarPilot: could not restore the original app after a failed relaunch")
+                return false
+            }
+            discardStaging()
+            _ = relaunch(installed, false)
+            return false
+        }
+
+        private func exchangeBundles() -> Bool {
+            installed.withUnsafeFileSystemRepresentation { installedPath in
+                staged.withUnsafeFileSystemRepresentation { stagedPath in
+                    guard let installedPath, let stagedPath else { return false }
+                    return renameatx_np(
+                        AT_FDCWD, installedPath, AT_FDCWD, stagedPath, UInt32(RENAME_SWAP)
+                    ) == 0
+                }
+            }
+        }
     }
 
     // MARK: Helpers
@@ -258,6 +406,11 @@ final class Updater {
         return !isDeveloperIDSigned()
     }()
 
+    static var isReleaseBuild: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "BarPilotBuildChannel") as? String == "release"
+            && !isDevBuild
+    }
+
     @MainActor
     static func verifyStartup() {
         @MainActor final class Probe {
@@ -295,6 +448,79 @@ final class Updater {
             teamIdentifier: teamID, certificateSubjects: ["Apple Development: Example"]
         ))
         precondition(!isDeveloperIDSigned(at: URL(fileURLWithPath: "/usr/bin/codesign")))
+        do {
+            try verifyInstallation()
+        } catch {
+            fputs("FAIL: could not prepare the update verification fixture\n", stderr)
+            exit(1)
+        }
         print("Startup identity verification passed (\(development ? "development" : "release")).")
+        print("Atomic update verification passed.")
+    }
+
+    private static func verifyInstallation() throws {
+        let fm = FileManager.default
+        let fixture = fm.temporaryDirectory.appendingPathComponent("barpilot-update-verify-\(UUID())")
+        try fm.createDirectory(at: fixture, withIntermediateDirectories: false)
+        defer { try? fm.removeItem(at: fixture) }
+        let installed = fixture.appendingPathComponent("BarPilot's $ test.app", isDirectory: true)
+        let installation = UpdateInstallation(installed: installed, id: UUID())
+        let competingInstallation = UpdateInstallation(installed: installed, id: UUID())
+
+        func createBundle(at url: URL, content: String) throws {
+            try fm.createDirectory(at: url, withIntermediateDirectories: true)
+            try content.write(to: url.appendingPathComponent("fixture"), atomically: true, encoding: .utf8)
+        }
+        func content(at url: URL) -> String? {
+            try? String(contentsOf: url.appendingPathComponent("fixture"), encoding: .utf8)
+        }
+
+        try createBundle(at: installed, content: "original")
+        try createBundle(at: installation.staged, content: "update")
+        let installedUpdate = installation.install { app, newInstance in
+            newInstance && content(at: app) == "update"
+        }
+        precondition(installedUpdate && content(at: installed) == "update")
+        precondition(!fm.fileExists(atPath: installation.stagingDirectory.path))
+
+        try createBundle(at: installation.staged, content: "bad relaunch")
+        var relaunches: [String] = []
+        let installedBrokenUpdate = installation.install { app, newInstance in
+            guard let current = content(at: app) else { return false }
+            relaunches.append(current)
+            precondition(newInstance == (current == "bad relaunch"))
+            return current == "update"
+        }
+        precondition(!installedBrokenUpdate && relaunches == ["bad relaunch", "update"])
+        precondition(content(at: installed) == "update")
+        precondition(!fm.fileExists(atPath: installation.stagingDirectory.path))
+
+        let installedMissingUpdate = installation.install { app, newInstance in
+            !newInstance && content(at: app) == "update"
+        }
+        precondition(!installedMissingUpdate && content(at: installed) == "update")
+
+        let excludedContender = installation.withInstallLock(timeout: 0) {
+            competingInstallation.withInstallLock(timeout: 0) { true } == nil
+        }
+        precondition(excludedContender == true)
+        precondition(competingInstallation.withInstallLock(timeout: 0) { true } == true)
+
+        let identifier = "org.example.barpilot.update-fixture"
+        func writeMetadata(at app: URL, version: String) throws {
+            let directory = app.appendingPathComponent("Contents", isDirectory: true)
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            let plist = try PropertyListSerialization.data(
+                fromPropertyList: ["CFBundleIdentifier": identifier, "CFBundleShortVersionString": version],
+                format: .xml, options: 0
+            )
+            try plist.write(to: directory.appendingPathComponent("Info.plist"))
+        }
+        try writeMetadata(at: installed, version: "2.0.0")
+        try writeMetadata(at: competingInstallation.staged, version: "1.5.0")
+        let staleCandidate = competingInstallation.withInstallLock(timeout: 0) {
+            competingInstallation.candidateState(expectedIdentifier: identifier)
+        }
+        precondition(staleCandidate == .stale)
     }
 }

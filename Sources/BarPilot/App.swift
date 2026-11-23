@@ -13,6 +13,9 @@ import UniformTypeIdentifiers
 struct AppMain {
     @MainActor
     static func main() {
+        if CommandLine.arguments.dropFirst().first == Updater.installArgument {
+            exit(Updater.applyStagedUpdate(CommandLine.arguments.dropFirst(2)) ? 0 : 1)
+        }
         let retiredFlags = ["--dump", "--sync-preview", "--verify-watchdog", "--verify-incremental"]
         if CommandLine.arguments.contains(where: retiredFlags.contains) {
             fputs("This telemetry command was removed. Use --diagnose or --verify-credits.\n", stderr)
@@ -190,12 +193,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSWorkspace.screensDidWakeNotification,
             object: nil
         )
+        let shouldRetireTelemetry = Updater.isReleaseBuild
         Task.detached(priority: .background) {
-            if !CreditSampleStore.retireLegacyTelemetry() {
+            if shouldRetireTelemetry, !CreditSampleStore.retireLegacyTelemetry() {
                 DiagLog.write("storage: legacy telemetry cleanup failed; will retry next launch")
             }
             CreditSampleStore.prune()
-            if case .failed(let reason) = TelemetryCleanup.live.run() {
+            if shouldRetireTelemetry, case .failed(let reason) = TelemetryCleanup.live.run() {
                 DiagLog.write("telemetry setup cleanup: \(reason); will retry next launch")
             }
         }

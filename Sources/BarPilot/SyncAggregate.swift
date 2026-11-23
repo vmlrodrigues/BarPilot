@@ -537,9 +537,13 @@ enum SyncAggregate {
                 .filter { CreditCycle.isCurrentCycle($0, now: now) }
                 .map { CurrentCreditObservation(sample: $0, cameFromRemote: true) }
         }
-        return candidates.max {
-            let lhs = $0.sample.serverAtMs ?? $0.sample.capturedAtMs
-            let rhs = $1.sample.serverAtMs ?? $1.sample.capturedAtMs
+        // A Mac with a fast clock must not hide a valid observation by winning
+        // the ranking and then failing the dashboard's future-date check.
+        return candidates.filter {
+            Date(timeIntervalSince1970: Double($0.sample.observedAtMs) / 1_000) <= now
+        }.max {
+            let lhs = $0.sample.observedAtMs
+            let rhs = $1.sample.observedAtMs
             if lhs != rhs { return lhs < rhs }
             // Prefer the direct local observation on an exact timestamp tie.
             if $0.cameFromRemote != $1.cameFromRemote {
@@ -1055,6 +1059,27 @@ enum SyncAggregate {
         precondition(
             tiedObservation?.cameFromRemote == false,
             "an equally current direct observation must win over its synced copy"
+        )
+        let futurePeerSample = CreditSample(
+            capturedAtMs: remoteCurrentSample.capturedAtMs + 120_000,
+            serverAtMs: nil, resetAtMs: remoteOnlyReset, creditsUsed: 127
+        )
+        let futurePeer = project(
+            creditSamples: [futurePeerSample],
+            accountFingerprint: "same-account",
+            machineId: "clock-ahead", label: nil, updatedAt: ""
+        )
+        let validObservation = currentCreditObservation(
+            local: remoteCurrentSample, remotes: [futurePeer],
+            accountFingerprint: "same-account", now: currentNow
+        )
+        precondition(
+            validObservation?.cameFromRemote == false
+                && CreditCycle.visibleCurrentCredits(
+                    sample: validObservation?.sample, connected: true,
+                    pollFailed: false, hasSuccessfulPoll: true, now: currentNow
+                ) == remoteCurrentSample.creditsUsed,
+            "future peer timestamps must not hide an eligible local observation"
         )
         let skewReset = CreditCycle.utcMidnightMs("2030-04-01")
         let serverNewer = CreditSample(

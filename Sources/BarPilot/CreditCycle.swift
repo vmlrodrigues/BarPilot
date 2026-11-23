@@ -32,9 +32,8 @@ enum CreditCycle {
     ) -> Double? {
         guard connected, !pollFailed, hasSuccessfulPoll, let sample,
               isCurrentCycle(sample, now: now) else { return nil }
-        let observedAtMs = sample.serverAtMs ?? sample.capturedAtMs
         let age = now.timeIntervalSince(
-            Date(timeIntervalSince1970: Double(observedAtMs) / 1_000)
+            Date(timeIntervalSince1970: Double(sample.observedAtMs) / 1_000)
         )
         guard age >= 0, age <= 5 * 60 else { return nil }
         return sample.creditsUsed
@@ -66,6 +65,7 @@ enum CreditCycle {
 
     static func verify() {
         CreditTimeline.verify()
+        CreditCycleNavigation.verify()
         CreditCycleTransitionPolicy.verify()
         CreditSampleStore.verifyTelemetryRetirement()
         let reset = CreditCycle.utcMidnightMs("2030-02-01")
@@ -147,7 +147,8 @@ enum CreditCycle {
             data: Data(alternateFixture.utf8),
             capturedAt: Date(timeIntervalSince1970: Double(t2) / 1000)
         )
-        precondition(alternate.creditsUsed == 100.5 && alternate.resetAtMs == reset,
+        precondition(alternate.creditsUsed == 100.5 && alternate.resetAtMs == reset
+                        && alternate.serverAtMs == nil,
                      "alternate reset fields and numeric strings must remain compatible")
         func rejectsReset(_ value: String) -> Bool {
             let invalid = """
@@ -193,12 +194,25 @@ enum CreditCycle {
           }
         }
         """
-        let skewedServer = try! CreditUsageAPI.parse(
-            data: Data(skewedServerFixture.utf8),
-            capturedAt: Date(timeIntervalSince1970: Double(t2) / 1_000)
-        )
-        precondition(skewedServer.serverAtMs == nil,
-                     "an implausible optional server clock must be ignored")
+        func rejectsTimestamp(_ timestamp: String) -> Bool {
+            let invalid = skewedServerFixture.replacingOccurrences(
+                of: "2099-01-01T00:00:00Z", with: timestamp
+            )
+            do {
+                _ = try CreditUsageAPI.parse(data: Data(invalid.utf8), capturedAt: now)
+                return false
+            } catch CreditUsageError.invalidResponse {
+                return true
+            } catch {
+                return false
+            }
+        }
+        precondition(rejectsTimestamp("2099-01-01T00:00:00Z"),
+                     "an implausible future GitHub timestamp must fail parsing")
+        precondition(rejectsTimestamp("2030-01-08T23:59:00Z"),
+                     "an explicit observation more than 24 hours old must not become fresh")
+        precondition(rejectsTimestamp("not a timestamp"),
+                     "a malformed GitHub timestamp must not become fresh")
 
         // A reset that is not UTC midnight on the 1st must still count as the
         // current cycle — otherwise the whole server dashboard goes blank for
@@ -266,17 +280,6 @@ enum CreditCycle {
                 containingUTCDate: april1, in: [newCycle, oldCycle]
             ) == newCycle,
             "a split reset day must select the cycle owning most of that UTC day")
-        precondition(
-            CreditCycleSummary.liveCycleDay(
-                currentSample: nil, cycles: [newCycle, oldCycle]
-            ) == newCycle.resetDayMs,
-            "the newest stored cycle must remain live while the current sample is unavailable")
-        precondition(
-            CreditCycleSummary.liveCycleDay(
-                currentSample: oldCycle.latestSample,
-                cycles: [newCycle, oldCycle]
-            ) == oldCycle.resetDayMs,
-            "a valid current sample must remain authoritative for live-cycle identity")
 
         CreditSampleStore.withTemporaryStore {
             let storeIdentity = CreditSampleStore.storeIdentity()

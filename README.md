@@ -141,24 +141,21 @@ backfill have been removed. All Copilot clients contributing to the connected
 account counter are included; there is no dependency on an IDE writing traces.
 GitHub's internal account endpoint remains unsupported and may change.
 
-On launch, BarPilot removes the telemetry-only `spans` table and its ingestion
-metadata. It **does not delete the database file**: account-counter observations,
-cycle budgets, database identity and account-adoption metadata remain intact.
+When a signed release launches, BarPilot removes the telemetry-only `spans`
+table and its ingestion metadata. It retains the database file, including its
+account-counter observations, cycle budgets, identity, and account-adoption metadata.
 The historical `spans-cache.db` filename is retained to preserve upgrades.
 Schema-v3 sync still sends `rows: []` so older Macs can read the counter payload;
 their telemetry rows are never used or republished by this version.
 
 ### Cleanup of previously enabled telemetry
 
-On launch, BarPilot also undoes the Copilot Mac app telemetry setup that older
-versions installed: it unloads and removes the `com.github.githubapp.otel-env`
-login agent and its helper script, and clears the three `COPILOT_OTEL_*` /
-`OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` session variables. Files are
-removed only when the helper has BarPilot's ownership marker and the agent's
-label and program path match that helper. A variable is cleared only if it still
-holds the value BarPilot set. If unloading or clearing fails, the helper files
-remain so cleanup can retry next launch. Relaunch the Copilot app afterwards so
-it stops exporting.
+Signed release builds also unload and remove the old Copilot Mac app telemetry
+login agent and helper after checking BarPilot's ownership marker, agent label,
+and program path. Session variables are cleared when the active file export
+path belongs to BarPilot and the variables still hold their original values.
+Cleanup retains the helper for retry if unloading or clearing fails. Relaunch
+the Copilot app afterwards so it picks up the updated session configuration.
 
 VS Code settings and existing trace files are not changed or deleted; they may be
 used by other tools. Never delete BarPilot's live `spans-cache.db`, because it

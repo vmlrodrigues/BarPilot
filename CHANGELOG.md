@@ -11,15 +11,24 @@ All notable changes to BarPilot are documented here.
   or disconnect. Saved counter history and cycle budgets remain intact.
 - Retired telemetry-only headless commands. Multi-Mac sync retains empty `rows`
   for compatibility with older schema-v3 peers.
-- **Old telemetry setup is cleaned up automatically.** On launch BarPilot removes
-  the Copilot telemetry login agent and helper it installed and clears the
-  session variables it set, leaving independently managed configuration, VS Code
-  settings and trace files untouched.
+- **Old telemetry setup is cleaned up automatically in signed releases.** BarPilot
+  removes its old Copilot telemetry login agent and helper. It clears session
+  variables only for its own active file exporter.
 
 ### Fixed
 - **BarPilot no longer crashes during startup while identifying the build.**
   Signature inspection no longer re-enters the main run loop during cached
   initialization, including when macOS launches the app at login.
+- Stale GitHub observations stay unavailable, a clock-ahead peer cannot hide a
+  fresh poll, and resolving the account no longer makes refresh wait for Gist sync.
+- Zero-usage cycles roll over correctly. Saved billing history remains browsable
+  offline, the calendar uses observed month-end resets, and a selected day's
+  spend follows the current account's observations.
+- Multi-Mac sync verifies that its Gist is secret before using it.
+- Automatic and manual update checks share one installer. Bundle replacement is
+  atomic and the original app is available for rollback. (#44)
+- The pricing catalogue keeps the newer bundled snapshot when the offline cache
+  predates it.
 
 ## [0.12.0] — 2026-09-11
 

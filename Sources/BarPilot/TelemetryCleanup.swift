@@ -3,9 +3,9 @@ import Foundation
 // ---------------------------------------------------------------------------
 // TelemetryCleanup — undoes the macOS login-session telemetry setup that older
 // BarPilot versions installed for the Copilot Mac app. Only artefacts that
-// carry BarPilot's ownership marker, and session variables that still hold the
-// exact values BarPilot set, are removed. VS Code settings and existing trace
-// files are deliberately left alone.
+// carry BarPilot's ownership marker, and matching session variables for its
+// file exporter, are removed. VS Code settings and existing trace files are
+// deliberately left alone.
 // ---------------------------------------------------------------------------
 
 struct TelemetryCleanup: Sendable {
@@ -23,7 +23,7 @@ struct TelemetryCleanup: Sendable {
     }
 
     let home: String
-    /// Runs `/bin/launchctl` and returns its exit status and trimmed output.
+    /// Runs `/bin/launchctl` and returns its exit status and output.
     let launchctl: @Sendable ([String]) -> (status: Int32, output: String)
 
     var helperScriptPath: String {
@@ -35,10 +35,13 @@ struct TelemetryCleanup: Sendable {
     var expectedEnvironment: [(name: String, value: String)] {
         [
             ("COPILOT_OTEL_EXPORTER_TYPE", "file"),
-            ("COPILOT_OTEL_FILE_EXPORTER_PATH",
-             home + "/Library/Application Support/com.github.githubapp/agent-traces.jsonl"),
             ("OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT", "true"),
+            exporterPath,
         ]
+    }
+    private var exporterPath: (name: String, value: String) {
+        ("COPILOT_OTEL_FILE_EXPORTER_PATH",
+         home + "/Library/Application Support/com.github.githubapp/agent-traces.jsonl")
     }
 
     static let live = TelemetryCleanup(
@@ -53,8 +56,11 @@ struct TelemetryCleanup: Sendable {
             do { try process.run() } catch { return (-1, "") }
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
-            let output = String(decoding: data, as: UTF8.self)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            // Strip the newline printed by getenv, preserving characters in
+            // the value itself, including whitespace in a custom path.
+            let value = arguments.first == "getenv" && data.last == 10
+                ? data.dropLast() : data[...]
+            let output = String(decoding: value, as: UTF8.self)
             return (process.terminationStatus, output)
         }
     )
@@ -102,21 +108,8 @@ struct TelemetryCleanup: Sendable {
                 )
             }
         }
-        for variable in expectedEnvironment {
-            let current = launchctl(["getenv", variable.name])
-            guard current.status == 0 else {
-                return .failed("unable to inspect \(variable.name)")
-            }
-            guard current.output == variable.value else { continue }
-
-            _ = launchctl(["unsetenv", variable.name])
-            let verified = launchctl(["getenv", variable.name])
-            guard verified.status == 0 else {
-                return .failed("unable to verify \(variable.name)")
-            }
-            if verified.output == variable.value {
-                return .failed("unable to clear \(variable.name)")
-            }
+        if let failure = clearOwnedEnvironment() {
+            return .failed(failure)
         }
         // Files go last so a failed run is retried on the next launch.
         let fileManager = FileManager.default
@@ -127,6 +120,34 @@ struct TelemetryCleanup: Sendable {
             return .failed("unable to remove telemetry helper files")
         }
         return .cleaned
+    }
+
+    private func clearOwnedEnvironment() -> String? {
+        let path = exporterPath
+        let configuredPath = launchctl(["getenv", path.name])
+        guard configuredPath.status == 0 else { return "unable to inspect \(path.name)" }
+        // The other values are generic. Only the exact trace path identifies
+        // the session configuration that the old BarPilot helper installed.
+        guard configuredPath.output == path.value else { return nil }
+        let exporter = launchctl(["getenv", "COPILOT_OTEL_EXPORTER_TYPE"])
+        guard exporter.status == 0 else { return "unable to inspect COPILOT_OTEL_EXPORTER_TYPE" }
+        // An empty type may be left by an earlier, partial cleanup. A different
+        // exporter type belongs to the current configuration, even with a stale path.
+        guard exporter.output.isEmpty || exporter.output == "file" else { return nil }
+
+        // Clear the path last. If another unset fails, the next launch can
+        // still recognise its own remaining variables by this path.
+        for variable in expectedEnvironment {
+            let current = launchctl(["getenv", variable.name])
+            guard current.status == 0 else { return "unable to inspect \(variable.name)" }
+            guard current.output == variable.value else { continue }
+
+            _ = launchctl(["unsetenv", variable.name])
+            let verified = launchctl(["getenv", variable.name])
+            guard verified.status == 0 else { return "unable to verify \(variable.name)" }
+            if verified.output == variable.value { return "unable to clear \(variable.name)" }
+        }
+        return nil
     }
 
     // MARK: Verification
@@ -318,6 +339,37 @@ struct TelemetryCleanup: Sendable {
             precondition(!fileManager.fileExists(atPath: cleanup.helperScriptPath))
         }
 
+        // Another file exporter can use the same general flags with its own path.
+        fixture(
+            script: ownedScript, agentProgram: .owned,
+            environment: { cleanup in [
+                "COPILOT_OTEL_EXPORTER_TYPE": "file",
+                "COPILOT_OTEL_FILE_EXPORTER_PATH": cleanup.exporterPath.value + " ",
+                "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "true",
+            ] }
+        ) { cleanup, fake in
+            let previous = fake.snapshot.environment
+            precondition(cleanup.run() == .cleaned)
+            precondition(fake.snapshot.environment == previous)
+            precondition(!fake.snapshot.calls.contains { $0.first == "unsetenv" })
+            precondition(!fileManager.fileExists(atPath: cleanup.helperScriptPath))
+            precondition(!fileManager.fileExists(atPath: cleanup.launchAgentPath))
+        }
+
+        // A different exporter can coexist with a leftover file path.
+        fixture(
+            script: ownedScript, agentProgram: nil,
+            environment: { cleanup in [
+                "COPILOT_OTEL_EXPORTER_TYPE": "otlp-http",
+                "COPILOT_OTEL_FILE_EXPORTER_PATH": cleanup.exporterPath.value,
+                "OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "true",
+            ] }
+        ) { cleanup, fake in
+            let previous = fake.snapshot.environment
+            precondition(cleanup.run() == .cleaned)
+            precondition(fake.snapshot.environment == previous)
+        }
+
         // A failed unload preserves its files and variables so the next launch retries.
         fixture(
             script: ownedScript, agentProgram: .owned,
@@ -333,7 +385,9 @@ struct TelemetryCleanup: Sendable {
         // A failed unset keeps the files so the next launch retries.
         fixture(
             script: ownedScript, agentProgram: nil,
-            environment: { _ in ["COPILOT_OTEL_EXPORTER_TYPE": "file"] }, failUnset: true
+            environment: { cleanup in
+                Dictionary(uniqueKeysWithValues: cleanup.expectedEnvironment)
+            }, failUnset: true
         ) { cleanup, _ in
             precondition(cleanup.run() == .failed("unable to clear COPILOT_OTEL_EXPORTER_TYPE"))
             precondition(fileManager.fileExists(atPath: cleanup.helperScriptPath))
@@ -345,7 +399,7 @@ struct TelemetryCleanup: Sendable {
             environment: { _ in ["COPILOT_OTEL_EXPORTER_TYPE": "file"] },
             failGetenvCall: 1
         ) { cleanup, fake in
-            precondition(cleanup.run() == .failed("unable to inspect COPILOT_OTEL_EXPORTER_TYPE"))
+            precondition(cleanup.run() == .failed("unable to inspect \(cleanup.exporterPath.name)"))
             precondition(fake.snapshot.environment["COPILOT_OTEL_EXPORTER_TYPE"] == "file")
             precondition(fileManager.fileExists(atPath: cleanup.helperScriptPath))
         }
@@ -353,12 +407,18 @@ struct TelemetryCleanup: Sendable {
         // Failed verification after unsetting also preserves the helper for retry.
         fixture(
             script: ownedScript, agentProgram: nil,
-            environment: { _ in ["COPILOT_OTEL_EXPORTER_TYPE": "file"] },
-            failGetenvCall: 2
+            environment: { cleanup in
+                Dictionary(uniqueKeysWithValues: cleanup.expectedEnvironment)
+            },
+            failGetenvCall: 4
         ) { cleanup, fake in
             precondition(cleanup.run() == .failed("unable to verify COPILOT_OTEL_EXPORTER_TYPE"))
             precondition(fake.snapshot.environment["COPILOT_OTEL_EXPORTER_TYPE"] == nil)
+            precondition(fake.snapshot.environment[cleanup.exporterPath.name] == cleanup.exporterPath.value)
             precondition(fileManager.fileExists(atPath: cleanup.helperScriptPath))
+            precondition(cleanup.run() == .cleaned)
+            precondition(fake.snapshot.environment.isEmpty)
+            precondition(!fileManager.fileExists(atPath: cleanup.helperScriptPath))
         }
 
         // A BarPilot helper can be removed when its agent is already unloaded.
