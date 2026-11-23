@@ -157,8 +157,8 @@ enum CreditCycleTransitionPolicy {
     }
 
     static func verify() {
-        let oldReset = Aggregator.utcMidnightMs("2030-01-01")
-        let newReset = Aggregator.utcMidnightMs("2030-02-01")
+        let oldReset = CreditCycle.utcMidnightMs("2030-01-01")
+        let newReset = CreditCycle.utcMidnightMs("2030-02-01")
         let previous = CreditSample(
             capturedAtMs: oldReset - 1, serverAtMs: nil,
             resetAtMs: oldReset, creditsUsed: 1_000
@@ -224,7 +224,7 @@ enum CreditHistoryMergePolicy {
     }
 
     static func verify() {
-        let day = Aggregator.utcMidnightMs("2030-02-01")
+        let day = CreditCycle.utcMidnightMs("2030-02-01")
         let stale = SyncedCycleBudget(
             resetDayMs: day, budgetUSD: 100, updatedAtMs: day - 2
         )
@@ -327,21 +327,8 @@ enum SyncPublishPolicy {
 
 @MainActor
 final class UsageStore: ObservableObject {
-    @Published private(set) var report: Report = .empty
-    @Published private(set) var currentMonthReport: Report = .empty
     @Published private(set) var isLoading = false
-    @Published private(set) var lastUpdated: Date?
-    @Published private(set) var status = SourcesStatus()
-    /// Server-authoritative overlay for the current billing cycle. The raw
-    /// `report` above always remains the local/classified report.
-    @Published private(set) var reconciled = ReconciledUsage.local(.empty)
-
-    @Published var periodKind: PeriodKind { didSet { onPeriodChanged() } }
-    @Published var customFrom: Date { didSet { if periodKind == .custom { recompute() } } }
-    @Published var customTo: Date { didSet { if periodKind == .custom { recompute() } } }
-
-    /// Monthly budget in USD. The per-period budget is derived from this by
-    /// pro-rating across the days in the selected range (a per-day rate).
+    private var hasCompletedInitialReload = false
     @Published var monthlyBudget: Double {
         didSet { persistBudget(previousValue: oldValue) }
     }
@@ -359,7 +346,7 @@ final class UsageStore: ObservableObject {
     private var exchangeRateSnapshot: ExchangeRateSnapshot?
 
     /// Multi-machine sync (opt-in, default OFF). The primary timeline unions
-    /// account-counter observations; legacy aggregate tabs still combine rows.
+    /// account-counter observations.
     @Published var syncEnabled: Bool { didSet { UserDefaults.standard.set(syncEnabled, forKey: Self.syncKey); recompute() } }
     /// Machines contributing to the combined view (this + remotes); 1 when OFF.
     @Published private(set) var syncMachineCount: Int = 1
@@ -397,6 +384,9 @@ final class UsageStore: ObservableObject {
     @Published private(set) var serverUsageSample: CreditSample?
     @Published private(set) var serverUsageError: String?
     @Published private(set) var isConnectingServerUsage = false
+    /// A persisted sample is not shown as current until this process has
+    /// completed a successful account-counter poll.
+    private var hasSuccessfulServerUsagePoll = false
     /// The in-flight device-flow poll, retained so the user can cancel it.
     private var serverUsageConnectTask: Task<Void, Never>?
     /// Cached in `recompute()` — see `updateCreditCycleView()`.
@@ -456,23 +446,9 @@ final class UsageStore: ObservableObject {
 
     /// Text shown in the menu bar (the compact current-month total cost).
     @Published private(set) var menuBarTitle: String = "—"
-    /// Is the Copilot app recording telemetry right now? Drives the menu-bar
-    /// warning glyph and the window banner (#27).
-    @Published private(set) var exporterVerdict: ExporterHealth.Verdict = .healthy
-    private var simulatingExporterDown = false
-
-    /// Whether to actually SHOW the exporter warning. Off by default while the
-    /// detection is unreliable (#32) — the dev simulation flag still forces it so
-    /// the UI can be worked on.
-    var showExporterWarning: Bool {
-        (ExporterHealth.warningsEnabled || simulatingExporterDown) && exporterVerdict.isWarning
-    }
-
-    private var allRecords: [UsageRecord] = []
     private var timer: Timer?
     private var rateTimer: Timer?
 
-    private static let periodKey = "selectedPeriodKind"
     private static let budgetKey = "monthlyBudgetUSD"
     private static let budgetUpdatedAtKey = "monthlyBudgetUpdatedAtMs"
     private static let excludeWeekendsKey = "excludeWeekendsFromProjection"
@@ -491,18 +467,12 @@ final class UsageStore: ObservableObject {
         calendar.timeZone = TimeZone(identifier: "UTC")!
         return calendar
     }()
-    /// Average days per month (365.25 / 12) — used to convert the monthly
-    /// budget into a stable per-day rate for any selected range.
-    private static let avgDaysPerMonth = 30.4375
     /// True only when the database identity differs from the one seen on the
     /// prior launch. Normal retention must not resurrect pruned remote rows.
     private var needsSelfHistoryRecovery = false
     private var creditStoreIdentity: String?
 
     init() {
-        let saved = UserDefaults.standard.string(forKey: Self.periodKey)
-        periodKind = PeriodKind(rawValue: saved ?? "") ?? .thisMonth
-
         if UserDefaults.standard.object(forKey: Self.budgetKey) != nil {
             let stored = UserDefaults.standard.double(forKey: Self.budgetKey)
             if case let .ok(value) = BudgetInput.parse(String(stored)) {
@@ -541,11 +511,6 @@ final class UsageStore: ObservableObject {
 
         syncEnabled = UserDefaults.standard.bool(forKey: Self.syncKey)   // default false
         syncLogin = UserDefaults.standard.string(forKey: "syncLogin")
-
-        let cal = Calendar.current
-        let now = Date()
-        customTo = now
-        customFrom = cal.date(from: cal.dateComponents([.year, .month], from: now)) ?? now
 
         // Connection is credential-driven, not an optional feature toggle. A
         // disconnected install presents its setup CTA in the primary dashboard.
@@ -601,12 +566,8 @@ final class UsageStore: ObservableObject {
     // Loading
     // -----------------------------------------------------------------------
 
-    /// Re-read both data sources from disk, then re-aggregate.
+    /// Refresh the saved peer snapshot and poll GitHub without overlapping reloads.
     func reload() async {
-        // Single-flight: reload() is triggered from six places (60s timer, launch,
-        // refresh, popover-open, telemetry setup, budget/currency change). Without
-        // this, two triggers close together (typically on wake) each run a full
-        // loadAll() — concurrent whole-file JSONL scans that peg CPU + memory. (#23)
         guard !isLoading else { return }
         isLoading = true
         let t0 = Date()
@@ -614,7 +575,6 @@ final class UsageStore: ObservableObject {
         let remoteCacheGeneration = syncGeneration
         let machineId = Self.machineId
         let loaded = await Task.detached(priority: .utility) {
-            let usage = DataSources.loadAll()
             let remotes: [MachineSyncPayload]?
             let remoteCacheReadFailed: Bool
             if loadRemoteCache {
@@ -630,14 +590,11 @@ final class UsageStore: ObservableObject {
                 remoteCacheReadFailed = false
             }
             return (
-                usage: usage,
                 remotes: remotes,
                 remoteCacheReadFailed: remoteCacheReadFailed
             )
         }.value
         let loadMs = Int(Date().timeIntervalSince(t0) * 1000)
-        allRecords = loaded.usage.records
-        status = loaded.usage.status
         var installedCurrentRemoteCache = false
         if let remotes = loaded.remotes, syncEnabled,
            syncGeneration == remoteCacheGeneration {
@@ -648,26 +605,7 @@ final class UsageStore: ObservableObject {
                   syncGeneration == remoteCacheGeneration {
             syncError = "Saved multi-Mac usage couldn’t be read. BarPilot kept its current view and will retry."
         }
-        lastUpdated = Date()
-        isLoading = false
-
-        // Watchdog: the Copilot app heartbeats into its JSONL every ~10s, so if
-        // it's running and the file isn't growing, its exporter is dead. Checked
-        // here (main actor) because NSWorkspace is a UI-layer API. (#27)
-        let copilot = NSWorkspace.shared.runningApplications
-            .first { $0.bundleIdentifier == ExporterHealth.copilotBundleId }
-        exporterVerdict = ExporterHealth.evaluate(
-            appRunning: copilot != nil,
-            appUptime: copilot?.launchDate.map { Date().timeIntervalSince($0) },
-            secondsSinceGrowth: status.macAppSecondsSinceGrowth,
-            gapSinceLastCheck: status.gapSinceLastCheck)
-        // Dev-only: force the warning state to eyeball the UI without having to
-        // break a real exporter. Gated to dev builds so a release can never be
-        // coaxed into showing a false alarm.
-        simulatingExporterDown = Updater.isDevBuild
-            && ProcessInfo.processInfo.environment["BARPILOT_SIMULATE_EXPORTER_DOWN"] != nil
-        if simulatingExporterDown { exporterVerdict = .silent(minutes: 14) }
-
+        hasCompletedInitialReload = true
         if RemoteCacheApplicationPolicy.shouldReapplyHistory(
             installedCurrentCache: installedCurrentRemoteCache,
             hasLocalHistory: localCreditHistory != nil
@@ -679,65 +617,24 @@ final class UsageStore: ObservableObject {
         } else {
             recompute()
         }
-        // Rotating support log (#24): load cost + what the reload actually computed
-        // vs the menu title it set — also the #13 display-vs-data drift diagnostic.
-        DiagLog.write("reload: \(loadMs)ms · scanned \(DiagLog.humanBytes(status.jsonlBytesScanned)) · +\(status.newRecords) new · \(allRecords.count) cached · period \(periodKind.rawValue) · menu \(menuBarTitle.hasPrefix("⚠︎") ? "warn" : "ok")\(menuBarTitle.hasSuffix(costString(credits: currentCompactTotalCredits)) ? "" : " · DRIFT")")
-        if syncEnabled { Task { await self.syncNow() } }   // background push/pull
-        if serverUsageEnabled { Task { await self.refreshServerUsage() } }
+        if serverUsageEnabled { await refreshServerUsage() }
+        isLoading = false
+        DiagLog.write("reload: \(loadMs)ms cache read - GitHub \(serverUsageStatusLabel)")
+        // Gist sync is independent of the account-counter poll. Do not hold the
+        // reload single-flight gate while it performs its slower network work.
+        if syncEnabled { Task { await syncNow() } }
     }
-
-    // -----------------------------------------------------------------------
-    // Aggregation (cheap; runs on the main actor)
-    // -----------------------------------------------------------------------
 
     private func recompute() {
         refreshCurrentCreditObservation()
-        // Don't paint the menu bar before the first load lands: init() kicks off
-        // reload() and refreshRate() concurrently, and if the rate fetch wins the
-        // race it would recompute with allRecords still empty — showing a
-        // remote-only (sync) or $0 total until reload finishes. reload() sets
-        // lastUpdated just before its own recompute, so this holds "—" until then. (#20)
-        guard lastUpdated != nil else { return }
-        let range = PeriodResolver.range(kind: periodKind, customFrom: customFrom, customTo: customTo)
-        let today = PeriodResolver.todayStr()
-        if syncEnabled {
-            let remotes = currentRemoteAggregates()
-            syncMachineCount = remotes.count + 1
-            report = Aggregator.buildCombined(
-                localRecords: allRecords, remoteAggregates: remotes,
-                fromStr: range.from, toStr: range.to, todayStr: today)
-        } else {
-            syncMachineCount = 1
-            report = Aggregator.build(
-                records: allRecords, fromStr: range.from, toStr: range.to, todayStr: today)
-        }
-        let monthRange = PeriodResolver.range(
-            kind: .thisMonth, customFrom: customFrom, customTo: customTo)
-        if range.from == monthRange.from && range.to == monthRange.to {
-            currentMonthReport = report
-        } else if syncEnabled {
-            currentMonthReport = Aggregator.buildCombined(
-                localRecords: allRecords, remoteAggregates: currentRemoteAggregates(),
-                fromStr: monthRange.from, toStr: monthRange.to, todayStr: today)
-        } else {
-            currentMonthReport = Aggregator.build(
-                records: allRecords, fromStr: monthRange.from,
-                toStr: monthRange.to, todayStr: today)
-        }
-        reconciled = CreditReconciliation.build(
-            report: report,
-            periodKind: periodKind,
-            snapshot: serverUsageEnabled ? serverUsageSample : nil,
-        )
         updateCreditCycleView()
+        syncMachineCount = syncEnabled ? remoteAggregates.count + 1 : 1
         counterSyncMachineCount = countCounterSyncMachines()
-        // The menu-bar figure must signal when it is a local fallback rather than
-        // the authoritative GitHub total. Reuse the existing warning glyph.
-        let cost = costString(credits: currentCompactTotalCredits)
-        let needsWarning = !serverUsageEnabled || serverUsageStatusIsError
-            || currentServerUsageSample == nil || serverUsageIsStale
-            || showExporterWarning
-        menuBarTitle = needsWarning ? "⚠︎ " + cost : cost
+        if let total = currentCompactTotalCredits {
+            menuBarTitle = costString(credits: total)
+        } else {
+            menuBarTitle = "—"
+        }
     }
 
     /// Other machines' payloads from the last successful pull. Excludes this
@@ -777,7 +674,7 @@ final class UsageStore: ObservableObject {
         return syncMachineCount
     }
 
-    /// Turn sync off. Local raw cache untouched; remote data cache cleared and
+    /// Turn sync off. Local counter history untouched; remote data cache cleared and
     /// the token removed. Does NOT delete the remote gist (offered separately).
     func disableSync() {
         syncGeneration += 1
@@ -933,7 +830,7 @@ final class UsageStore: ObservableObject {
         let remotes = snapshot.filter { $0.machineId != Self.machineId }
 
         let projected = SyncAggregate.project(
-            allRecords, creditSamples: syncCreditSamples,
+            creditSamples: syncCreditSamples,
             cycleBudgets: syncCycleBudgets,
             accountFingerprint: accountFingerprint,
             exchangeRateSnapshot: exchangeRateSnapshot,
@@ -1219,6 +1116,7 @@ final class UsageStore: ObservableObject {
         resetCreditCycleSelection()
         resetSpendCalendar()
         pendingCycleTransitionSample = sample
+        hasSuccessfulServerUsagePoll = false
         serverUsageAccountFingerprint = fingerprint
         UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
         serverUsageEnabled = true
@@ -1242,6 +1140,7 @@ final class UsageStore: ObservableObject {
         resetSpendCalendar()
         pendingCycleTransitionSample = nil
         serverUsageAccountFingerprint = fingerprint
+        hasSuccessfulServerUsagePoll = true
         if accountChanged {
             syncCycleBudgets = []
             localCreditHistory = nil
@@ -1366,7 +1265,7 @@ final class UsageStore: ObservableObject {
             stored: stored.cycleBudgets, live: syncCycleBudgets
         )
 
-        // A disconnected dashboard intentionally falls back to local telemetry.
+        // A disconnected dashboard intentionally has no current usage amount.
         // The history load above exists only to keep the sync upload complete;
         // do not leak retained account-counter rows back into that fallback UI.
         guard serverUsageEnabled else {
@@ -1428,6 +1327,7 @@ final class UsageStore: ObservableObject {
 
     private func transitionToDisconnectedServerUsage(error: String?) {
         serverUsageEnabled = false
+        hasSuccessfulServerUsagePoll = false
         pendingCycleTransitionSample = nil
         budgetMigrationCycleDayMs = nil
         previousCreditActivity = []
@@ -1604,6 +1504,7 @@ final class UsageStore: ObservableObject {
                 return .notNeeded
             }
             budgetPersistenceError = nil
+            hasSuccessfulServerUsagePoll = true
             upsertLocalCycleBudget(
                 resetDayMs: CreditCycleSummary.dayStart(for: sample.resetAtMs),
                 budgetUSD: budgetUSD, updatedAtMs: budgetChangedAtMs
@@ -1738,15 +1639,14 @@ final class UsageStore: ObservableObject {
         )
     }
 
-    var displayTotalCredits: Double { reconciled.totalCredits }
     var rollingCreditActivity: [ObservedDayCredits] {
         CreditTimeline.mergedDailyRows([
             creditTimeline.daily, previousCreditActivity
         ])
     }
     private func refreshCurrentCreditObservation() {
-        // Gated on the connection too: an explicit disconnect drops the headline
-        // to local telemetry. While connected, however, a matching peer may be
+        // Gated on the connection too: an explicit disconnect clears the current
+        // headline. While connected, however, a matching peer may be
         // the only Mac that observed the current cycle rollover.
         guard serverUsageEnabled else {
             resolvedCurrentCreditObservation = nil
@@ -1773,25 +1673,21 @@ final class UsageStore: ObservableObject {
             sample.serverAtMs ?? sample.capturedAtMs
         ) / 1000)
     }
-    var compactTotalCredits: Double {
+    var compactTotalCredits: Double? {
         if selectedCreditCycleDayMs != nil {
             return selectedHistoricalTotalCredits
                 ?? selectedCreditCycle?.latestSample.creditsUsed
-                ?? currentCompactTotalCredits
         }
         return currentCompactTotalCredits
     }
 
-    private var currentCompactTotalCredits: Double {
-        guard serverUsageEnabled, let sample = currentServerUsageSample else {
-            return currentMonthReport.totalCredits
-        }
-        guard CreditReconciliation.matchesCurrentCycle(
-            snapshot: sample, report: currentMonthReport, now: Date()
-        ) else {
-            return sample.creditsUsed
-        }
-        return max(sample.creditsUsed, currentMonthReport.totalCredits)
+    private var currentCompactTotalCredits: Double? {
+        CreditCycle.visibleCurrentCredits(
+            sample: currentServerUsageSample,
+            connected: serverUsageEnabled,
+            pollFailed: serverUsageError != nil,
+            hasSuccessfulPoll: hasSuccessfulServerUsagePoll
+        )
     }
 
     var selectedCreditCycle: CreditCycleSummary? {
@@ -2111,25 +2007,13 @@ final class UsageStore: ObservableObject {
         }
         return matching.count + 1
     }
-    var classifiedTotalCredits: Double { reconciled.classifiedCredits }
-    var sessionClassifiedTotalCredits: Double {
-        report.sessions.reduce(0) { $0 + $1.credits }
-    }
-    var unclassifiedCredits: Double { reconciled.unclassifiedCredits }
-    var summaryRows: [SummaryRow] { reconciled.summary }
-    var modelRows: [ModelRow] { reconciled.models }
-    var dailyRows: [DailyRow] { reconciled.daily }
-
     var serverUsageIsStale: Bool {
         guard let observedAt = currentServerUsageObservedAt else { return false }
         return Date().timeIntervalSince(observedAt) > 5 * 60
     }
 
-    /// A failed direct poll is not a dashboard failure when a fresh matching Mac
-    /// supplied the same authoritative account counter through sync.
     var serverUsageStatusIsError: Bool {
         serverUsageError != nil
-            && !(currentServerUsageSampleIsRemote && !serverUsageIsStale)
     }
 
     var serverUsageStatusLabel: String {
@@ -2149,11 +2033,6 @@ final class UsageStore: ObservableObject {
             return "GitHub · via sync"
         }
         return "GitHub · connected"
-    }
-
-    private func onPeriodChanged() {
-        UserDefaults.standard.set(periodKind.rawValue, forKey: Self.periodKey)
-        recompute()
     }
 
     private func persistBudget(previousValue: Double) {
@@ -2241,7 +2120,7 @@ final class UsageStore: ObservableObject {
         let changed = adoptNewestExchangeRate(from: [snapshot])
         // reload() owns the initial sync. If the network wins the launch race,
         // publishing here would replace this machine's gist rows with an empty set.
-        if changed, syncEnabled, lastUpdated != nil { await syncNow() }
+        if changed, syncEnabled, hasCompletedInitialReload { await syncNow() }
     }
 
     @discardableResult
@@ -2331,33 +2210,13 @@ final class UsageStore: ObservableObject {
     /// progress through the month (matching the "This month's budget" label),
     /// rather than a per-day pro-ration that collapses to a single day on the 1st.
     /// Every other period pro-rates the daily rate across the days in its range.
-    var periodBudgetCredits: Double {
-        if periodKind == .thisMonth {
-            return monthlyBudget * 100.0
-        }
-        let perDayCredits = (monthlyBudget * 100.0) / Self.avgDaysPerMonth
-        return perDayCredits * Double(max(report.daysInRange, 1))
-    }
-
-    var spendTitle: String { periodKind.spendTitle }
-
-    /// Run-rate projection of full-month spend (nil unless viewing an in-progress
-    /// month with usage). Pure + derived from the current report — see #18.
-    var spendProjection: SpendProjection? {
-        var displayReport = report
-        displayReport.totalCredits = reconciled.totalCredits
-        displayReport.todayCredits = reconciled.todayCredits
-        return SpendProjection.compute(periodKind: periodKind, report: displayReport,
-                                monthlyBudgetUSD: monthlyBudget, now: Date(),
-                                excludeWeekends: excludeWeekendsFromProjection)
-    }
-
     var compactSpendProjection: SpendProjection? {
         guard isViewingCurrentCreditCycle,
+              let totalCredits = currentCompactTotalCredits,
               let cycle = selectedCreditCycle,
               let startAt = cycle.startAt else { return nil }
         return SpendProjection.computeBillingCycle(
-            totalCredits: currentCompactTotalCredits,
+            totalCredits: totalCredits,
             monthlyBudgetUSD: monthlyBudget,
             startAt: startAt,
             resetAt: cycle.resetAt,
@@ -2366,120 +2225,5 @@ final class UsageStore: ObservableObject {
             excludeWeekends: excludeWeekendsFromProjection)
     }
 
-    // -----------------------------------------------------------------------
-    // Sparkline series
-    // -----------------------------------------------------------------------
 
-    /// Daily series for the header sparkline. For short periods it spans the
-    /// period's FULL calendar extent — so "This Month" shows the whole month with
-    /// only used days drawn and the rest blank, filling in as the month
-    /// progresses. This Year / All Time (and any range > 45 days) keep the raw
-    /// data-day series, since a bar-per-day won't fit the strip.
-    var sparklineTotals: [DayTotal] {
-        // In sync mode the combined dailyTotals are UTC-keyed; the full-extent grid
-        // keys by local day, so they wouldn't match — fall back to the raw series.
-        guard !syncEnabled, let (start, end) = sparklineExtent() else { return reconciled.dailyTotals }
-        let cal = Calendar.current
-        let days = (cal.dateComponents([.day], from: start, to: end).day ?? 0) + 1
-        guard days >= 1, days <= 45 else { return reconciled.dailyTotals }
-        var byDay: [String: Double] = [:]
-        for t in reconciled.dailyTotals { byDay[t.day] = t.credits }
-        var out: [DayTotal] = []
-        var d = start
-        for _ in 0..<days {
-            let key = Self.dayString(d, cal)
-            out.append(DayTotal(day: key, credits: byDay[key] ?? 0))
-            guard let next = cal.date(byAdding: .day, value: 1, to: d) else { break }
-            d = next
-        }
-        return out
-    }
-
-    /// Full calendar extent (local calendar) to chart for the current period, or
-    /// nil for periods that keep the raw data-day series (This Year / All Time).
-    private func sparklineExtent() -> (start: Date, end: Date)? {
-        let cal = Calendar.current
-        let today = cal.startOfDay(for: Date())
-        switch periodKind {
-        case .today:
-            return (today, today)
-        case .last7:
-            return (cal.date(byAdding: .day, value: -6, to: today) ?? today, today)
-        case .last30:
-            return (cal.date(byAdding: .day, value: -29, to: today) ?? today, today)
-        case .thisMonth:
-            let comps = cal.dateComponents([.year, .month], from: today)
-            guard let first = cal.date(from: comps),
-                  let range = cal.range(of: .day, in: .month, for: today) else { return nil }
-            return (first, cal.date(byAdding: .day, value: range.count - 1, to: first) ?? first)
-        case .previousMonth:
-            let comps = cal.dateComponents([.year, .month], from: today)
-            guard let firstOfThis = cal.date(from: comps),
-                  let lastOfPrev = cal.date(byAdding: .day, value: -1, to: firstOfThis),
-                  let firstOfPrev = cal.date(from: cal.dateComponents([.year, .month], from: lastOfPrev))
-                  else { return nil }
-            return (firstOfPrev, lastOfPrev)
-        case .custom:
-            let a = cal.startOfDay(for: customFrom), b = cal.startOfDay(for: customTo)
-            return a <= b ? (a, b) : (b, a)
-        case .thisYear, .allTime:
-            return nil
-        }
-    }
-
-    /// "YYYY-MM-DD" in the local calendar — matches `Aggregator.localDayStr` keys.
-    private static func dayString(_ d: Date, _ cal: Calendar) -> String {
-        let c = cal.dateComponents([.year, .month, .day], from: d)
-        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
-    }
-
-    // -----------------------------------------------------------------------
-    // Telemetry setup (explicit, user-confirmed)
-    // -----------------------------------------------------------------------
-
-    /// Confirm, then natively enable OTel telemetry for any unconfigured source.
-    func runTelemetrySetup() {
-        let planned = TelemetrySetup.plannedChanges()
-        guard !planned.isEmpty else { return }
-
-        let confirm = NSAlert()
-        confirm.messageText = "Enable Copilot telemetry?"
-        confirm.informativeText = """
-        BarPilot will make these changes (all in your ~/Library — no admin needed):
-
-        • \(planned.joined(separator: "\n• "))
-
-        macOS may show a “Background Items Added” notice for the LaunchAgent. \
-        Afterwards, restart VS Code and quit & relaunch the GitHub Copilot app.
-        """
-        confirm.addButton(withTitle: "Enable")
-        confirm.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        guard confirm.runModal() == .alertFirstButtonReturn else { return }
-
-        let result = TelemetrySetup.enableAll()
-
-        let done = NSAlert()
-        if result.ok {
-            done.messageText = "Telemetry enabled"
-            done.informativeText = """
-            Applied:
-            • \(result.changes.joined(separator: "\n• "))
-
-            Next: restart VS Code, and quit & relaunch the GitHub Copilot app, then \
-            use Copilot to start recording usage.
-            """
-        } else {
-            done.alertStyle = .warning
-            done.messageText = "Setup partly failed"
-            let applied = result.changes.isEmpty ? "" : "Applied:\n• \(result.changes.joined(separator: "\n• "))\n\n"
-            done.informativeText = applied + "Problems:\n• \(result.errors.joined(separator: "\n• "))"
-        }
-        done.runModal()
-
-        Task { await reload() }
-    }
-
-    /// Set the monthly budget via a simple input dialog (right-click menu entry).
-    /// Input is in the displayed currency; stored canonically in USD.
 }

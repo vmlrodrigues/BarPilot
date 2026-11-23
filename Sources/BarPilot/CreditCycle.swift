@@ -1,39 +1,44 @@
 import Foundation
 
-// ---------------------------------------------------------------------------
-// CreditReconciliation — server truth over local attribution.
-//
-// The local report remains untouched. For the current UTC billing cycle only,
-// the server counter supplies the headline total and any positive difference is
-// surfaced as "Unclassified"; it is never spread across known models/sessions.
-// ---------------------------------------------------------------------------
+enum CreditCycle {
+    private static let utcCalendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        return calendar
+    }()
 
-struct ReconciledUsage {
-    var isCurrentCycle = false
-    var totalCredits = 0.0
-    var classifiedCredits = 0.0
-    var unclassifiedCredits = 0.0
-    var summary: [SummaryRow] = []
-    var models: [ModelRow] = []
-    var daily: [DailyRow] = []
-    var dailyTotals: [DayTotal] = []
-    var todayCredits = 0.0
+    static func utcMidnightMs(_ day: String) -> Int64 {
+        let parts = day.split(separator: "-")
+        guard parts.count == 3,
+              let year = Int(parts[0]), let month = Int(parts[1]), let date = Int(parts[2]),
+              let value = utcCalendar.date(from: DateComponents(
+                year: year, month: month, day: date
+              )) else { return 0 }
+        return Int64(value.timeIntervalSince1970 * 1_000)
+    }
 
-    static func local(_ report: Report) -> ReconciledUsage {
-        ReconciledUsage(
-            totalCredits: report.totalCredits,
-            classifiedCredits: report.totalCredits,
-            summary: report.summary,
-            models: report.models,
-            daily: report.daily,
-            dailyTotals: report.dailyTotals,
-            todayCredits: report.todayCredits
+    static func utcDayStr(_ ms: Int64) -> String {
+        CreditCycleSummary.utcDayString(
+            for: Date(timeIntervalSince1970: Double(ms) / 1_000)
         )
     }
-}
 
-enum CreditReconciliation {
-    static let unclassifiedLabel = "Unclassified"
+    /// Never present a missing, expired or failed poll as a real zero or as a
+    /// current cached amount. History stays persisted for navigation and sync.
+    static func visibleCurrentCredits(
+        sample: CreditSample?, connected: Bool, pollFailed: Bool,
+        hasSuccessfulPoll: Bool,
+        now: Date = Date()
+    ) -> Double? {
+        guard connected, !pollFailed, hasSuccessfulPoll, let sample,
+              isCurrentCycle(sample, now: now) else { return nil }
+        let observedAtMs = sample.serverAtMs ?? sample.capturedAtMs
+        let age = now.timeIntervalSince(
+            Date(timeIntervalSince1970: Double(observedAtMs) / 1_000)
+        )
+        guard age >= 0, age <= 5 * 60 else { return nil }
+        return sample.creditsUsed
+    }
 
     /// The cycle a sample belongs to is `[resetAt - 1 month, resetAt)`. Copilot
     /// resets are not always UTC midnight on the 1st — the account response
@@ -41,8 +46,7 @@ enum CreditReconciliation {
     /// time-of-day, and anniversary-billed accounts never land on the 1st. So
     /// this is deliberately interval containment, not calendar-month equality:
     /// requiring alignment silently disabled the whole server dashboard for
-    /// those accounts. Callers that must line up with a locally aggregated
-    /// calendar-month range add that check themselves (`matchesCurrentCycle`).
+    /// those accounts.
     static func cycleStart(for sample: CreditSample) -> Date? {
         var utc = Calendar(identifier: .gregorian)
         utc.timeZone = TimeZone(identifier: "UTC")!
@@ -60,61 +64,63 @@ enum CreditReconciliation {
         return start <= now
     }
 
-    static func build(
-        report: Report,
-        periodKind: PeriodKind,
-        snapshot: CreditSample?,
-        now: Date = Date()
-    ) -> ReconciledUsage {
-        guard periodKind == .thisMonth,
-              let snapshot,
-              matchesCurrentCycle(snapshot: snapshot, report: report, now: now) else {
-            return .local(report)
-        }
-
-        let total = max(snapshot.creditsUsed, report.totalCredits)
-        let unclassified = max(0, total - report.totalCredits)
-        var out = ReconciledUsage.local(report)
-        out.isCurrentCycle = true
-        out.totalCredits = total
-        out.unclassifiedCredits = unclassified
-
-        guard unclassified > 0 else { return out }
-
-        out.summary.append(SummaryRow(model: unclassifiedLabel, calls: 0, credits: unclassified))
-        out.models.append(ModelRow(
-            model: unclassifiedLabel, calls: 0, credits: unclassified,
-            inputTokens: 0, outputTokens: 0,
-            inRate: .nan, outRate: .nan, fit: .nan, levels: []
-        ))
-        return out
-    }
-
-    /// The legacy overlay sits on top of a locally aggregated calendar-month
-    /// report, so it additionally requires the cycle to line up with that range.
-    /// A non-calendar cycle simply falls back to the local report rather than
-    /// mixing two different windows.
-    static func matchesCurrentCycle(snapshot: CreditSample, report: Report, now: Date) -> Bool {
-        guard isCurrentCycle(snapshot, now: now),
-              let start = cycleStart(for: snapshot) else { return false }
-        let startMs = Int64(start.timeIntervalSince1970 * 1_000)
-        // A local calendar-month report starts at UTC midnight. A 10am reset on
-        // the first still leaves ten hours from the previous cycle in that
-        // report, so matching only the day key is not sufficient.
-        guard startMs == Aggregator.utcMidnightMs(report.fromStr) else {
-            return false
-        }
-        return Aggregator.utcDayStr(startMs) == report.fromStr
-            && Aggregator.utcDayStr(Int64(now.timeIntervalSince1970 * 1000)) == report.toStr
-    }
-
     static func verify() {
         CreditTimeline.verify()
         CreditCycleTransitionPolicy.verify()
-        let reset = Aggregator.utcMidnightMs("2030-02-01")
-        let t0 = Aggregator.utcMidnightMs("2030-01-10")
+        CreditSampleStore.verifyTelemetryRetirement()
+        let reset = CreditCycle.utcMidnightMs("2030-02-01")
+        let t0 = CreditCycle.utcMidnightMs("2030-01-10")
         let t1 = t0 + 60_000
         let t2 = t1 + 60_000
+        let now = Date(timeIntervalSince1970: Double(t2) / 1_000)
+        let zero = CreditSample(
+            capturedAtMs: t2, serverAtMs: nil, resetAtMs: reset, creditsUsed: 0
+        )
+        precondition(visibleCurrentCredits(
+            sample: zero, connected: true, pollFailed: false,
+            hasSuccessfulPoll: true, now: now
+        ) == 0, "a successful zero counter must remain visible")
+        precondition(visibleCurrentCredits(
+            sample: zero, connected: true, pollFailed: true,
+            hasSuccessfulPoll: true, now: now
+        ) == nil, "a failed poll must hide even a previously valid counter")
+        precondition(visibleCurrentCredits(
+            sample: zero, connected: false, pollFailed: false,
+            hasSuccessfulPoll: true, now: now
+        ) == nil, "disconnecting must hide current usage")
+        precondition(visibleCurrentCredits(
+            sample: nil, connected: true, pollFailed: false,
+            hasSuccessfulPoll: true, now: now
+        ) == nil, "a missing counter must not become zero")
+        precondition(visibleCurrentCredits(
+            sample: zero, connected: true, pollFailed: false,
+            hasSuccessfulPoll: true,
+            now: now.addingTimeInterval(301)
+        ) == nil, "an old cached counter must not look current")
+        precondition(visibleCurrentCredits(
+            sample: zero, connected: true, pollFailed: false,
+            hasSuccessfulPoll: false, now: now
+        ) == nil, "a recent database sample must not appear current before this process polls")
+        precondition(visibleCurrentCredits(
+            sample: zero, connected: true, pollFailed: false,
+            hasSuccessfulPoll: true,
+            now: zero.resetAt
+        ) == nil, "the prior cycle must not remain current after rollover")
+        let available = CreditSample(
+            capturedAtMs: t2, serverAtMs: nil, resetAtMs: reset, creditsUsed: 123
+        )
+        precondition(visibleCurrentCredits(
+            sample: available, connected: true, pollFailed: false,
+            hasSuccessfulPoll: true, now: now
+        ) == 123, "a recovered poll must show the exact GitHub amount")
+        let serverTimestampIsOld = CreditSample(
+            capturedAtMs: t2, serverAtMs: t2 - 6 * 60_000,
+            resetAtMs: reset, creditsUsed: 123
+        )
+        precondition(visibleCurrentCredits(
+            sample: serverTimestampIsOld, connected: true, pollFailed: false,
+            hasSuccessfulPoll: true, now: now
+        ) == nil, "a recent fetch must not make an older GitHub observation current")
         let fixture = """
         {
           "quota_reset_date_utc": "2030-02-01T00:00:00Z",
@@ -194,24 +200,6 @@ enum CreditReconciliation {
         precondition(skewedServer.serverAtMs == nil,
                      "an implausible optional server clock must be ignored")
 
-        var report = Report.empty
-        report.fromStr = "2030-01-01"
-        report.toStr = "2030-01-10"
-        report.totalCredits = 80
-        let reconciled = build(
-            report: report, periodKind: .thisMonth,
-            snapshot: CreditSample(capturedAtMs: t2, serverAtMs: nil,
-                                   resetAtMs: reset, creditsUsed: 100),
-            now: Date(timeIntervalSince1970: Double(t2) / 1000)
-        )
-        precondition(reconciled.totalCredits == 100
-                     && reconciled.unclassifiedCredits == 20
-                     && reconciled.summary.last?.model == unclassifiedLabel
-                     && reconciled.models.last?.model == unclassifiedLabel,
-                     "unclassified usage must remain a separated final bucket")
-        precondition(!reconciled.daily.contains { $0.model == unclassifiedLabel },
-                     "daily usage must remain classified-only")
-
         // A reset that is not UTC midnight on the 1st must still count as the
         // current cycle — otherwise the whole server dashboard goes blank for
         // anniversary-billed and time-of-day resets, with no error shown.
@@ -236,31 +224,8 @@ enum CreditReconciliation {
                         ISO8601DateFormatter().date(from: "2029-12-01T00:00:00Z")!),
                      "a cycle that has not started must not be current")
 
-        // The legacy overlay still requires calendar alignment, so an
-        // anniversary cycle must fall back to the local calendar-month report
-        // rather than mix two different windows.
-        var offset = Report.empty
-        offset.fromStr = "2030-01-01"
-        offset.toStr = "2030-01-20"
-        offset.totalCredits = 80
-        let unaligned = build(
-            report: offset, periodKind: .thisMonth,
-            snapshot: sample(resetISO: "2030-01-25T00:00:00Z"), now: midCycle
-        )
-        precondition(!unaligned.isCurrentCycle && unaligned.totalCredits == 80,
-                     "an anniversary cycle must not overlay the calendar-month report")
-        // A same-day but non-midnight start still contains hours from the prior
-        // cycle in the local report, so the authoritative counter must stand
-        // alone rather than being maxed against that mixed window.
-        let alignedWithTime = build(
-            report: offset, periodKind: .thisMonth,
-            snapshot: sample(resetISO: "2030-02-01T08:00:00Z"), now: midCycle
-        )
-        precondition(!alignedWithTime.isCurrentCycle
-                     && alignedWithTime.totalCredits == offset.totalCredits,
-                     "a non-midnight cycle must not overlay a calendar-day report")
         verifyAccountRetention()
-        print("credit reconciliation verification passed")
+        print("credit counter verification passed")
     }
 
     /// Reconnecting, or changing how the account fingerprint is derived, must
@@ -269,8 +234,8 @@ enum CreditReconciliation {
     /// look like a different one, and the reconnect path responded by hiding the
     /// entire cycle behind a freshly advanced baseline pointer.
     private static func verifyAccountRetention() {
-        let reset = Aggregator.utcMidnightMs("2030-04-01")
-        let base = Aggregator.utcMidnightMs("2030-03-10")
+        let reset = CreditCycle.utcMidnightMs("2030-04-01")
+        let base = CreditCycle.utcMidnightMs("2030-03-10")
         let old = "fingerprint-before-derivation-change"
         let new = "fingerprint-after-derivation-change"
         let other = "a-genuinely-different-account"
@@ -278,18 +243,18 @@ enum CreditReconciliation {
             capturedAtMs: base, serverAtMs: nil,
             resetAtMs: reset + 8 * 60 * 60 * 1000, creditsUsed: 75
         ))
-        let nextReset = Aggregator.utcMidnightMs("2030-05-01") + 8 * 60 * 60 * 1000
+        let nextReset = CreditCycle.utcMidnightMs("2030-05-01") + 8 * 60 * 60 * 1000
         let newCycle = CreditCycleSummary(latestSample: CreditSample(
             capturedAtMs: reset + 9 * 60 * 60 * 1000, serverAtMs: nil,
             resetAtMs: nextReset, creditsUsed: 10
         ))
         let march31 = Date(
             timeIntervalSince1970:
-                Double(Aggregator.utcMidnightMs("2030-03-31")) / 1000
+                Double(CreditCycle.utcMidnightMs("2030-03-31")) / 1000
         )
         let april1 = Date(
             timeIntervalSince1970:
-                Double(Aggregator.utcMidnightMs("2030-04-01")) / 1000
+                Double(CreditCycle.utcMidnightMs("2030-04-01")) / 1000
         )
         precondition(
             CreditCycleSummary.cycle(
@@ -389,7 +354,7 @@ enum CreditReconciliation {
                 ) == 222,
                 "rewriting a sample without a budget must preserve its snapshot")
 
-            let priorReset = Aggregator.utcMidnightMs("2030-03-01")
+            let priorReset = CreditCycle.utcMidnightMs("2030-03-01")
             CreditSampleStore.save(
                 CreditSample(capturedAtMs: base - 2_000_000, serverAtMs: nil,
                              resetAtMs: priorReset, creditsUsed: 40),
@@ -546,7 +511,7 @@ enum CreditReconciliation {
                 ) == 222,
                 "updating one account must not alter another account")
 
-            let peerOnlyResetDay = Aggregator.utcMidnightMs("2031-01-01")
+            let peerOnlyResetDay = CreditCycle.utcMidnightMs("2031-01-01")
             precondition(
                 CreditSampleStore.loadCycle(
                     resetDayMs: peerOnlyResetDay, account: new
@@ -578,7 +543,7 @@ enum CreditReconciliation {
             )
 
             let recoveryAccount = "recovered-self-payload"
-            let recoveryReset = Aggregator.utcMidnightMs("2031-02-01")
+            let recoveryReset = CreditCycle.utcMidnightMs("2031-02-01")
             let recoveredSamples = [
                 CreditSample(
                     capturedAtMs: recoveryReset - 120_000,

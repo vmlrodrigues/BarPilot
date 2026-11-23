@@ -4,6 +4,18 @@ All notable changes to BarPilot are documented here.
 
 ## [Unreleased]
 
+### Removed
+- **Legacy local telemetry usage** (#57): removed attribution tabs, telemetry
+  ingestion, backfill, exporter monitoring and setup controls. Current usage
+  comes only from GitHub account counters and is unavailable after a failed poll
+  or disconnect. Saved counter history and cycle budgets remain intact.
+- Retired telemetry-only headless commands. Multi-Mac sync retains empty `rows`
+  for compatibility with older schema-v3 peers.
+- **Old telemetry setup is cleaned up automatically.** On launch BarPilot removes
+  the Copilot telemetry login agent and helper it installed and clears the
+  session variables it set, leaving independently managed configuration, VS Code
+  settings and trace files untouched.
+
 ### Fixed
 - **BarPilot no longer crashes during startup while identifying the build.**
   Signature inspection no longer re-enters the main run loop during cached

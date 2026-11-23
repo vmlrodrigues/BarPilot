@@ -6,7 +6,7 @@ struct ObservedDayCredits: Identifiable {
     let credits: Double
 
     var date: Date {
-        Date(timeIntervalSince1970: Double(Aggregator.utcMidnightMs(day)) / 1000)
+        Date(timeIntervalSince1970: Double(CreditCycle.utcMidnightMs(day)) / 1000)
     }
 }
 
@@ -193,8 +193,8 @@ struct CreditTimeline {
 
     static func verify() {
         let hour: Int64 = 60 * 60 * 1000
-        let reset = Aggregator.utcMidnightMs("2030-02-01")
-        let start = Aggregator.utcMidnightMs("2030-01-10")
+        let reset = CreditCycle.utcMidnightMs("2030-02-01")
+        let start = CreditCycle.utcMidnightMs("2030-01-10")
         let samples = [
             CreditSample(capturedAtMs: start, serverAtMs: nil, resetAtMs: reset, creditsUsed: 100),
             CreditSample(capturedAtMs: start + hour, serverAtMs: nil, resetAtMs: reset, creditsUsed: 125),
@@ -207,7 +207,7 @@ struct CreditTimeline {
         precondition(timeline.unallocatedCredits == 0)
         precondition(timeline.daily.first?.credits == 100)
 
-        let crossDayStart = Aggregator.utcMidnightMs("2030-01-10") + 23 * hour
+        let crossDayStart = CreditCycle.utcMidnightMs("2030-01-10") + 23 * hour
         let crossDay = build(samples: [
             CreditSample(capturedAtMs: crossDayStart, serverAtMs: nil, resetAtMs: reset, creditsUsed: 100),
             CreditSample(capturedAtMs: crossDayStart + 3 * hour, serverAtMs: nil, resetAtMs: reset, creditsUsed: 160)
@@ -274,11 +274,11 @@ struct CreditTimeline {
                      "calendar spend must sum both sides of a reset-day boundary")
 
         let chartStart = Date(timeIntervalSince1970: Double(
-            Aggregator.utcMidnightMs("2030-09-01")) / 1000)
+            CreditCycle.utcMidnightMs("2030-09-01")) / 1000)
         let chartReset = Date(timeIntervalSince1970: Double(
-            Aggregator.utcMidnightMs("2030-10-01")) / 1000)
+            CreditCycle.utcMidnightMs("2030-10-01")) / 1000)
         let chartNow = Date(timeIntervalSince1970: Double(
-            Aggregator.utcMidnightMs("2030-09-02") + 12 * hour) / 1000)
+            CreditCycle.utcMidnightMs("2030-09-02") + 12 * hour) / 1000)
         let chartDays = billingCycleDays(
             daily: [ObservedDayCredits(
                 id: "2030-09-01", day: "2030-09-01", credits: 42

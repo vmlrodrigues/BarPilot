@@ -268,7 +268,6 @@ struct CompactDashboard: View {
     @EnvironmentObject var store: UsageStore
     let connectGitHub: () -> Void
     let openSettings: () -> Void
-    let showLegacy: () -> Void
     let closePopover: () -> Void
     @ObservedObject var presentationState: PopoverPresentationState
     @State private var selectedSpendDay: String?
@@ -287,7 +286,9 @@ struct CompactDashboard: View {
                             connectionCard
                         }
                         spendSummary
-                        CompactBudgetBar()
+                        if store.compactTotalCredits != nil {
+                            CompactBudgetBar()
+                        }
                         if selectedSpendDay != nil {
                             selectedDayCard
                         }
@@ -386,7 +387,7 @@ struct CompactDashboard: View {
 
     private var connectionMessage: String {
         if let error = store.serverUsageError { return error }
-        return "BarPilot is temporarily showing incomplete local telemetry. Connect to load GitHub’s account-wide credit total and begin daily tracking."
+        return "Connect to load GitHub’s account-wide credit total and begin daily tracking. Current usage is unavailable until GitHub responds."
     }
 
     private var header: some View {
@@ -546,7 +547,7 @@ struct CompactDashboard: View {
         if let selectedSpendDay {
             return Date(
                 timeIntervalSince1970:
-                    Double(Aggregator.utcMidnightMs(selectedSpendDay)) / 1000
+                    Double(CreditCycle.utcMidnightMs(selectedSpendDay)) / 1000
             )
         }
         return store.selectedCreditCycle?.startAt ?? Date()
@@ -591,7 +592,7 @@ struct CompactDashboard: View {
         guard let selectedSpendDay else { return "Selected day" }
         let date = Date(
             timeIntervalSince1970:
-                Double(Aggregator.utcMidnightMs(selectedSpendDay)) / 1000
+                Double(CreditCycle.utcMidnightMs(selectedSpendDay)) / 1000
         )
         return "\(Self.selectedDayFormatter.string(from: date)) · UTC"
     }
@@ -615,12 +616,19 @@ struct CompactDashboard: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                Text(store.displayCostString(credits: store.compactTotalCredits))
+                Text(store.compactTotalCredits.map {
+                    store.displayCostString(credits: $0)
+                } ?? "—")
                     .font(.system(size: 34, weight: .bold, design: .rounded))
                     .monospacedDigit()
                 HStack(spacing: 7) {
-                    Text("\(Fmt.credits(store.compactTotalCredits)) premium credits")
-                        .font(.caption)
+                    if let credits = store.compactTotalCredits {
+                        Text("\(Fmt.credits(credits)) premium credits")
+                            .font(.caption)
+                    } else {
+                        Text(store.serverUsageError ?? "Current usage unavailable")
+                            .font(.caption)
+                    }
                     if let cycle = store.selectedCreditCycle {
                         Text("·")
                         Text("\(store.isViewingCurrentCreditCycle ? "Resets" : "Ended") \(Self.resetFormatter.string(from: cycle.resetAt))")
@@ -653,16 +661,6 @@ struct CompactDashboard: View {
                 .tint(.accentColor)
                 .help("Compare current GitHub Copilot model token prices")
 
-                Button {
-                    showLegacy()
-                } label: {
-                    Label("Legacy telemetry", systemImage: "clock.arrow.circlepath")
-                }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .help("Open the previous telemetry-based interface unchanged")
             }
         }
         .padding(16)
@@ -1218,13 +1216,18 @@ private struct CompactBudgetBar: View {
     }()
 
     var body: some View {
-        let spent = store.compactTotalCredits
+        if let spent = store.compactTotalCredits {
+            budgetContent(spent: spent)
+        }
+    }
+
+    private func budgetContent(spent: Double) -> some View {
         let budgetUSD = store.compactBudgetUSD
         let budget = (budgetUSD ?? 0) * 100
         let projection = store.compactSpendProjection
         let hasBudget = (budgetUSD ?? 0) >= BudgetInput.minimumNonZero
 
-        VStack(alignment: .leading, spacing: 10) {
+        return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Monthly budget")

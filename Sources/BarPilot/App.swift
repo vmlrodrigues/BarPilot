@@ -5,26 +5,22 @@ import UniformTypeIdentifiers
 
 // ---------------------------------------------------------------------------
 // Entry point. `@MainActor static main()` (the same shape SwiftUI's App uses)
-// runs the bootstrap on the main actor. `--dump` short-circuits to the
-// headless verification path; otherwise we boot an AppKit run loop.
+// runs the bootstrap on the main actor. Verification flags short-circuit to
+// headless checks; otherwise we boot an AppKit run loop.
 // ---------------------------------------------------------------------------
 
 @main
 struct AppMain {
     @MainActor
     static func main() {
-        if CommandLine.arguments.contains("--dump") {
-            Dump.run()
-            exit(0)
+        let retiredFlags = ["--dump", "--sync-preview", "--verify-watchdog", "--verify-incremental"]
+        if CommandLine.arguments.contains(where: retiredFlags.contains) {
+            fputs("This telemetry command was removed. Use --diagnose or --verify-credits.\n", stderr)
+            exit(2)
         }
-        // Dev-only: verify the versioned sync payload and legacy projection.
+        // Dev-only: verify the versioned counter sync payload.
         if CommandLine.arguments.contains("--verify-sync") {
             SyncAggregate.verifySelfConsistency()
-            exit(0)
-        }
-        // Dev-only: preview the combined view vs a simulated second machine.
-        if CommandLine.arguments.contains("--sync-preview") {
-            SyncAggregate.preview()
             exit(0)
         }
         // Dev-only: regression-check the spend projection math (#18).
@@ -32,19 +28,9 @@ struct AppMain {
             SpendProjection.verify()
             exit(0)
         }
-        // Dev-only: exporter-heartbeat watchdog decision rules (#27).
-        if CommandLine.arguments.contains("--verify-watchdog") {
-            ExporterHealth.verify()
-            exit(0)
-        }
-        // Dev-only: prove incremental JSONL reads never lose/duplicate a record (#24).
-        if CommandLine.arguments.contains("--verify-incremental") {
-            DataSources.verifyIncremental()
-            exit(0)
-        }
         // Dev-only: cumulative-counter reset, baseline and gap rules (#33).
         if CommandLine.arguments.contains("--verify-credits") {
-            CreditReconciliation.verify()
+            CreditCycle.verify()
             exit(0)
         }
         // Dev-only: post-wake refresh coalescing and retry rules (#39).
@@ -69,6 +55,10 @@ struct AppMain {
             RecentActivityLayout.verify()
             AppDelegate.verifyPopoverCloseTriggerRetention()
             StatusItemActionPolicy.verify()
+            exit(0)
+        }
+        if CommandLine.arguments.contains("--verify-telemetry-cleanup") {
+            TelemetryCleanup.verify()
             exit(0)
         }
         if CommandLine.arguments.contains("--verify-startup") {
@@ -99,7 +89,7 @@ struct AppMain {
 // We use an explicit AppKit NSStatusItem (rather than SwiftUI's MenuBarExtra)
 // because it is the reliable way to get a menu-bar item to appear from a
 // SwiftPM-built, hand-assembled .app bundle. The window UI itself is still
-// SwiftUI (DetailView), hosted in an NSPopover.
+// SwiftUI (CompactDashboard), hosted in an NSPopover.
 // ---------------------------------------------------------------------------
 
 enum PopoverSizePolicy {
@@ -172,7 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         popover.animates = false
         popover.delegate = self
         popover.contentViewController = NSHostingController(
-            rootView: DetailView(
+            rootView: CompactDashboard(
                 connectGitHub: { [weak self] in
                     self?.startCreditUsageDeviceFlow()
                 },
@@ -184,7 +174,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         )
         popover.contentSize = desiredContentSize()
 
-        // Keep the menu-bar title in sync with the selected period's total.
+        // Keep the menu-bar title in sync with the current account counter.
         store.$menuBarTitle
             .receive(on: RunLoop.main)
             .sink { [weak self] title in
@@ -201,8 +191,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             object: nil
         )
         Task.detached(priority: .background) {
-            SpanCache.prune()
+            if !CreditSampleStore.retireLegacyTelemetry() {
+                DiagLog.write("storage: legacy telemetry cleanup failed; will retry next launch")
+            }
             CreditSampleStore.prune()
+            if case .failed(let reason) = TelemetryCleanup.live.run() {
+                DiagLog.write("telemetry setup cleanup: \(reason); will retry next launch")
+            }
         }
 
         // A crowded menu bar (or a notch) can push the status item somewhere the
@@ -411,12 +406,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Shared by the settings window and the legacy footer control.
+    /// Confirm disconnection from the settings window.
     func confirmDisconnectGitHub() {
         guard store.serverUsageEnabled else { return }
         let a = NSAlert()
         a.messageText = "Disconnect GitHub?"
-        a.informativeText = "BarPilot will stop refreshing the authoritative credit total and temporarily show incomplete local telemetry. Saved daily counter history and multi-machine sync remain untouched."
+        a.informativeText = "BarPilot will stop showing current usage until you reconnect GitHub. Saved daily counter history and multi-machine sync remain untouched."
         a.addButton(withTitle: "Disconnect")
         a.addButton(withTitle: "Cancel")
         NSApp.activate(ignoringOtherApps: true)
@@ -454,7 +449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         1.  You run Copilot on more than one Mac.
         2.  Your GitHub account can create gists.
 
-        Most work or enterprise accounts have gists disabled, so sync won’t work with those — a gist is where the data is stored. BarPilot shares compact cumulative credit observations so one Mac can fill another Mac’s offline gaps. During the legacy transition it also retains the existing daily telemetry summary. No code, prompts, or content are uploaded. Every Mac must use the same account.
+        Most work or enterprise accounts have gists disabled, so sync won’t work with those — a gist is where the data is stored. BarPilot shares compact cumulative credit observations so one Mac can fill another Mac’s offline gaps. No code, prompts, or content are uploaded. Every Mac must use the same account.
 
         Open GitHub and enter the code below (already copied to your clipboard). It finishes on its own once you approve.
         """

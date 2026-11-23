@@ -17,7 +17,7 @@ struct CreditCycleSummary: Identifiable, Equatable {
     var id: Int64 { resetDayMs }
     var resetAtMs: Int64 { latestSample.resetAtMs }
     var resetAt: Date { latestSample.resetAt }
-    var startAt: Date? { CreditReconciliation.cycleStart(for: latestSample) }
+    var startAt: Date? { CreditCycle.cycleStart(for: latestSample) }
 
     static func dayStart(for resetAtMs: Int64) -> Int64 {
         resetAtMs / dayMs * dayMs
@@ -96,12 +96,139 @@ struct CreditCycleSummary: Identifiable, Equatable {
 // ---------------------------------------------------------------------------
 // CreditSampleStore — cumulative server-counter observations.
 //
-// Samples live beside the legacy span cache but in their own durable table. The
-// database remains after telemetry retirement. Poll failures are never written,
-// and reconciliation never diffs across a reset or decrease.
+// Keep the historical filename so upgrades preserve samples and cycle budgets.
+// Poll failures are never written, and timelines never diff across a reset.
 // ---------------------------------------------------------------------------
 
 enum CreditSampleStore {
+    static var path: String {
+        if let override = ProcessInfo.processInfo.environment["BARPILOT_CACHE_PATH"],
+           !override.isEmpty { return override }
+        return FileManager.default.homeDirectoryForCurrentUser.path
+            + "/Library/Application Support/com.victorrodrigues.barpilot/spans-cache.db"
+    }
+
+    static func getMeta(_ key: String) -> String? {
+        guard let db = open() else { return nil }
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            db, "SELECT value FROM meta WHERE key=?", -1, &statement, nil
+        ) == SQLITE_OK else {
+            NSLog("BarPilot: unable to read credit metadata")
+            return nil
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, key, -1, sqliteTransient)
+        let result = sqlite3_step(statement)
+        if result == SQLITE_ROW, let value = sqlite3_column_text(statement, 0) {
+            return String(cString: value)
+        }
+        if result != SQLITE_DONE {
+            NSLog("BarPilot: credit metadata read failed")
+        }
+        return nil
+    }
+
+    static func setMeta(_ key: String, _ value: String) {
+        guard let db = open() else { return }
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            db, "INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+            -1, &statement, nil
+        ) == SQLITE_OK else {
+            NSLog("BarPilot: unable to prepare credit metadata write")
+            return
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, key, -1, sqliteTransient)
+        sqlite3_bind_text(statement, 2, value, -1, sqliteTransient)
+        if sqlite3_step(statement) != SQLITE_DONE {
+            NSLog("BarPilot: credit metadata write failed")
+        }
+    }
+
+    /// Retire only telemetry-owned storage. Account adoption, budget migration
+    /// and database identity metadata must survive this upgrade.
+    static func retireLegacyTelemetry() -> Bool {
+        guard let db = open() else { return false }
+        defer { sqlite3_close(db) }
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else {
+            NSLog("BarPilot: unable to start telemetry retirement")
+            return false
+        }
+        let retired = sqlite3_exec(db, """
+        DROP TABLE IF EXISTS spans;
+        DELETE FROM meta WHERE key IN (
+            'macAppJSONLOffset', 'macAppJSONLLastSize', 'macAppJSONLLastGrowthAt',
+            'lastSourceCheckAt', 'backfill_version', 'reasoning_backfill_version'
+        );
+        """, nil, nil, nil) == SQLITE_OK
+        if retired && sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK {
+            return true
+        }
+        sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+        NSLog("BarPilot: telemetry retirement failed; credit history retained")
+        return false
+    }
+
+    static func verifyTelemetryRetirement() {
+        withTemporaryStore {
+            let identity = storeIdentity()
+            let sample = CreditSample(
+                capturedAtMs: CreditCycle.utcMidnightMs("2030-01-10"),
+                serverAtMs: nil, resetAtMs: CreditCycle.utcMidnightMs("2030-02-01"),
+                creditsUsed: 123
+            )
+            precondition(save(sample, account: "fixture", budgetUSD: 150))
+            setMeta(adoptionKey, "fixture")
+            guard let db = open() else { preconditionFailure("fixture database unavailable") }
+            precondition(sqlite3_exec(db, """
+            CREATE TABLE spans(span_id TEXT PRIMARY KEY, credits REAL);
+            INSERT INTO spans VALUES('retired',999);
+            INSERT INTO meta VALUES('macAppJSONLOffset','1234');
+            INSERT INTO meta VALUES('backfill_version','2');
+            CREATE TRIGGER prevent_retirement BEFORE DELETE ON meta
+            WHEN OLD.key='macAppJSONLOffset'
+            BEGIN SELECT RAISE(ABORT,'fixture retirement failure'); END;
+            """, nil, nil, nil) == SQLITE_OK)
+            sqlite3_close(db)
+            precondition(!retireLegacyTelemetry(), "failed retirement must report failure")
+            precondition(getMeta("macAppJSONLOffset") == "1234")
+            guard let rollback = open() else { preconditionFailure("rollback database unavailable") }
+            var restored: OpaquePointer?
+            precondition(sqlite3_prepare_v2(
+                rollback, "SELECT COUNT(*) FROM spans", -1, &restored, nil
+            ) == SQLITE_OK, "a failed cleanup must restore the dropped table")
+            precondition(sqlite3_step(restored) == SQLITE_ROW && sqlite3_column_int(restored, 0) == 1)
+            sqlite3_finalize(restored)
+            precondition(sqlite3_exec(
+                rollback, "DROP TRIGGER prevent_retirement", nil, nil, nil
+            ) == SQLITE_OK)
+            sqlite3_close(rollback)
+            precondition(retireLegacyTelemetry())
+            precondition(retireLegacyTelemetry(), "retirement must be idempotent")
+            precondition(storeIdentity() == identity)
+            precondition(load(resetAtMs: sample.resetAtMs, account: "fixture") == [sample])
+            precondition(cycleBudget(
+                resetDayMs: CreditCycleSummary.dayStart(for: sample.resetAtMs),
+                account: "fixture"
+            ) == 150, "telemetry retirement must preserve cycle budgets")
+            precondition(getMeta(adoptionKey) == "fixture")
+            precondition(getMeta("macAppJSONLOffset") == nil && getMeta("backfill_version") == nil)
+            guard let checked = open() else { preconditionFailure("retired database unavailable") }
+            defer { sqlite3_close(checked) }
+            var statement: OpaquePointer?
+            precondition(sqlite3_prepare_v2(
+                checked, "SELECT 1 FROM sqlite_master WHERE name='spans'",
+                -1, &statement, nil
+            ) == SQLITE_OK)
+            defer { sqlite3_finalize(statement) }
+            precondition(sqlite3_step(statement) == SQLITE_DONE, "telemetry table must be removed")
+        }
+    }
+
     struct HistorySnapshot {
         let cycles: [CreditCycleSummary]
         let samplesByCycle: [Int64: [CreditSample]]
@@ -118,29 +245,33 @@ enum CreditSampleStore {
     /// and enables one-time recovery from this machine's remote payload.
     static func storeIdentity() -> String? {
         let key = "credit_history_store_id"
-        if let existing = SpanCache.getMeta(key), !existing.isEmpty {
+        if let existing = CreditSampleStore.getMeta(key), !existing.isEmpty {
             return existing
         }
         let created = UUID().uuidString
-        SpanCache.setMeta(key, created)
-        return SpanCache.getMeta(key) == created ? created : nil
+        CreditSampleStore.setMeta(key, created)
+        return CreditSampleStore.getMeta(key) == created ? created : nil
     }
 
     private static func open() -> OpaquePointer? {
-        let path = SpanCache.path
-        try? FileManager.default.createDirectory(
-            atPath: (path as NSString).deletingLastPathComponent,
-            withIntermediateDirectories: true)
+        let path = CreditSampleStore.path
+        do {
+            try FileManager.default.createDirectory(
+                atPath: (path as NSString).deletingLastPathComponent,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            NSLog("BarPilot: unable to create credit history directory")
+            return nil
+        }
         var db: OpaquePointer?
         guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK else {
+            NSLog("BarPilot: unable to open credit history database")
             if let db { sqlite3_close(db) }
             return nil
         }
         sqlite3_exec(db, "PRAGMA journal_mode=WAL", nil, nil, nil)
-        // Credit samples are written from a different task than the span
-        // merge, so two writers now contend for this file. WAL allows
-        // concurrent readers but still only one writer: without a timeout the
-        // loser gets SQLITE_BUSY immediately instead of waiting its turn.
+        // Budget edits, polling and sync recovery may write concurrently.
         sqlite3_busy_timeout(db, 5000)
         sqlite3_exec(db, """
         CREATE TABLE IF NOT EXISTS credit_samples (
@@ -250,7 +381,7 @@ enum CreditSampleStore {
     /// account connecting later cannot inherit the first account's history.
     @discardableResult
     static func adoptUnattributed(account: String) -> Int {
-        guard SpanCache.getMeta(adoptionKey) == nil else { return 0 }
+        guard CreditSampleStore.getMeta(adoptionKey) == nil else { return 0 }
         guard let db = open() else { return 0 }
         defer { sqlite3_close(db) }
         guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK
@@ -303,7 +434,7 @@ enum CreditSampleStore {
             return 0
         }
         committed = true
-        SpanCache.setMeta(adoptionKey, account)
+        CreditSampleStore.setMeta(adoptionKey, account)
         return adoptedCount
     }
 
@@ -351,7 +482,7 @@ enum CreditSampleStore {
         try? FileManager.default.createDirectory(
             atPath: dir, withIntermediateDirectories: true)
         setenv("BARPILOT_CACHE_PATH", dir + "/spans-cache.db", 1)
-        precondition(SpanCache.path.hasPrefix(dir),
+        precondition(CreditSampleStore.path.hasPrefix(dir),
                      "verification must not run against the real database")
         body()
         if let previous { setenv("BARPILOT_CACHE_PATH", previous, 1) }
@@ -690,14 +821,14 @@ enum CreditSampleStore {
     ) -> Int64? {
         guard let account else { return nil }
         let key = budgetMigrationKey(account: account)
-        if let stored = SpanCache.getMeta(key) {
+        if let stored = CreditSampleStore.getMeta(key) {
             if stored == budgetMigrationComplete { return nil }
             if let resetDayMs = Int64(stored),
                let cycle = cycles.first(where: { $0.resetDayMs == resetDayMs }),
                resetDayMs != liveResetDayMs,
                cycle.startAt.map(CreditCycleSummary.utcMonthKey) == eligibleStartMonth {
                 guard cycleBudget(resetDayMs: resetDayMs, account: account) == nil else {
-                    SpanCache.setMeta(key, budgetMigrationComplete)
+                    CreditSampleStore.setMeta(key, budgetMigrationComplete)
                     return nil
                 }
                 return resetDayMs
@@ -714,16 +845,16 @@ enum CreditSampleStore {
             return nil
         }
         guard cycleBudget(resetDayMs: candidate.resetDayMs, account: account) == nil else {
-            SpanCache.setMeta(key, budgetMigrationComplete)
+            CreditSampleStore.setMeta(key, budgetMigrationComplete)
             return nil
         }
-        SpanCache.setMeta(key, String(candidate.resetDayMs))
+        CreditSampleStore.setMeta(key, String(candidate.resetDayMs))
         return candidate.resetDayMs
     }
 
     static func completeBudgetMigration(account: String?) {
         guard let account else { return }
-        SpanCache.setMeta(
+        CreditSampleStore.setMeta(
             budgetMigrationKey(account: account), budgetMigrationComplete
         )
     }

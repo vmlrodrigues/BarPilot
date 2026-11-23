@@ -4,7 +4,7 @@ import SQLite3
 // ---------------------------------------------------------------------------
 // RemoteStore — a SEPARATE local SQLite store of OTHER machines' pulled sync
 // payloads, keyed by random machine UUID. It holds authoritative counter
-// observations plus temporary legacy aggregates, never raw spans or content.
+// observations and cycle budgets, never raw spans or content.
 //
 // Each successful pull atomically replaces the complete peer snapshot. Cleared
 // on disable / revert. A missing/foreign machine can be forgotten individually
