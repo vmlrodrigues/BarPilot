@@ -171,7 +171,8 @@ final class Updater {
 
     @MainActor
     private static func installAndRelaunch(_ installation: UpdateInstallation) {
-        guard installation.canBeginInstall({ isRunningFromInstalledBundle(installation.installed) }) else {
+        guard installation.canBeginInstall({ isRunningFromInstalledBundle(installation.installed) }),
+              startupLease?.pendingUpdate == .absent else {
             installation.discardUnrecordedStaging()
             NSLog("BarPilot: update deferred because the installation is busy or needs recovery")
             return
@@ -320,16 +321,19 @@ final class Updater {
         runStartupMaintenance(at: installed, canRetire: true, runMaintenance)
     }
 
+    @MainActor
     private static func runStartupMaintenance(
         at installed: URL, canRetire: Bool, _ runMaintenance: @escaping @Sendable (Bool) -> Void
     ) {
+        let runningBundle = startupLease
         Task.detached(priority: .background) {
             // Consult the durable state even for Finder and login launches.
             // Holding the lock through retirement also excludes an exchange
             // beginning between this check and the destructive writes.
             let ran = canRetire && (UpdateInstallation.withInstallLock(at: installed, timeout: 0) {
                 if isRunningFromInstalledBundle(installed),
-                   case .ready = UpdateInstallation.startupState(at: installed, cleanSettled: true) {
+                   case .ready = UpdateInstallation.startupState(at: installed, cleanSettled: true),
+                   runningBundle?.pendingUpdate == .absent {
                     runMaintenance(true)
                     return true
                 }
@@ -448,23 +452,22 @@ final class Updater {
         return true
     }
 
-    private final class BundleLease {
+    private final class BundleLease: Sendable {
         enum Failure: Error { case busy, unavailable }
+        enum PendingUpdate: Equatable { case absent, marked(UUID), unreadable }
 
+        private static let pendingAttribute = "com.barpilot.pending-update"
         private let descriptor: Int32
 
         init(at url: URL, operation: Int32) throws {
-            let descriptor = Darwin.open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            let descriptor = Self.openDirectory(at: url)
             guard descriptor >= 0 else { throw Failure.unavailable }
             guard flock(descriptor, operation | LOCK_NB) == 0 else {
                 let failure: Failure = errno == EWOULDBLOCK ? .busy : .unavailable
                 _ = Darwin.close(descriptor)
                 throw failure
             }
-            var opened = stat()
-            var current = stat()
-            guard fstat(descriptor, &opened) == 0, lstat(url.path, &current) == 0,
-                  opened.st_dev == current.st_dev, opened.st_ino == current.st_ino else {
+            guard Self.matchesDirectory(descriptor, at: url) else {
                 _ = Darwin.close(descriptor)
                 throw Failure.unavailable
             }
@@ -472,6 +475,65 @@ final class Updater {
         }
 
         deinit { _ = Darwin.close(descriptor) }
+
+        private static func openDirectory(at url: URL) -> Int32 {
+            Darwin.open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        }
+
+        private static func matchesDirectory(_ descriptor: Int32, at url: URL) -> Bool {
+            var opened = stat()
+            var current = stat()
+            return fstat(descriptor, &opened) == 0 && lstat(url.path, &current) == 0
+                && opened.st_dev == current.st_dev && opened.st_ino == current.st_ino
+        }
+
+        func matchesDirectory(at url: URL) -> Bool { Self.matchesDirectory(descriptor, at: url) }
+
+        var pendingUpdate: PendingUpdate { Self.pendingUpdate(on: descriptor) }
+
+        static func pendingUpdate(at url: URL) -> PendingUpdate {
+            let descriptor = openDirectory(at: url)
+            guard descriptor >= 0 else { return .unreadable }
+            defer { _ = Darwin.close(descriptor) }
+            return pendingUpdate(on: descriptor)
+        }
+
+        private static func pendingUpdate(on descriptor: Int32) -> PendingUpdate {
+            var bytes = [UInt8](repeating: 0, count: 36)
+            let count = bytes.withUnsafeMutableBytes {
+                fgetxattr(descriptor, pendingAttribute, $0.baseAddress, $0.count, 0, 0)
+            }
+            if count < 0 { return errno == ENOATTR ? .absent : .unreadable }
+            guard count == bytes.count, let id = UUID(uuidString: String(decoding: bytes, as: UTF8.self)) else {
+                return .unreadable
+            }
+            return .marked(id)
+        }
+
+        func markPendingUpdate(_ id: UUID) -> Bool {
+            let bytes = Array(id.uuidString.utf8)
+            let result = bytes.withUnsafeBytes {
+                fsetxattr(descriptor, Self.pendingAttribute, $0.baseAddress, $0.count, 0, XATTR_CREATE)
+            }
+            return result == 0 && syncMetadata()
+        }
+
+        func clearPendingUpdate(_ id: UUID) -> Bool {
+            switch pendingUpdate {
+            case .absent:
+                break
+            case .marked(let pendingID) where pendingID == id:
+                guard fremovexattr(descriptor, Self.pendingAttribute, 0) == 0 else { return false }
+            default:
+                return false
+            }
+            // A prior removal may have succeeded before its sync failed.
+            return syncMetadata()
+        }
+
+        private func syncMetadata() -> Bool {
+            fcntl(descriptor, F_FULLFSYNC) == 0 || fsync(descriptor) == 0
+        }
     }
 
     private struct UpdateInstallation: Sendable {
@@ -629,17 +691,25 @@ final class Updater {
                     guard pending == nil else { return .deferMaintenance }
                     pending = attempt
                 case (.replacement, .some), (.committedWithoutBackup, .some):
-                    if cleanSettled {
-                        guard attempt.syncJournal(), attempt.cleanSettled(journal) else {
-                            return .deferMaintenance
-                        }
-                    }
+                    if cleanSettled, !attempt.cleanCommitted(journal) { return .deferMaintenance }
                 default:
                     return .deferMaintenance
                 }
             }
             if let pending { return .restore(pending) }
-            return .ready
+            // This guard follows the candidate even when its recorded parent
+            // directory and receipt are no longer discoverable from this path.
+            return BundleLease.pendingUpdate(at: installed) == .absent ? .ready : .deferMaintenance
+        }
+
+        private func cleanCommitted(_ journal: Journal) -> Bool {
+            // The original remains recoverable until the acknowledgment is
+            // durable and the matching candidate's marker has been cleared.
+            guard journal.committedPID != nil, syncJournal(),
+                  let lease = try? BundleLease(at: installed, operation: LOCK_SH),
+                  [.replacement, .committedWithoutBackup].contains(layout(journal)),
+                  lease.matchesDirectory(at: installed), lease.clearPendingUpdate(journal.id) else { return false }
+            return cleanSettled(journal)
         }
 
         /// Detach the settled transaction from startup discovery before
@@ -719,11 +789,8 @@ final class Updater {
         }
 
         func finishStartupIfCommitted(pid: pid_t) -> Bool {
-            guard let journal = readJournal(), journal.committedPID == pid,
-                  [.replacement, .committedWithoutBackup].contains(layout(journal)),
-                  syncJournal() else { return false }
-            cleanSettled(journal)
-            return true
+            guard let journal = readJournal(), journal.committedPID == pid else { return false }
+            return cleanCommitted(journal)
         }
 
         private func writeCheckpoint(_ name: String, pid: pid_t) -> Bool {
@@ -878,8 +945,8 @@ final class Updater {
             }
             let journal = Journal(id: id, installedPath: installed.path, original: original,
                                   candidate: candidate)
-            guard !Self.exists(journalURL), writeJournal(journal) else {
-                NSLog("BarPilot: could not record the update")
+            guard !Self.exists(journalURL) else {
+                NSLog("BarPilot: an update transaction already exists")
                 _ = reopen(installed)
                 return false
             }
@@ -975,6 +1042,17 @@ final class Updater {
             guard let stagedLease = try? BundleLease(at: staged, operation: LOCK_EX) else { return .failed }
             return withExtendedLifetime((installedLease, stagedLease)) {
                 guard layout(journal) == expectedLayout else { return .failed }
+                if expectedLayout == .original {
+                    // A candidate must already carry the restriction when the
+                    // journal becomes visible, and before it becomes installed.
+                    guard !Self.exists(journalURL), installedLease.pendingUpdate == .absent else { return .failed }
+                    guard stagedLease.markPendingUpdate(journal.id), writeJournal(journal) else {
+                        if stagedLease.matchesDirectory(at: staged) { discardUnrecordedStaging() }
+                        return .failed
+                    }
+                    guard installedLease.matchesDirectory(at: installed), stagedLease.matchesDirectory(at: staged),
+                          layout(journal) == expectedLayout else { return .failed }
+                }
                 return installed.withUnsafeFileSystemRepresentation { installedPath in
                     staged.withUnsafeFileSystemRepresentation { stagedPath in
                         guard let installedPath, let stagedPath else { return .failed }
@@ -1133,6 +1211,14 @@ final class Updater {
             try? String(contentsOf: url.appendingPathComponent("fixture"), encoding: .utf8)
         }
         func checkImmediately(_ predicate: () -> Bool) -> Bool { predicate() }
+        func defersMaintenance(_ installation: UpdateInstallation) -> Bool {
+            installation.withInstallLock(timeout: 0) {
+                if case .deferMaintenance = UpdateInstallation.startupState(
+                    at: installation.installed, cleanSettled: true
+                ) { return true }
+                return false
+            } == true
+        }
 
         try createBundle(at: installed, content: "original")
         precondition(installation.canBeginInstall({ true }))
@@ -1159,6 +1245,8 @@ final class Updater {
         let installedUpdate = installation.install(launch: { app, arguments in
             precondition(arguments == [startupArgument, installation.id.uuidString])
             precondition(content(at: app) == "update" && content(at: installation.staged) == "original")
+            precondition(BundleLease.pendingUpdate(at: app) == .marked(installation.id))
+            precondition(BundleLease.pendingUpdate(at: installation.staged) == .absent)
             precondition(installation.acknowledgeStartup(pid: pid))
             precondition(!installation.finishStartupIfCommitted(pid: pid), "acknowledgment alone is provisional")
             return .started(pid: pid, isRunning: { true }, stop: { preconditionFailure("healthy replacement") })
@@ -1166,7 +1254,13 @@ final class Updater {
         precondition(installedUpdate && content(at: installed) == "update")
         precondition(content(at: installation.staged) == "original", "the replacement still has to read the commit")
         precondition(!installation.finishStartupIfCommitted(pid: pid + 1))
-        precondition(installation.finishStartupIfCommitted(pid: pid))
+        do {
+            let running = try BundleLease(at: installed, operation: LOCK_SH)
+            precondition(running.pendingUpdate == .marked(installation.id))
+            precondition(!running.clearPendingUpdate(UUID()), "another attempt must not clear the restriction")
+            precondition(installation.finishStartupIfCommitted(pid: pid))
+            precondition(running.pendingUpdate == .absent, "commit must clear the running candidate's marker")
+        }
         precondition(!fm.fileExists(atPath: installation.stagingDirectory.path))
 
         for incorrectAcknowledgment in [false, true] {
@@ -1317,13 +1411,7 @@ final class Updater {
         let separateInstall = UpdateInstallation(installed: separate, id: UUID())
         for version in ["3.0.0", "3.0.1"] {
             try writeMetadata(at: renamed, version: version)
-            let defersRenamedMaintenance = renamedInstall.withInstallLock(timeout: 0) {
-                if case .deferMaintenance = UpdateInstallation.startupState(at: renamed, cleanSettled: true) {
-                    return true
-                }
-                return false
-            }
-            precondition(defersRenamedMaintenance == true)
+            precondition(defersMaintenance(renamedInstall))
             precondition(!renamedInstall.canBeginInstall({ true }))
             precondition(separateInstall.canBeginInstall({ true }))
             precondition(content(at: renamed) == "renamed update")
@@ -1331,8 +1419,38 @@ final class Updater {
             precondition(!fm.fileExists(atPath: installed.path))
         }
         try writeMetadata(at: renamed, version: "3.0.0")
-        try fm.moveItem(at: renamed, to: installed)
+        let movedParent = fixture.appendingPathComponent("Other Folder", isDirectory: true)
+        try fm.createDirectory(at: movedParent, withIntermediateDirectories: false)
+        let moved = movedParent.appendingPathComponent("Moved.app", isDirectory: true)
+        try fm.moveItem(at: renamed, to: moved)
+        let movedInstall = UpdateInstallation(installed: moved, id: UUID())
+        precondition(defersMaintenance(movedInstall) && !movedInstall.canBeginInstall({ true }))
+        precondition(content(at: moved) == "renamed update")
+        precondition(content(at: renamedAttempt.staged) == "confirmed update")
+        let copied = movedParent.appendingPathComponent("Copied.app", isDirectory: true)
+        try fm.copyItem(at: moved, to: copied)
+        precondition(defersMaintenance(UpdateInstallation(installed: copied, id: UUID())))
+        try fm.moveItem(at: moved, to: installed)
         precondition(renamedAttempt.restoreInterruptedExchange())
+        precondition(BundleLease.pendingUpdate(at: installed) == .absent)
+
+        let oldParent = fixture.appendingPathComponent("Old Parent", isDirectory: true)
+        let newParent = fixture.appendingPathComponent("New Parent", isDirectory: true)
+        let parentAttempt = UpdateInstallation(
+            installed: oldParent.appendingPathComponent("Original.app", isDirectory: true), id: UUID()
+        )
+        try createBundle(at: parentAttempt.installed, content: "original in moved folder")
+        try createBundle(at: parentAttempt.staged, content: "candidate in moved folder")
+        precondition(!parentAttempt.install(launch: { _, _ in .unresolved },
+            reopen: { _ in preconditionFailure("launch unresolved") }, waitForStartup: checkImmediately))
+        try fm.moveItem(at: oldParent, to: newParent)
+        let movedOriginalName = newParent.appendingPathComponent("Original.app", isDirectory: true)
+        let movedNewName = newParent.appendingPathComponent("New Name.app", isDirectory: true)
+        try fm.moveItem(at: movedOriginalName, to: movedNewName)
+        precondition(defersMaintenance(UpdateInstallation(installed: movedNewName, id: parentAttempt.id)))
+        let backup = newParent.appendingPathComponent(parentAttempt.stagingDirectory.lastPathComponent)
+            .appendingPathComponent("Original.app", isDirectory: true)
+        precondition(content(at: backup) == "original in moved folder")
 
         let superseded = UpdateInstallation(installed: installed, id: UUID())
         try createBundle(at: superseded.staged, content: "candidate update")
