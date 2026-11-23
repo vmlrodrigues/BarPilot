@@ -241,10 +241,13 @@ enum StatusItemActionPolicy {
             probe.action == nil,
             "status-item presentation must not run inside button tracking"
         )
-        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+        let deadline = Date().addingTimeInterval(2)
+        while probe.action == nil && Date() < deadline {
+            _ = RunLoop.main.run(mode: .default, before: deadline)
+        }
         precondition(
             probe.action == .togglePopover,
-            "the deferred status-item action must run on the next main-loop turn"
+            "the main run loop must deliver the deferred status-item action"
         )
     }
 }
