@@ -43,7 +43,7 @@ jobs:
 
       - name: Run headless app regression checks
         run: |
-          for check in projection watchdog incremental credits wake-refresh shortcut model-pricing presentation sync; do
+          for check in projection watchdog incremental credits wake-refresh shortcut model-pricing presentation startup sync; do
             .build/debug/BarPilot "--verify-${check}"
           done
 

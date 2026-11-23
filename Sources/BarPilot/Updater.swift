@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import Security
 
 // ---------------------------------------------------------------------------
 // Updater — silent, built-in auto-update against GitHub Releases.
@@ -214,14 +215,41 @@ final class Updater {
     }
 
     /// Only Developer ID-signed builds self-update (so dev builds don't).
-    static func isDeveloperIDSigned() -> Bool {
-        let out = runTool("/usr/bin/codesign", ["-dvv", Bundle.main.bundlePath]).output
-        return out.contains("TeamIdentifier=\(teamID)") && out.contains("Authority=Developer ID Application")
+    static func isDeveloperIDSigned(at url: URL = Bundle.main.bundleURL) -> Bool {
+        var code: SecStaticCode?
+        let codeStatus = SecStaticCodeCreateWithPath(url as CFURL, SecCSFlags(), &code)
+        guard codeStatus == errSecSuccess, let code else {
+            NSLog("BarPilot: unable to inspect code signature (%d); auto-update disabled", codeStatus)
+            return false
+        }
+
+        var signingInformation: CFDictionary?
+        let infoStatus = SecCodeCopySigningInformation(
+            code, SecCSFlags(rawValue: kSecCSSigningInformation), &signingInformation
+        )
+        guard infoStatus == errSecSuccess,
+              let info = signingInformation as? [String: Any] else {
+            NSLog("BarPilot: unable to read code signing information (%d); auto-update disabled", infoStatus)
+            return false
+        }
+        let certificates = info[kSecCodeInfoCertificates as String] as? [SecCertificate] ?? []
+        let subjects = certificates.compactMap { SecCertificateCopySubjectSummary($0) as String? }
+        return matchesDeveloperID(
+            teamIdentifier: info[kSecCodeInfoTeamIdentifier as String] as? String,
+            certificateSubjects: subjects
+        )
+    }
+
+    private static func matchesDeveloperID(teamIdentifier: String?, certificateSubjects: [String]) -> Bool {
+        teamIdentifier == teamID && certificateSubjects.contains {
+            $0.hasPrefix("Developer ID Application")
+        }
     }
 
     /// Cached once. New bundles carry an explicit channel because signature type
     /// cannot distinguish a release from a stable-signed local build. The signing
-    /// check remains as a safe fallback for older bundles and `swift run`.
+    /// check remains as a safe fallback for older bundles and `swift run`. It
+    /// must not spin the main run loop while this static value is initialising.
     static let isDevBuild: Bool = {
         if let channel = Bundle.main.infoDictionary?["BarPilotBuildChannel"] as? String {
             guard channel == "release" else { return true }
@@ -229,4 +257,44 @@ final class Updater {
         }
         return !isDeveloperIDSigned()
     }()
+
+    @MainActor
+    static func verifyStartup() {
+        @MainActor final class Probe {
+            var checkingIdentity = true
+            var callbackRan = false
+            var reentered = false
+        }
+        let probe = Probe()
+        DispatchQueue.main.async {
+            probe.reentered = probe.checkingIdentity
+            probe.callbackRan = true
+        }
+        let development = isDevBuild
+        probe.checkingIdentity = false
+
+        let deadline = Date().addingTimeInterval(2)
+        while !probe.callbackRan && Date() < deadline {
+            _ = RunLoop.main.run(mode: .default, before: deadline)
+        }
+        guard probe.callbackRan else {
+            fputs("FAIL: startup verification could not service the main queue\n", stderr)
+            exit(1)
+        }
+        guard !probe.reentered else {
+            fputs("FAIL: startup build identity check reentered the main queue\n", stderr)
+            exit(1)
+        }
+        precondition(matchesDeveloperID(
+            teamIdentifier: teamID, certificateSubjects: ["Developer ID Application: Example"]
+        ))
+        precondition(!matchesDeveloperID(
+            teamIdentifier: "OTHERTEAM", certificateSubjects: ["Developer ID Application: Example"]
+        ))
+        precondition(!matchesDeveloperID(
+            teamIdentifier: teamID, certificateSubjects: ["Apple Development: Example"]
+        ))
+        precondition(!isDeveloperIDSigned(at: URL(fileURLWithPath: "/usr/bin/codesign")))
+        print("Startup identity verification passed (\(development ? "development" : "release")).")
+    }
 }

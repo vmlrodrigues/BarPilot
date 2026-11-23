@@ -71,6 +71,10 @@ struct AppMain {
             StatusItemActionPolicy.verify()
             exit(0)
         }
+        if CommandLine.arguments.contains("--verify-startup") {
+            Updater.verifyStartup()
+            exit(0)
+        }
         // Support report — state, a timed load, and the recent reload log (#24).
         if CommandLine.arguments.contains("--diagnose") {
             Diagnose.run()

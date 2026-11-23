@@ -2,6 +2,13 @@
 
 All notable changes to BarPilot are documented here.
 
+## [Unreleased]
+
+### Fixed
+- **BarPilot no longer crashes during startup while identifying the build.**
+  Signature inspection no longer re-enters the main run loop during cached
+  initialization, including when macOS launches the app at login.
+
 ## [0.12.0] — 2026-09-11
 
 ### Added

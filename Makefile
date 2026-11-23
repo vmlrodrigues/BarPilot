@@ -59,7 +59,7 @@ verify:
 	swift build
 	swift build -c release
 	swift build -Xswiftc -strict-concurrency=complete -Xswiftc -warnings-as-errors
-	@for check in projection watchdog incremental credits wake-refresh shortcut model-pricing presentation sync; do \
+	@for check in projection watchdog incremental credits wake-refresh shortcut model-pricing presentation startup sync; do \
 		.build/debug/BarPilot "--verify-$$check" || exit 1; \
 	done
 	TZ=America/Los_Angeles .build/debug/BarPilot --verify-projection
