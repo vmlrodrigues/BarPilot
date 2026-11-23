@@ -21,6 +21,7 @@ final class Updater {
     private static let repo = "vmlrodrigues/BarPilot"
     private static let teamID = "9N354A3UZK"
     static let installArgument = "--apply-staged-update"
+    static let restoreArgument = "--restore-interrupted-update"
     private static let startupArgument = "--confirm-staged-update"
     private static let recoveryArgument = "--recovered-staged-update"
     @MainActor private static var isChecking = false
@@ -169,23 +170,7 @@ final class Updater {
 
     @MainActor
     private static func installAndRelaunch(_ installation: UpdateInstallation) {
-        guard let executable = Bundle.main.executableURL else {
-            installation.discardStaging()
-            return
-        }
-        // Start the current executable in helper mode. It performs the swap
-        // after this application exits and takes every argument literally.
-        let helper = Process()
-        helper.executableURL = executable
-        helper.arguments = [
-            installArgument, installation.id.uuidString,
-            String(ProcessInfo.processInfo.processIdentifier),
-        ]
-        helper.standardOutput = FileHandle.nullDevice
-        helper.standardError = FileHandle.nullDevice
-        do {
-            try helper.run()
-        } catch {
+        guard let helper = launchHelper(installArgument, installation: installation) else {
             installation.discardStaging()
             NSLog("BarPilot: could not start the update helper")
             return
@@ -195,8 +180,28 @@ final class Updater {
         NSApp.terminate(nil)
     }
 
+    private static func launchHelper(_ argument: String, installation: UpdateInstallation) -> Process? {
+        guard let executable = Bundle.main.executableURL else { return nil }
+        // Start the current executable in helper mode. It performs the swap
+        // after this application exits and takes every argument literally.
+        let helper = Process()
+        helper.executableURL = executable
+        helper.arguments = [
+            argument, installation.id.uuidString,
+            String(ProcessInfo.processInfo.processIdentifier),
+        ]
+        helper.standardOutput = FileHandle.nullDevice
+        helper.standardError = FileHandle.nullDevice
+        do {
+            try helper.run()
+        } catch {
+            return nil
+        }
+        return helper
+    }
+
     @MainActor
-    static func applyStagedUpdate(_ arguments: ArraySlice<String>) -> Bool {
+    static func applyStagedUpdate(_ arguments: ArraySlice<String>, restoring: Bool = false) -> Bool {
         guard !isDevBuild, arguments.count == 2,
               let id = UUID(uuidString: arguments[arguments.startIndex]),
               let parent = Int32(arguments[arguments.startIndex + 1]), parent > 1,
@@ -211,19 +216,60 @@ final class Updater {
         // helper has already been reparented when the old app's exit is final.
         while getppid() == parent {
             guard ProcessInfo.processInfo.systemUptime < deadline else {
-                installation.discardStaging()
+                if !restoring { installation.discardUnrecordedStaging() }
                 NSLog("BarPilot: timed out waiting for the app to quit before updating")
                 return false
             }
             Thread.sleep(forTimeInterval: 0.1)
         }
 
+        if restoring {
+            let restored = installation.withInstallLock {
+                guard !hasRunningApp(at: installation.installed, excluding: parent) else { return false }
+                return installation.restoreInterruptedExchange()
+            } ?? false
+            // On failure leave the recorded backup alone. Opening the candidate
+            // here could immediately start another recovery attempt.
+            guard restored else {
+                NSLog("BarPilot: could not safely restore the interrupted update")
+                return false
+            }
+            return reopenInstalled(installation.installed)
+        }
         return installation.apply(
             expectedIdentifier: expectedIdentifier,
+            installedIsRunning: { hasRunningApp(at: installation.installed, excluding: parent) },
             launch: launchReplacement,
             reopen: reopenInstalled,
             waitForStartup: { waitOnMain(for: 15, until: $0) }
         )
+    }
+
+    private static var confirmationID: UUID? {
+        let arguments = CommandLine.arguments.dropFirst()
+        guard arguments.count == 2, arguments.first == startupArgument else { return nil }
+        return arguments.last.flatMap(UUID.init(uuidString:))
+    }
+
+    /// Run before creating the delegate or exposing a provisional app's UI.
+    @MainActor
+    static func prepareStartup() -> Bool {
+        guard isReleaseBuild else { return true }
+        let installed = Bundle.main.bundleURL.resolvingSymlinksInPath()
+        guard let state = UpdateInstallation.withInstallLock(at: installed, timeout: 0, {
+            UpdateInstallation.startupState(at: installed, cleanSettled: true)
+        }) else {
+            // The live installer expects only its own replacement to run.
+            // An ordinary launch at the swapped path can wait for that launch.
+            if case .restore(let attempt) = UpdateInstallation.startupState(at: installed),
+               attempt.id != confirmationID { return false }
+            return true
+        }
+        guard case .restore(let attempt) = state,
+              !hasRunningApp(at: installed),
+              let helper = launchHelper(restoreArgument, installation: attempt) else { return true }
+        installer = helper
+        return false
     }
 
     /// Called from the first main-queue turn after the delegate has finished launch.
@@ -231,36 +277,64 @@ final class Updater {
     static func completeStartup(
         statusItemReady: Bool, runMaintenance: @escaping @Sendable (Bool) -> Void
     ) {
-        let arguments = CommandLine.arguments.dropFirst()
-        let release = isReleaseBuild
-        if !arguments.contains(startupArgument) {
-            // A recovery launch can occur while a different helper still has
-            // a provisional bundle installed. It has no matching commit.
-            let shouldRetire = release && !arguments.contains(recoveryArgument)
-            Task.detached(priority: .background) { runMaintenance(shouldRetire) }
+        let installed = Bundle.main.bundleURL.resolvingSymlinksInPath()
+        guard isReleaseBuild, statusItemReady, !CommandLine.arguments.contains(recoveryArgument) else {
+            Task.detached(priority: .background) { runMaintenance(false) }
             return
         }
-        guard statusItemReady, release,
-              arguments.count == 2, arguments.first == startupArgument,
-              let id = arguments.last.flatMap(UUID.init(uuidString:)) else { return }
-        let installation = UpdateInstallation(
-            installed: Bundle.main.bundleURL.resolvingSymlinksInPath(), id: id
-        )
-        let pid = ProcessInfo.processInfo.processIdentifier
-        guard installation.acknowledgeStartup(pid: pid) else { return }
-        Task.detached(priority: .background) {
-            // Startup acknowledgment alone does not commit the exchange. Wait
-            // for the helper before retiring data the original app still uses.
-            let deadline = ProcessInfo.processInfo.systemUptime + 20
-            while FileManager.default.fileExists(atPath: installation.stagingDirectory.path) {
-                if installation.finishStartupIfCommitted(pid: pid) {
-                    runMaintenance(true)
-                    return
-                }
-                guard ProcessInfo.processInfo.systemUptime < deadline else { return }
-                try? await Task.sleep(for: .milliseconds(100))
+        if let id = confirmationID {
+            let attempt = UpdateInstallation(installed: installed, id: id)
+            let pid = ProcessInfo.processInfo.processIdentifier
+            guard isRunningFromInstalledBundle(installed), attempt.acknowledgeStartup(pid: pid) else { return }
+            Task { @MainActor in
+                let deadline = ProcessInfo.processInfo.systemUptime + 20
+                repeat {
+                    if let finished = attempt.withInstallLock(timeout: 0, {
+                        attempt.finishStartupIfCommitted(pid: pid)
+                    }) {
+                        if !finished, !prepareStartup() { NSApp.terminate(nil) }
+                        runStartupMaintenance(at: installed, canRetire: finished, runMaintenance)
+                        return
+                    }
+                    try? await Task.sleep(for: .milliseconds(100))
+                } while ProcessInfo.processInfo.systemUptime < deadline
             }
+            return
         }
+        guard !CommandLine.arguments.contains(startupArgument) else { return }
+        runStartupMaintenance(at: installed, canRetire: true, runMaintenance)
+    }
+
+    private static func runStartupMaintenance(
+        at installed: URL, canRetire: Bool, _ runMaintenance: @escaping @Sendable (Bool) -> Void
+    ) {
+        Task.detached(priority: .background) {
+            // Consult the durable state even for Finder and login launches.
+            // Holding the lock through retirement also excludes an exchange
+            // beginning between this check and the destructive writes.
+            let ran = canRetire && (UpdateInstallation.withInstallLock(at: installed, timeout: 0) {
+                if isRunningFromInstalledBundle(installed),
+                   case .ready = UpdateInstallation.startupState(at: installed, cleanSettled: true) {
+                    runMaintenance(true)
+                    return true
+                }
+                return false
+            } ?? false)
+            if !ran { runMaintenance(false) }
+        }
+    }
+
+    private static func isRunningFromInstalledBundle(_ installed: URL) -> Bool {
+        // The kernel follows the running executable if its bundle is moved.
+        // Bundle.main may still refer to the old path after an exchange.
+        var path = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        let length = path.withUnsafeMutableBufferPointer {
+            proc_pidpath(getpid(), $0.baseAddress, UInt32($0.count))
+        }
+        guard length > 0 else { return false }
+        let executable = URL(fileURLWithPath: String(cString: path)).resolvingSymlinksInPath()
+        return executable.deletingLastPathComponent().path
+            == installed.appendingPathComponent("Contents/MacOS", isDirectory: true).path
     }
 
     private enum WorkspaceLaunch {
@@ -273,6 +347,16 @@ final class Updater {
         case started(pid: pid_t, isRunning: () -> Bool, stop: () -> Bool)
         case rejected
         case unresolved
+    }
+
+    @MainActor
+    private static func hasRunningApp(at url: URL, excluding parent: pid_t? = nil) -> Bool {
+        NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "")
+            .contains { application in
+                application.processIdentifier != getpid() && application.processIdentifier != parent
+                    && !application.isTerminated
+                    && application.bundleURL?.resolvingSymlinksInPath().path == url.path
+            }
     }
 
     @MainActor
@@ -352,10 +436,12 @@ final class Updater {
     private struct UpdateInstallation: Sendable {
         let installed: URL
         let id: UUID
+        private static let stagingPrefix = ".BarPilot-update-"
+        private static let disposalPrefix = ".BarPilot-settled-"
 
         var stagingDirectory: URL {
             installed.deletingLastPathComponent()
-                .appendingPathComponent(".BarPilot-update-\(id.uuidString)", isDirectory: true)
+                .appendingPathComponent(Self.stagingPrefix + id.uuidString, isDirectory: true)
         }
 
         var staged: URL {
@@ -366,14 +452,177 @@ final class Updater {
             try? FileManager.default.removeItem(at: stagingDirectory)
         }
 
+        func discardUnrecordedStaging() {
+            if !Self.exists(journalURL) { discardStaging() }
+        }
+
+        private var journalURL: URL {
+            stagingDirectory.appendingPathComponent(installed.lastPathComponent + ".transaction")
+        }
+
+        private struct Journal: Codable {
+            let id: UUID
+            let installedPath: String
+            let original: BundleIdentity
+            let candidate: BundleIdentity
+            var committedPID: pid_t?
+        }
+
+        private enum Layout: Equatable {
+            case original, originalWithoutCandidate, replacement, committedWithoutBackup, unknown
+        }
+
+        private func layout(_ journal: Journal) -> Layout {
+            let current = BundleIdentity(installed)
+            let backup = BundleIdentity(staged)
+            if current == journal.original, backup == journal.candidate { return .original }
+            if current == journal.original, journal.committedPID == nil, !Self.exists(staged) {
+                return .originalWithoutCandidate
+            }
+            if current == journal.candidate, backup == journal.original { return .replacement }
+            if current == journal.candidate, journal.committedPID != nil, !Self.exists(staged) {
+                return .committedWithoutBackup
+            }
+            return .unknown
+        }
+
+        private static func exists(_ url: URL) -> Bool {
+            var metadata = stat()
+            return lstat(url.path, &metadata) == 0 || errno != ENOENT
+        }
+
+        private func readJournal() -> Journal? {
+            var metadata = stat()
+            guard lstat(stagingDirectory.path, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFDIR,
+                  lstat(journalURL.path, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFREG,
+                  let data = try? Data(contentsOf: journalURL),
+                  let journal = try? PropertyListDecoder().decode(Journal.self, from: data),
+                  journal.id == id, journal.installedPath == installed.path,
+                  journal.original != journal.candidate else { return nil }
+            return journal
+        }
+
+        private static func sync(_ url: URL, directory: Bool) -> Bool {
+            let flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC | (directory ? O_DIRECTORY : 0)
+            let descriptor = Darwin.open(url.path, flags)
+            guard descriptor >= 0 else { return false }
+            defer { _ = Darwin.close(descriptor) }
+            if !directory, fcntl(descriptor, F_FULLFSYNC) == 0 { return true }
+            return fsync(descriptor) == 0
+        }
+
+        private func syncExchangeDirectories() -> Bool {
+            Self.sync(stagingDirectory, directory: true)
+                && Self.sync(installed.deletingLastPathComponent(), directory: true)
+        }
+
+        private func syncJournal() -> Bool {
+            Self.sync(journalURL, directory: false) && syncExchangeDirectories()
+        }
+
+        private func writeJournal(_ journal: Journal) -> Bool {
+            do {
+                try PropertyListEncoder().encode(journal).write(to: journalURL, options: .atomic)
+            } catch {
+                NSLog("BarPilot: unable to write the update transaction")
+                return false
+            }
+            if syncJournal() { return true }
+            NSLog("BarPilot: unable to synchronize the update transaction")
+            return false
+        }
+
+        enum StartupState {
+            case ready
+            case restore(UpdateInstallation)
+            case deferMaintenance
+        }
+
+        /// Called under the install lock when cleaning settled transactions.
+        /// A read-only inspection can also identify a live helper's candidate.
+        static func startupState(at installed: URL, cleanSettled: Bool = false) -> StartupState {
+            let parent = installed.deletingLastPathComponent()
+            guard let children = try? FileManager.default.contentsOfDirectory(atPath: parent.path) else {
+                return .deferMaintenance
+            }
+            // Opening a backup directly must not give it authority over the
+            // active installation or its shared telemetry files.
+            guard !parent.lastPathComponent.hasPrefix(stagingPrefix),
+                  !parent.lastPathComponent.hasPrefix(disposalPrefix) else { return .deferMaintenance }
+            var pending: UpdateInstallation?
+            for name in children where name.hasPrefix(stagingPrefix) {
+                guard let id = UUID(uuidString: String(name.dropFirst(stagingPrefix.count))) else { continue }
+                let attempt = UpdateInstallation(installed: installed, id: id)
+                guard exists(attempt.journalURL) else { continue }
+                guard let journal = attempt.readJournal() else { return .deferMaintenance }
+                switch (attempt.layout(journal), journal.committedPID) {
+                case (.original, nil), (.originalWithoutCandidate, nil):
+                    if cleanSettled { attempt.cleanSettled(journal) }
+                case (.replacement, nil):
+                    guard pending == nil else { return .deferMaintenance }
+                    pending = attempt
+                case (.replacement, .some), (.committedWithoutBackup, .some):
+                    if cleanSettled {
+                        guard attempt.syncJournal() else { return .deferMaintenance }
+                        attempt.cleanSettled(journal)
+                    }
+                default:
+                    return .deferMaintenance
+                }
+            }
+            if let pending { return .restore(pending) }
+            return .ready
+        }
+
+        /// Detach the settled transaction from startup discovery before
+        /// deleting files recursively. A crash during deletion can only leave
+        /// a detached directory, never a partially erased pending record.
+        private func cleanSettled(_ journal: Journal) {
+            let expected: BundleIdentity?
+            switch (layout(journal), journal.committedPID) {
+            case (.original, nil):
+                expected = journal.candidate
+            case (.replacement, .some):
+                expected = journal.original
+            case (.originalWithoutCandidate, nil), (.committedWithoutBackup, .some):
+                expected = nil
+            default:
+                return
+            }
+            let parent = installed.deletingLastPathComponent()
+            let disposal = parent.appendingPathComponent(Self.disposalPrefix + id.uuidString, isDirectory: true)
+            guard syncExchangeDirectories(),
+                  renamex_np(stagingDirectory.path, disposal.path, UInt32(RENAME_EXCL)) == 0,
+                  Self.sync(parent, directory: true) else { return }
+            let disposedBundle = disposal.appendingPathComponent(installed.lastPathComponent)
+            if let expected {
+                guard BundleIdentity(disposedBundle) == expected else { return }
+            } else if Self.exists(disposedBundle) { return }
+            try? FileManager.default.removeItem(at: disposal)
+        }
+
+        func restoreInterruptedExchange() -> Bool {
+            guard let journal = readJournal(), journal.committedPID == nil else { return false }
+            return restore(journal)
+        }
+
+        private func restore(_ journal: Journal) -> Bool {
+            guard layout(journal) == .replacement, exchangeBundles() else { return false }
+            if syncExchangeDirectories() { cleanSettled(journal) }
+            return true
+        }
+
         func acknowledgeStartup(pid: pid_t) -> Bool {
-            FileManager.default.fileExists(atPath: staged.path)
-                && writeCheckpoint("startup-acknowledgment", pid: pid)
+            guard let journal = readJournal(), journal.committedPID == nil,
+                  layout(journal) == .replacement else { return false }
+            return writeCheckpoint("startup-acknowledgment", pid: pid)
         }
 
         func finishStartupIfCommitted(pid: pid_t) -> Bool {
-            guard matchesCheckpoint("startup-commit", pid: pid) else { return false }
-            discardStaging()
+            guard let journal = readJournal(), journal.committedPID == pid,
+                  [.replacement, .committedWithoutBackup].contains(layout(journal)),
+                  syncJournal() else { return false }
+            cleanSettled(journal)
             return true
         }
 
@@ -397,6 +646,10 @@ final class Updater {
         }
 
         func withInstallLock<T>(timeout: TimeInterval = 30, _ work: () -> T) -> T? {
+            Self.withInstallLock(at: installed, timeout: timeout, work)
+        }
+
+        static func withInstallLock<T>(at installed: URL, timeout: TimeInterval, _ work: () -> T) -> T? {
             // Use a directory descriptor so the lock has a stable inode across
             // exchanges and leaves no lock file. Close releases the lock.
             let parent = installed.deletingLastPathComponent()
@@ -440,10 +693,16 @@ final class Updater {
         @MainActor
         func apply(
             expectedIdentifier: String?, lockTimeout: TimeInterval = 30,
+            installedIsRunning: () -> Bool = { false },
             launch: (URL, [String]) -> ReplacementLaunch, reopen: (URL) -> Bool,
             waitForStartup: (() -> Bool) -> Bool
         ) -> Bool {
             let outcome = withInstallLock(timeout: lockTimeout) {
+                guard case .ready = Self.startupState(at: installed, cleanSettled: true),
+                      !installedIsRunning() else {
+                    discardUnrecordedStaging()
+                    return false
+                }
                 // Another helper may have installed a newer bundle while we waited.
                 switch candidateState(expectedIdentifier: expectedIdentifier) {
                 case .ready:
@@ -459,7 +718,7 @@ final class Updater {
                 }
             }
             if let outcome { return outcome }
-            discardStaging()
+            discardUnrecordedStaging()
             NSLog("BarPilot: unable to acquire the update installation lock")
             _ = reopen(installed)
             return false
@@ -471,26 +730,39 @@ final class Updater {
             waitForStartup: (() -> Bool) -> Bool
         ) -> Bool {
             guard let original = BundleIdentity(installed), let candidate = BundleIdentity(staged),
-                  exchangeBundles() else {
+                  original != candidate else {
                 NSLog("BarPilot: could not replace the installed app")
-                discardStaging()
+                discardUnrecordedStaging()
+                _ = reopen(installed)
+                return false
+            }
+            let journal = Journal(id: id, installedPath: installed.path, original: original,
+                                  candidate: candidate)
+            guard !Self.exists(journalURL), writeJournal(journal), layout(journal) == .original,
+                  exchangeBundles() else {
+                NSLog("BarPilot: could not record or exchange the update")
                 _ = reopen(installed)
                 return false
             }
 
-            func exchangeIsUnchanged() -> Bool {
-                BundleIdentity(installed) == candidate && BundleIdentity(staged) == original
+            guard syncExchangeDirectories() else {
+                if restore(journal) { _ = reopen(installed) }
+                return false
             }
             switch launch(installed, [Updater.startupArgument, id.uuidString]) {
             case .started(let pid, let isRunning, let stop):
                 func acknowledged() -> Bool { matchesCheckpoint("startup-acknowledgment", pid: pid) }
                 if waitForStartup({ !isRunning() || acknowledged() }),
-                   isRunning(), acknowledged(), exchangeIsUnchanged(),
-                   writeCheckpoint("startup-commit", pid: pid) {
-                    // The confirmed replacement removes the backup after reading this commit.
-                    return true
+                   isRunning(), acknowledged(), layout(journal) == .replacement {
+                    var committed = journal
+                    committed.committedPID = pid
+                    if writeJournal(committed) || readJournal()?.committedPID == pid {
+                        // If synchronization failed after publishing the commit,
+                        // leave the backup until a reader can synchronize it.
+                        return true
+                    }
                 }
-                guard exchangeIsUnchanged() else {
+                guard layout(journal) == .replacement else {
                     NSLog("BarPilot: installed bundle changed during update. Original app kept in staging.")
                     return false
                 }
@@ -506,25 +778,29 @@ final class Updater {
                 NSLog("BarPilot: replacement launch outcome unknown. Original app kept in staging.")
                 return false
             }
-            guard exchangeIsUnchanged(), exchangeBundles() else {
+            guard restore(journal) else {
                 NSLog("BarPilot: could not restore the original app after a failed relaunch")
                 return false
             }
-            discardStaging()
             _ = reopen(installed)
             return false
         }
 
-        private struct BundleIdentity: Equatable {
-            let device: dev_t
+        private struct BundleIdentity: Codable, Equatable {
+            let volume: String
             let inode: ino_t
+            let birthSeconds: Int
+            let birthNanoseconds: Int
             let info: Data?
 
             init?(_ url: URL) {
                 var metadata = stat()
                 guard lstat(url.path, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFDIR else { return nil }
-                device = metadata.st_dev
+                volume = (try? url.resourceValues(forKeys: [.volumeUUIDStringKey]).volumeUUIDString)
+                    ?? String(metadata.st_dev)
                 inode = metadata.st_ino
+                birthSeconds = metadata.st_birthtimespec.tv_sec
+                birthNanoseconds = metadata.st_birthtimespec.tv_nsec
                 info = try? Data(contentsOf: url.appendingPathComponent("Contents/Info.plist"))
             }
         }
@@ -749,15 +1025,55 @@ final class Updater {
         for launch in [ReplacementLaunch.unresolved, .started(pid: pid, isRunning: { true }, stop: { false })] {
             let attempt = UpdateInstallation(installed: installed, id: UUID())
             try createBundle(at: attempt.staged, content: "undetermined update")
-            let installedUnresolved = attempt.install(launch: { _, _ in launch },
+            let installedUnresolved = attempt.install(launch: { _, _ in
+                precondition(attempt.acknowledgeStartup(pid: pid + 1))
+                return launch
+            },
                 reopen: { _ in preconditionFailure("replacement may still be running") },
                 waitForStartup: checkImmediately)
             precondition(!installedUnresolved && content(at: installed) == "undetermined update")
             precondition(content(at: attempt.staged) == "update", "keep the original when rollback is unsafe")
-            try fm.removeItem(at: installed)
-            try fm.moveItem(at: attempt.staged, to: installed)
-            attempt.discardStaging()
+            let restarted = UpdateInstallation.withInstallLock(at: installed, timeout: 0) {
+                guard case .restore(let recovered) = UpdateInstallation.startupState(at: installed, cleanSettled: true),
+                      recovered.id == attempt.id else { return false }
+                return recovered.restoreInterruptedExchange()
+            }
+            precondition(restarted == true && content(at: installed) == "update")
+            precondition(!fm.fileExists(atPath: attempt.stagingDirectory.path))
+            guard case .ready = UpdateInstallation.startupState(at: installed) else {
+                preconditionFailure("the original must be usable after interrupted-update recovery")
+            }
         }
+
+        for removedCandidate in [false, true] {
+            let attempt = UpdateInstallation(installed: installed, id: UUID())
+            try createBundle(at: attempt.staged, content: "interrupted rollback candidate")
+            precondition(!attempt.install(launch: { _, _ in .unresolved },
+                reopen: { _ in preconditionFailure("launch unresolved") }, waitForStartup: checkImmediately))
+            // Interrupt recovery after the exchange, leaving its durable record.
+            precondition(renamex_np(installed.path, attempt.staged.path, UInt32(RENAME_SWAP)) == 0)
+            if removedCandidate { try fm.removeItem(at: attempt.staged) }
+            let restartedOriginal = attempt.withInstallLock(timeout: 0) {
+                if case .ready = UpdateInstallation.startupState(at: installed, cleanSettled: true) { return true }
+                return false
+            }
+            precondition(restartedOriginal == true && content(at: installed) == "update")
+            precondition(!fm.fileExists(atPath: attempt.stagingDirectory.path))
+        }
+
+        let committed = UpdateInstallation(installed: installed, id: UUID())
+        try createBundle(at: committed.staged, content: "confirmed update")
+        precondition(committed.install(launch: { _, _ in
+            precondition(committed.acknowledgeStartup(pid: pid))
+            return .started(pid: pid, isRunning: { true }, stop: { preconditionFailure("healthy replacement") })
+        }, reopen: { _ in preconditionFailure("healthy replacement") }, waitForStartup: checkImmediately))
+        try fm.removeItem(at: committed.staged)
+        let restartedCommitted = committed.withInstallLock(timeout: 0) {
+            if case .ready = UpdateInstallation.startupState(at: installed, cleanSettled: true) { return true }
+            return false
+        }
+        precondition(restartedCommitted == true && content(at: installed) == "confirmed update")
+        precondition(!fm.fileExists(atPath: committed.stagingDirectory.path))
 
         let identifier = "org.example.barpilot.update-fixture"
         func writeMetadata(at app: URL, version: String) throws {
@@ -778,9 +1094,24 @@ final class Updater {
             try! writeMetadata(at: app, version: "4.0.0")
             return .started(pid: pid, isRunning: { true }, stop: { preconditionFailure("bundle changed during launch") })
         }, reopen: { _ in preconditionFailure("newer update must remain installed") }, waitForStartup: checkImmediately)
-        precondition(!supersededUpdate && content(at: superseded.staged) == "update")
+        precondition(!supersededUpdate && content(at: superseded.staged) == "confirmed update")
         precondition(content(at: installed) == "candidate update")
         precondition(!superseded.finishStartupIfCommitted(pid: pid))
+        let unrelated = fixture.appendingPathComponent("unrelated.app", isDirectory: true)
+        try fm.moveItem(at: installed, to: unrelated)
+        try createBundle(at: installed, content: "third-party replacement")
+        try writeMetadata(at: installed, version: "3.0.0")
+        let restartedSuperseded = superseded.withInstallLock(timeout: 0) {
+            guard case .deferMaintenance = UpdateInstallation.startupState(at: installed, cleanSettled: true)
+            else { return false }
+            return !superseded.restoreInterruptedExchange()
+        }
+        precondition(restartedSuperseded == true && content(at: installed) == "third-party replacement")
+        precondition(content(at: superseded.staged) == "confirmed update")
+        try fm.removeItem(at: installed)
+        try fm.moveItem(at: unrelated, to: installed)
+        try writeMetadata(at: installed, version: "3.0.0")
+        precondition(superseded.restoreInterruptedExchange())
 
         let competingInstallation = UpdateInstallation(installed: installed, id: UUID())
         try writeMetadata(at: competingInstallation.staged, version: "1.5.0")

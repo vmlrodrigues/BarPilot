@@ -41,10 +41,14 @@ struct CreditCycleSummary: Identifiable, Equatable {
               abs(preceding.resetAt.timeIntervalSince(estimate)) < Self.adjacentResetTolerance
         else { return nil }
 
-        // An accepted new-cycle observation can establish an earlier boundary.
-        // Use the same instant as the preceding cycle's exclusive end.
-        let observed = Date(timeIntervalSince1970: Double(firstObservedAtMs) / 1_000)
-        if observed < preceding.resetAt,
+        // The earlier boundary must leave the preceding cycle's accepted
+        // observations inside its exclusive range. A stale timestamp on the
+        // opening poll cannot move that boundary behind saved spend.
+        let previousObservation = preceding.latestSample.observedAtMs
+        let earliestPossible = firstObservedAtMs > previousObservation
+            ? firstObservedAtMs : latestSample.observedAtMs
+        let observed = Date(timeIntervalSince1970: Double(earliestPossible) / 1_000)
+        if earliestPossible > previousObservation, observed < preceding.resetAt,
            preceding.resetAt.timeIntervalSince(observed) < Self.adjacentResetTolerance {
             return observed
         }
@@ -224,6 +228,53 @@ struct CreditCycleNavigation {
                 local: [CreditCycleSummary(latestSample: later), prior], additionalSamples: [early]
             )
             precondition(merged == cycles, "an earlier peer observation must keep the early reset after a merge")
+        }
+
+        let februaryStart = CreditCycle.utcMidnightMs("2030-02-01")
+        let februaryReset = februaryStart + 2 * hour
+        let marchReset = CreditCycle.utcMidnightMs("2030-03-01") + 2 * hour
+        let minute: Int64 = 60_000
+        let previousSamples = [CreditSample(
+            capturedAtMs: februaryStart + 5 * minute, serverAtMs: nil,
+            resetAtMs: februaryReset, creditsUsed: 100
+        ), CreditSample(
+            capturedAtMs: februaryStart + 20 * minute, serverAtMs: nil,
+            resetAtMs: februaryReset, creditsUsed: 150
+        ), CreditSample(
+            capturedAtMs: februaryStart + 25 * minute, serverAtMs: februaryStart + 10 * minute,
+            resetAtMs: februaryReset, creditsUsed: 100
+        )]
+        let nextSamples = [CreditSample(
+            capturedAtMs: februaryReset + minute, serverAtMs: februaryStart - 15 * minute,
+            resetAtMs: marchReset, creditsUsed: 0
+        ), CreditSample(
+            capturedAtMs: februaryReset + 2 * minute, serverAtMs: nil,
+            resetAtMs: marchReset, creditsUsed: 0
+        ), CreditSample(
+            capturedAtMs: februaryReset + 3 * minute, serverAtMs: nil,
+            resetAtMs: marchReset, creditsUsed: 10
+        )]
+        CreditSampleStore.withTemporaryStore {
+            for sample in previousSamples + nextSamples {
+                precondition(CreditSampleStore.save(sample, account: "fixture"))
+            }
+            let cycles = CreditSampleStore.cycles(account: "fixture")
+            precondition(cycles.count == 2 && cycles == CreditSampleStore.compactedHistory(account: "fixture")?.cycles)
+            let closed = cycles[1]
+            precondition(closed.latestSample == previousSamples[1],
+                         "sample order must prefer observation time over capture time")
+            let opening = CreditCycleSummary(latestSample: nextSamples[0])
+            precondition(closed.endAt(in: [opening, closed]) == closed.resetAt)
+            precondition(closed.endAt(in: cycles) == closed.resetAt)
+            precondition(cycles[0].startAt(in: cycles) == closed.resetAt)
+            let month = date("2030-02-01")
+            let calendarCycles = cycles.filter { CreditCycleSummary.overlapsUTCMonth($0, containing: month, in: cycles) }
+            let daily = CreditTimeline.combinedDaily(
+                samplesByCycle: calendarCycles.map { CreditSampleStore.loadCycle(resetDayMs: $0.id, account: "fixture") },
+                monthKey: "2030-02"
+            )
+            precondition(daily["2030-02-01"] == 60,
+                         "a stale new-cycle timestamp must leave recorded prior-cycle spend in the calendar")
         }
     }
 }
@@ -1225,7 +1276,7 @@ enum CreditSampleStore {
             FROM credit_samples
             WHERE reset_at_ms >= \(resetDay) AND reset_at_ms < \(end)
               AND \(accountClause)
-            ORDER BY captured_at_ms DESC
+            ORDER BY COALESCE(server_at_ms, captured_at_ms) DESC, captured_at_ms DESC
             LIMIT 1
             """
             var latestStmt: OpaquePointer?

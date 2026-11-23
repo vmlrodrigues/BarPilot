@@ -294,7 +294,7 @@ struct CompactDashboard: View {
                             connectionCard
                         }
                         spendSummary
-                        if store.compactTotalCredits != nil {
+                        if store.compactTotalCredits != nil, !showsProvisionalTotal {
                             CompactBudgetBar()
                         }
                         if let selection = currentSpendDaySelection {
@@ -337,6 +337,10 @@ struct CompactDashboard: View {
 
     private var selectedSpendDay: String? {
         currentSpendDaySelection.map { CreditCycleSummary.utcDayString(for: $0.date) }
+    }
+
+    private var showsProvisionalTotal: Bool {
+        store.isViewingCurrentCreditCycle && store.currentCreditTotalIsProvisional
     }
 
     /// Escape unwinds exactly one presentation level. Handling it here avoids
@@ -608,8 +612,7 @@ struct CompactDashboard: View {
         HStack(alignment: .top, spacing: 20) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 7) {
-                    Text(store.isViewingCurrentCreditCycle
-                         ? "SPENT THIS CYCLE" : "SPENT IN THIS CYCLE")
+                    Text(spendSummaryTitle)
                         .font(.system(size: 10, weight: .semibold))
                         .tracking(0.7)
                         .foregroundStyle(.secondary)
@@ -683,6 +686,11 @@ struct CompactDashboard: View {
         }
     }
 
+    private var spendSummaryTitle: String {
+        if showsProvisionalTotal { return "UNCONFIRMED CYCLE TOTAL" }
+        return store.isViewingCurrentCreditCycle ? "SPENT THIS CYCLE" : "SPENT IN THIS CYCLE"
+    }
+
     private func relativeUpdatedLabel(_ date: Date) -> String {
         let seconds = max(0, Date().timeIntervalSince(date))
         if seconds < 60 { return "just now" }
@@ -735,6 +743,9 @@ struct CompactDashboard: View {
     }
 
     private var dailyChartSubtitle: String {
+        if showsProvisionalTotal {
+            return "Daily tracking resumes when GitHub confirms the new cycle."
+        }
         let timeline = store.creditTimeline
         guard timeline.firstAtMs != nil else {
             return "Waiting for saved GitHub counter samples."
@@ -885,7 +896,8 @@ struct CompactDashboard: View {
     private var statusColor: Color {
         if store.serverUsageStatusIsError { return .red }
         guard store.serverUsageEnabled else { return .orange }
-        if store.currentServerUsageSample == nil || store.serverUsageIsStale { return .orange }
+        if store.currentCreditTotalIsProvisional
+            || store.currentServerUsageSample == nil || store.serverUsageIsStale { return .orange }
         return .green
     }
 

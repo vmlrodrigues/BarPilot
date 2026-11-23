@@ -241,7 +241,9 @@ column or date reveals that day’s date, credits and display-currency cost.
   history is not erased. A cached sample is not presented as current until this
   launch completes a successful poll; its GitHub observation must be no more
   than five minutes old. A direct poll in this process tolerates up to 30 seconds
-  of server clock lead. Future-dated peer observations are excluded.
+  of server clock lead. Future-dated peer observations are excluded. After a day
+  of ambiguous rollover, a fresh direct total can appear as provisional while
+  history, sync and projections wait for a confirmed cycle.
 - **Multi-machine sync uses schema v3 counter observations and cycle budgets.** Each Mac publishes
   the live cycle's first locally captured observation in each 15-minute UTC
   bucket plus its moving close. Completed cycles retain the first, high-water
@@ -308,7 +310,8 @@ column or date reveals that day’s date, credits and display-currency cost.
   `Store.loadCycleSamples` reads by UTC reset day + account. Exact reset instants
   remain stored, but same-day variants are coalesced for navigation because the
   API's reset fields can disagree on time-of-day. An accepted early reset sets
-  the shared boundary for both adjacent cycles. A new cycle can be confirmed by
+  the shared boundary for both adjacent cycles if it follows the previous
+  cycle's last accepted observation. A new cycle can be confirmed by
   a counter drop, a zero reading following an observed zero after reset, or a
   reset that shows an intervening cycle has passed. Ambiguous readings stay out
   of history. The former baseline
@@ -338,9 +341,10 @@ column or date reveals that day’s date, credits and display-currency cost.
   across manual and scheduled triggers. It stages the bundle beside the running
   app, verifies its identity, Developer ID signature and Gatekeeper assessment,
   and uses a helper process to exchange the two bundles atomically. The helper
-  retains the original bundle until the replacement confirms startup. It restores
-  the original if the replacement fails startup and can safely be stopped.
-  Developer ID release builds use this updater.
+  records the transaction before the exchange and retains the original bundle
+  until the replacement confirms startup. A later launch checks for an interrupted
+  exchange before telemetry retirement and can restore the original when the
+  recorded bundles still match. Developer ID release builds use this updater.
 - **Start at Login** via `SMAppService.mainApp` (`LoginItem.swift`), toggled from
   Settings — no third-party dependency.
 - **Currency (USD/AUD):** everything is computed/stored in USD; AUD is a

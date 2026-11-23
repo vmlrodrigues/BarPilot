@@ -106,23 +106,30 @@ enum BudgetPersistenceCompletionPolicy {
 }
 
 enum CreditCycleTransitionPolicy {
-    /// GitHub can advance the reset boundary before the cumulative counter.
-    /// A previous-cycle balance stored under the new reset would permanently
-    /// suppress its daily increases, so a repeated balance stays ambiguous
-    /// across retries and restarts.
-    static func needsConfirmation(
+    enum Disposition: Equatable {
+        case record
+        case wait
+        case showProvisional
+    }
+
+    /// GitHub can advance the reported reset before its counter resets. Allow
+    /// the fresh direct total after one day without adding an unverified
+    /// opening balance to history. The saved prior reset anchors the delay
+    /// across restarts.
+    static func disposition(
         previous: CreditSample?, current: CreditSample
-    ) -> Bool {
+    ) -> Disposition {
         guard let previous,
               CreditCycleSummary.dayStart(for: current.resetAtMs)
                 > CreditCycleSummary.dayStart(for: previous.resetAtMs),
               current.creditsUsed >= previous.creditsUsed,
               current.resetAt.timeIntervalSince(previous.resetAt)
-                <= CreditCycle.maximumCycleLength else { return false }
+                <= CreditCycle.maximumCycleLength else { return .record }
 
-        // Accept an unchanged zero after the boundary. With a positive value
-        // the old cycle might have accrued spend since the last observation.
-        return current.creditsUsed > 0 || current.observedAtMs < previous.resetAtMs
+        let sinceResetMs = current.observedAtMs - previous.resetAtMs
+        if current.creditsUsed == 0, sinceResetMs >= 0 { return .record }
+        if sinceResetMs >= CreditCycleSummary.dayMs { return .showProvisional }
+        return .wait
     }
 
     static func changed(previous: CreditSample?, current: CreditSample) -> Bool {
@@ -143,99 +150,105 @@ enum CreditCycleTransitionPolicy {
     static func verify() {
         let oldReset = CreditCycle.utcMidnightMs("2030-01-01")
         let newReset = CreditCycle.utcMidnightMs("2030-02-01")
-        let previous = CreditSample(
-            capturedAtMs: oldReset - 1, serverAtMs: nil,
-            resetAtMs: oldReset, creditsUsed: 1_000
-        )
-        let staleCounter = CreditSample(
-            capturedAtMs: oldReset, serverAtMs: nil,
-            resetAtMs: newReset, creditsUsed: 1_000
-        )
+        let day = CreditCycleSummary.dayMs
+
+        func sample(
+            at timestamp: Int64, credits: Double, reset: Int64 = newReset,
+            serverAtMs: Int64? = nil
+        ) -> CreditSample {
+            CreditSample(
+                capturedAtMs: timestamp, serverAtMs: serverAtMs,
+                resetAtMs: reset, creditsUsed: credits
+            )
+        }
+
+        let previous = sample(at: oldReset - 1, credits: 1_000, reset: oldReset)
+        let staleCounter = sample(at: oldReset, credits: 1_000)
         precondition(changed(previous: previous, current: staleCounter))
         precondition(!rolledOver(previous: previous, current: staleCounter))
-        precondition(needsConfirmation(
-            previous: previous, current: staleCounter
-        ))
-        let delayedReconnect = CreditSample(
-            capturedAtMs: oldReset + 3 * CreditCycleSummary.dayMs,
-            serverAtMs: nil,
-            resetAtMs: newReset,
-            creditsUsed: 1_200
+        precondition(disposition(previous: previous, current: staleCounter) == .wait)
+        let staleAfterDay = sample(at: oldReset + day, credits: 1_000)
+        precondition(disposition(previous: previous, current: staleAfterDay) == .showProvisional)
+        let lateCaptureOfOldCounter = sample(
+            at: oldReset + day, credits: 1_000, serverAtMs: oldReset + 1
         )
-        precondition(needsConfirmation(
-            previous: previous, current: delayedReconnect
-        ), "elapsed time alone cannot confirm an adjacent nonzero rollover")
-        let skippedCycle = CreditSample(
-            capturedAtMs: newReset + 3 * CreditCycleSummary.dayMs,
-            serverAtMs: nil,
-            resetAtMs: CreditCycle.utcMidnightMs("2030-03-01"), creditsUsed: 1_200
+        precondition(disposition(previous: previous, current: lateCaptureOfOldCounter) == .wait,
+                     "a late capture must not make an earlier server observation provisional")
+        let skippedCycle = sample(
+            at: newReset + 3 * day, credits: 1_200, reset: CreditCycle.utcMidnightMs("2030-03-01")
         )
-        precondition(!needsConfirmation(previous: previous, current: skippedCycle),
+        precondition(disposition(previous: previous, current: skippedCycle) == .record,
                      "an intervening cycle invalidates the old comparison counter")
-        let resetCounter = CreditSample(
-            capturedAtMs: oldReset + 1, serverAtMs: nil,
-            resetAtMs: newReset, creditsUsed: 10
-        )
+        let resetCounter = sample(at: oldReset + 1, credits: 10)
         precondition(rolledOver(previous: previous, current: resetCounter))
-        precondition(!needsConfirmation(previous: previous, current: resetCounter))
-        let earlierResetReading = CreditSample(
-            capturedAtMs: oldReset - 1, serverAtMs: nil,
-            resetAtMs: newReset, creditsUsed: resetCounter.creditsUsed
-        )
-        precondition(!needsConfirmation(previous: previous, current: earlierResetReading),
-                     "a counter drop can confirm a rollover before the previous reported reset time")
-        precondition(!needsConfirmation(
-            previous: staleCounter, current: resetCounter
-        ))
-        let growingNewCounter = CreditSample(
-            capturedAtMs: oldReset + 2, serverAtMs: nil,
-            resetAtMs: newReset, creditsUsed: 1_001
-        )
-        precondition(needsConfirmation(previous: previous, current: growingNewCounter),
-                     "rerunning an ambiguous poll near reset must still wait")
-        let repeatedAfterOneDay = CreditSample(
-            capturedAtMs: oldReset + CreditCycleSummary.dayMs + 1, serverAtMs: nil,
-            resetAtMs: newReset, creditsUsed: growingNewCounter.creditsUsed
-        )
-        precondition(needsConfirmation(previous: previous, current: repeatedAfterOneDay),
-                     "an ambiguous high-water mark must stay out of history after 24 hours")
+        precondition(disposition(previous: previous, current: resetCounter) == .record)
+        let earlyDrop = sample(at: oldReset - 1, credits: 10)
+        precondition(disposition(previous: previous, current: earlyDrop) == .record)
+        let growingNewCounter = sample(at: oldReset + 2, credits: 1_001)
+        precondition(disposition(previous: previous, current: growingNewCounter) == .wait)
 
-        let zeroPrevious = CreditSample(
-            capturedAtMs: oldReset - 1, serverAtMs: nil,
-            resetAtMs: oldReset, creditsUsed: 0
-        )
-        let zeroBoundary = CreditSample(
-            capturedAtMs: oldReset, serverAtMs: nil,
-            resetAtMs: newReset, creditsUsed: 0
-        )
-        precondition(!needsConfirmation(previous: zeroPrevious, current: zeroBoundary),
-                     "a new zero counter can follow an old zero after reset")
-        let delayedOldSpend = CreditSample(
-            capturedAtMs: oldReset + 1, serverAtMs: nil,
-            resetAtMs: newReset, creditsUsed: 80
-        )
-        precondition(needsConfirmation(previous: zeroPrevious, current: delayedOldSpend),
-                     "new reset metadata and an old zero do not validate a positive counter")
-        let confirmedZero = CreditSample(
-            capturedAtMs: oldReset + 2, serverAtMs: nil,
-            resetAtMs: newReset, creditsUsed: 0
-        )
-        let newSpend = CreditSample(
-            capturedAtMs: oldReset + 3, serverAtMs: nil,
-            resetAtMs: newReset, creditsUsed: 50
-        )
-        precondition(!needsConfirmation(previous: zeroPrevious, current: confirmedZero))
-        precondition(!needsConfirmation(previous: confirmedZero, current: newSpend))
-        precondition(CreditTimeline.build(samples: [
-            confirmedZero, newSpend
-        ]).observedCredits == 50,
-        "waiting for reset confirmation must preserve the first genuine increases")
-        let earlyZero = CreditSample(
-            capturedAtMs: oldReset - 1, serverAtMs: nil,
-            resetAtMs: newReset, creditsUsed: 0
-        )
-        precondition(needsConfirmation(previous: zeroPrevious, current: earlyZero),
-                     "pre-reset readings cannot start the new cycle")
+        CreditSampleStore.withTemporaryStore {
+            for oldCredits in [0.0, 1.0] {
+                let account = "rollover-fixture-\(Int(oldCredits))"
+                let prior = sample(at: oldReset - 1 - Int64(oldCredits),
+                                   credits: oldCredits, reset: oldReset)
+                precondition(CreditSampleStore.save(prior, account: account))
+                for (dayOfCycle, credits) in [(3, 2.0), (7, 3.0), (27, 8.0)] {
+                    // Each attempt starts from durable history, as after relaunch.
+                    let stored = CreditSampleStore.latest(account: account)
+                    let current = sample(at: oldReset + Int64(dayOfCycle) * day, credits: credits)
+                    precondition(stored == prior)
+                    precondition(disposition(previous: stored, current: current) == .showProvisional,
+                                 "missing the opening zero must not leave the amount unavailable")
+                    let now = current.capturedAt
+                    precondition(CreditCycle.visibleCurrentCredits(
+                        sample: current, connected: true, pollFailed: false,
+                        hasSuccessfulPoll: true, directlyPolled: true, now: now
+                    ) == credits)
+                    precondition(CreditCycle.visibleCurrentCredits(
+                        sample: current, connected: true, pollFailed: true,
+                        hasSuccessfulPoll: true, directlyPolled: true, now: now
+                    ) == nil)
+                    precondition(CreditCycle.visibleCurrentCredits(
+                        sample: current, connected: true, pollFailed: false,
+                        hasSuccessfulPoll: true, directlyPolled: true,
+                        now: now.addingTimeInterval(301)
+                    ) == nil)
+                    precondition(CreditSampleStore.loadCycle(resetDayMs: newReset, account: account).isEmpty)
+                }
+            }
+
+            let account = "rollover-fixture-zero"
+            let zeroPrevious = sample(at: oldReset - 3, credits: 0, reset: oldReset)
+            let earlyZero = sample(at: oldReset - 1, credits: 0)
+            precondition(disposition(previous: zeroPrevious, current: earlyZero) == .wait)
+            let zeroBoundary = sample(at: oldReset, credits: 0)
+            precondition(disposition(previous: zeroPrevious, current: zeroBoundary) == .record)
+            precondition(CreditSampleStore.save(zeroPrevious, account: account))
+            let delayedOldSpend = sample(at: oldReset + 1, credits: 80)
+            precondition(disposition(previous: zeroPrevious, current: delayedOldSpend) == .wait)
+            let prolongedCarryover = sample(at: oldReset + day, credits: 80)
+            precondition(disposition(
+                previous: CreditSampleStore.latest(account: account), current: prolongedCarryover
+            ) == .showProvisional)
+            let confirmedZero = sample(at: oldReset + day + 60_000, credits: 0)
+            precondition(disposition(
+                previous: CreditSampleStore.latest(account: account), current: confirmedZero
+            ) == .record)
+            precondition(CreditSampleStore.save(confirmedZero, account: account))
+            let newSpend = sample(at: oldReset + day + 120_000, credits: 50)
+            precondition(disposition(
+                previous: CreditSampleStore.latest(account: account), current: newSpend
+            ) == .record)
+            precondition(CreditSampleStore.save(newSpend, account: account))
+            let history = CreditSampleStore.loadCycle(resetDayMs: newReset, account: account)
+            precondition(history == [confirmedZero, newSpend])
+            precondition(CreditTimeline.build(samples: history).observedCredits == 50,
+                         "an unverified carryover must not suppress confirmed daily increases")
+            precondition(CreditSampleStore.compactedHistory(account: account)?
+                .samplesByCycle[newReset] == [confirmedZero, newSpend],
+                         "only confirmed observations may be included in sync history")
+        }
     }
 }
 
@@ -440,6 +453,9 @@ final class UsageStore: ObservableObject {
     /// completed a successful account-counter poll. Keep the direct observation
     /// distinct from the newest local row, which can be recovered through sync.
     private var lastSuccessfulServerUsagePoll: CreditSample?
+    /// A direct reading following an ambiguous rollover can drive the headline
+    /// but never becomes an input to cycle history or sync.
+    private var provisionalServerUsagePoll: CreditSample?
     /// The in-flight device-flow poll, retained so the user can cancel it.
     private var serverUsageConnectTask: Task<Void, Never>?
     /// Cached in `recompute()` — see `updateCreditCycleView()`.
@@ -681,8 +697,10 @@ final class UsageStore: ObservableObject {
         updateCreditCycleView()
         syncMachineCount = syncEnabled ? remoteAggregates.count + 1 : 1
         counterSyncMachineCount = countCounterSyncMachines()
-        if let total = currentCompactTotalCredits {
+        if let total = confirmedCurrentCredits {
             menuBarTitle = costString(credits: total)
+        } else if let provisional = visibleProvisionalPoll {
+            menuBarTitle = "≈" + costString(credits: provisional.creditsUsed)
         } else {
             menuBarTitle = "—"
         }
@@ -1090,6 +1108,10 @@ final class UsageStore: ObservableObject {
         let generation = serverUsageGeneration
         UserDefaults.standard.set(true, forKey: Self.serverUsageDisconnectedKey)
         serverUsageError = nil
+        if provisionalServerUsagePoll != nil {
+            provisionalServerUsagePoll = nil
+            recompute()
+        }
 
         guard let fingerprint = await CreditUsageAPI.accountFingerprint(token: token) else {
             guard generation == serverUsageGeneration else { return false }
@@ -1112,16 +1134,18 @@ final class UsageStore: ObservableObject {
         let budgetChangedAtMs = budgetUpdatedAtMs
         let previous = serverUsageAccountFingerprint == fingerprint
             ? serverUsageSample : nil
-        let transitionNeedsConfirmation = CreditCycleTransitionPolicy
-            .needsConfirmation(previous: previous, current: sample)
+        let disposition = CreditCycleTransitionPolicy.disposition(previous: previous, current: sample)
 
         guard CreditUsageKeychain.saveToken(token) else {
             serverUsageError = "GitHub authenticated, but the credential couldn’t be saved securely."
             recompute()
             return false
         }
-        if transitionNeedsConfirmation {
-            return finishServerUsageConnectionAwaitingTransition(fingerprint: fingerprint)
+        if disposition != .record {
+            return finishServerUsageConnectionAwaitingTransition(
+                fingerprint: fingerprint,
+                provisionalSample: disposition == .showProvisional ? sample : nil
+            )
         }
         let saved = await Task.detached(priority: .utility) {
             // Claim pre-attribution rows before the first attributed write, so
@@ -1156,12 +1180,15 @@ final class UsageStore: ObservableObject {
         )
     }
 
-    /// Reconnect without persisting an ambiguous boundary response. The prior
-    /// sample stays in memory so the next poll can re-evaluate the same window.
-    private func finishServerUsageConnectionAwaitingTransition(fingerprint: String) -> Bool {
+    /// Keep the saved previous sample as the comparison point when reconnecting
+    /// during an ambiguous rollover.
+    private func finishServerUsageConnectionAwaitingTransition(
+        fingerprint: String, provisionalSample: CreditSample?
+    ) -> Bool {
         resetCreditCycleSelection()
         resetSpendCalendar()
         lastSuccessfulServerUsagePoll = nil
+        provisionalServerUsagePoll = provisionalSample
         serverUsageAccountFingerprint = fingerprint
         UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
         serverUsageEnabled = true
@@ -1240,10 +1267,12 @@ final class UsageStore: ObservableObject {
             $0.resetDayMs == summary.resetDayMs
         }) {
             let previous = creditCycles[index]
-            let latest = sample.capturedAtMs >= previous.latestSample.capturedAtMs
-                ? sample : previous.latestSample
+            let latest = previous.latestSample
+            let isNewer = sample.observedAtMs > latest.observedAtMs
+                || (sample.observedAtMs == latest.observedAtMs && sample.capturedAtMs >= latest.capturedAtMs)
             creditCycles[index] = CreditCycleSummary(
-                latestSample: latest, firstObservedAtMs: min(summary.firstObservedAtMs, previous.firstObservedAtMs)
+                latestSample: isNewer ? sample : latest,
+                firstObservedAtMs: min(summary.firstObservedAtMs, previous.firstObservedAtMs)
             )
         } else {
             creditCycles.append(summary)
@@ -1368,6 +1397,7 @@ final class UsageStore: ObservableObject {
     private func transitionToDisconnectedServerUsage(error: String?) {
         serverUsageEnabled = false
         lastSuccessfulServerUsagePoll = nil
+        provisionalServerUsagePoll = nil
         budgetMigrationCycleDayMs = nil
         savedCreditActivityByCycle = [:]
         resetCreditCycleSelection()
@@ -1467,13 +1497,6 @@ final class UsageStore: ObservableObject {
                   !Task.isCancelled else {
                 return .notNeeded
             }
-            let previous = serverUsageSample
-            if CreditCycleTransitionPolicy.needsConfirmation(previous: previous, current: sample) {
-                serverUsageError = nil
-                recompute()
-                return .refreshed
-            }
-
             let resolvedAccountDuringRefresh = serverUsageAccountFingerprint == nil
             if resolvedAccountDuringRefresh {
                 guard let fingerprint = await CreditUsageAPI.accountFingerprint(token: token) else {
@@ -1494,6 +1517,16 @@ final class UsageStore: ObservableObject {
                 syncCycleBudgets = []
                 UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
             }
+            let previous = serverUsageSample
+            let disposition = CreditCycleTransitionPolicy.disposition(previous: previous, current: sample)
+            provisionalServerUsagePoll = disposition == .showProvisional ? sample : nil
+            guard disposition == .record else {
+                serverUsageError = nil
+                recompute()
+                if resolvedAccountDuringRefresh { await refreshCreditCycles() }
+                return .refreshed
+            }
+
             let account = serverUsageAccountFingerprint
             let budgetUSD = monthlyBudget
             let budgetChangedAtMs = self.budgetUpdatedAtMs
@@ -1576,6 +1609,7 @@ final class UsageStore: ObservableObject {
             guard serverUsageEnabled, generation == serverUsageGeneration else {
                 return .notNeeded
             }
+            provisionalServerUsagePoll = nil
             serverUsageError = Self.serverUsageErrorMessage(error)
             if case .unauthorized = error as? CreditUsageError {
                 let message = serverUsageError
@@ -1688,17 +1722,31 @@ final class UsageStore: ObservableObject {
         currentServerUsageObservation?.cameFromRemote == true
     }
     var currentServerUsageObservedAt: Date? {
-        currentServerUsageSample?.observedAt
+        visibleProvisionalPoll?.observedAt ?? currentServerUsageSample?.observedAt
     }
     var compactTotalCredits: Double? {
         if selectedCreditCycleDayMs != nil {
             return selectedHistoricalTotalCredits
                 ?? selectedCreditCycle?.latestSample.creditsUsed
         }
-        return currentCompactTotalCredits
+        return confirmedCurrentCredits ?? visibleProvisionalPoll?.creditsUsed
     }
 
-    private var currentCompactTotalCredits: Double? {
+    var currentCreditTotalIsProvisional: Bool { visibleProvisionalPoll != nil }
+
+    private var visibleProvisionalPoll: CreditSample? {
+        guard confirmedCurrentCredits == nil, let provisionalServerUsagePoll,
+              CreditCycle.visibleCurrentCredits(
+                sample: provisionalServerUsagePoll,
+                connected: serverUsageEnabled,
+                pollFailed: serverUsageError != nil,
+                hasSuccessfulPoll: true,
+                directlyPolled: true
+              ) != nil else { return nil }
+        return provisionalServerUsagePoll
+    }
+
+    private var confirmedCurrentCredits: Double? {
         let sample = currentServerUsageSample
         let range = sample.flatMap { current in
             let day = CreditCycleSummary.dayStart(for: current.resetAtMs)
@@ -1710,7 +1758,8 @@ final class UsageStore: ObservableObject {
             sample: sample,
             connected: serverUsageEnabled,
             pollFailed: serverUsageError != nil,
-            hasSuccessfulPoll: lastSuccessfulServerUsagePoll != nil,
+            hasSuccessfulPoll: lastSuccessfulServerUsagePoll != nil
+                || provisionalServerUsagePoll != nil,
             directlyPolled: !currentServerUsageSampleIsRemote
                 && sample == lastSuccessfulServerUsagePoll,
             knownRange: range
@@ -2083,6 +2132,7 @@ final class UsageStore: ObservableObject {
             return serverUsageError == nil ? "GitHub · disconnected" : "GitHub · reconnect required"
         }
         if serverUsageStatusIsError { return "GitHub · error" }
+        if visibleProvisionalPoll != nil { return "GitHub · cycle unconfirmed" }
         if currentServerUsageSample == nil && serverUsageSample == nil {
             return "GitHub · connecting"
         }
@@ -2274,7 +2324,7 @@ final class UsageStore: ObservableObject {
     /// Every other period pro-rates the daily rate across the days in its range.
     var compactSpendProjection: SpendProjection? {
         guard isViewingCurrentCreditCycle,
-              let totalCredits = currentCompactTotalCredits,
+              let totalCredits = confirmedCurrentCredits,
               let startAt = selectedCreditCycleStart,
               let endAt = selectedCreditCycleEnd else { return nil }
         return SpendProjection.computeBillingCycle(

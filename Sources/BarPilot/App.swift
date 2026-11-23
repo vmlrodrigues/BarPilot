@@ -16,6 +16,9 @@ struct AppMain {
         if CommandLine.arguments.dropFirst().first == Updater.installArgument {
             exit(Updater.applyStagedUpdate(CommandLine.arguments.dropFirst(2)) ? 0 : 1)
         }
+        if CommandLine.arguments.dropFirst().first == Updater.restoreArgument {
+            exit(Updater.applyStagedUpdate(CommandLine.arguments.dropFirst(2), restoring: true) ? 0 : 1)
+        }
         let retiredFlags = ["--dump", "--sync-preview", "--verify-watchdog", "--verify-incremental"]
         if CommandLine.arguments.contains(where: retiredFlags.contains) {
             fputs("This telemetry command was removed. Use --diagnose or --verify-credits.\n", stderr)
@@ -73,6 +76,7 @@ struct AppMain {
             Diagnose.run()
             exit(0)
         }
+        guard Updater.prepareStartup() else { return }
         // `--regular` runs as a normal foreground (Dock) app instead of a
         // menu-bar-only agent — used for UI verification, since automation tools
         // don't bind LSUIElement agent apps.
