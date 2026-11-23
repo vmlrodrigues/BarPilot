@@ -1,14 +1,10 @@
 # BarPilot
 
-A macOS **menu-bar app** (Swift / SwiftUI, SwiftPM, no Xcode) that shows your
-GitHub Copilot AIU credit **cost** for a selected period in the menu bar; click
-it for a detail window with the full breakdown (summary, models, daily, sessions,
-top calls). Formerly named **TokenTally** — the app, bundle id, product/target,
-and `Sources/` dir were all renamed to BarPilot; the folder was later renamed too.
-
-It reads your local GitHub Copilot OTel telemetry directly off disk (**no
-external dependencies**); network use is limited to the GitHub auto-updater and
-the USD→AUD exchange-rate fetch.
+A native macOS menu-bar app (Swift / SwiftUI / AppKit, SwiftPM) that tracks
+GitHub Copilot account credits and spend. GitHub's authenticated internal counter
+is the only usage source. There is no local OTel ingestion or attribution view.
+Network access also supports optional Gist sync, model pricing, updates and
+USD-to-AUD exchange rates. Formerly named TokenTally.
 
 ## Issue tracking
 
@@ -53,29 +49,22 @@ make local && make run               # preferred interactive dev workflow (stabl
 swift build                          # quick compile check
 ```
 
-**Headless output (the key safety net):** the binary has a `--dump` mode that
-prints the per-model summary as JSON on stdout. After any change to data loading
-or aggregation, run it and sanity-check the totals against a known-good capture:
+Use `make verify` after changing counter persistence, sync or presentation.
+There is no telemetry dump mode.
 
-```sh
-.build/release/BarPilot --dump --from 2026-06-01 --to 2026-06-10
-```
-
-`--dump` uses `Fmt.credits4` (4 dp) for exact parity; the UI shows 2 dp.
 `--regular` runs as a normal foreground (Dock) app instead of a menu-bar agent.
 
 Other headless modes — run the relevant ones after touching their area:
 
 | Flag | Checks |
 |---|---|
-| `--verify-incremental` | incremental JSONL reads never lose/duplicate a record (#24) |
-| `--verify-watchdog` | exporter-heartbeat rules: warn only when running-but-not-writing (#27) |
 | `--verify-projection` | spend-projection run-rate math + guards (#18) |
-| `--verify-sync` | v3 sync payload, account isolation, remote gap-fill, legacy fit |
-| `--verify-credits` | server-counter parsing, current-cycle guards, and unclassified reconciliation (#33) |
+| `--verify-sync` | v3 counter payload, account isolation, remote gap-fill and compatibility |
+| `--verify-credits` | counter parsing, availability, cycle guards, history retention and telemetry retirement |
 | `--verify-wake-refresh` | visible-wake freshness and bounded retry rules (#39) |
 | `--verify-shortcut` | global shortcut validation and persistence encoding (#40) |
-| `--sync-preview` | combined multi-machine view vs a simulated second machine |
+| `--verify-telemetry-cleanup` | removal of BarPilot's old Copilot telemetry agent, helper and matching session variables only |
+| `--verify-startup` | build identity, release-signature gating and recoverable update replacement |
 | `--diagnose` | support report: state, a timed load, recent reload log |
 
 Every `--verify-*` command exits nonzero when any assertion fails. `make verify`
@@ -96,112 +85,48 @@ paths, so output is safe to paste into the public repo. Runtime history comes fr
 
 Requires the Swift toolchain only (Command Line Tools is enough).
 
-## The core invariant
+## Usage invariants
 
-**The aggregation rules below are exact and load-bearing — don't change them
-casually.** When touching `Sources.swift` or `Aggregator.swift`, re-check the
-totals with `--dump` against a known-good capture. The rules:
-
-- credits = `nano_aiu / 1e9`; cost = `credits / 100` (100 credits = $1.00).
-- **Range bounds are UTC** — from = `00:00:00.000Z`, to = `23:59:59.999Z`
-  (`Aggregator.utcMidnightMs` + `86_399_999`).
-- **Daily buckets use the LOCAL calendar date** (`localDayStr`) — distinct from
-  the UTC range bounds above.
-- **Model normalisation** merges VS Code vs Mac App punctuation: a *single*
-  trailing `-<digit>` → `.<digit>` (so `claude-sonnet-4-6` ≡ `claude-sonnet-4.6`,
-  but `...-2024-07-18` is untouched). See `Aggregator.normaliseModel`.
-- **Dedup** by `spanId` (first occurrence wins; later duplicates ignored).
-- Orchestration/agent spans are **skipped** — their AIU duplicates the child LLM
-  span's value, so counting them double-counts. Two shapes: spans with **no model
-  attribute**, and **`invoke_agent` rollup spans** (which *do* carry a model, but
-  whose AIU is the sum of the child chat calls). Both are excluded — at parse time
-  (`Sources.parseJSONLLine`) and again at cache-load (`SpanCache.load` filters out
-  `op_name LIKE 'invoke_agent%'`), so historical cached rollups stop counting too.
-
-When GitHub is connected, a second invariant overlays this local report for the
-current UTC billing cycle:
-
-- `headline total = max(GitHub cumulative counter, locally classified credits)`.
-- `unclassified = max(0, GitHub counter - locally classified credits)`.
-- Unclassified credits are never distributed across known models, days, sessions,
-  or calls. Summary / Models show a separated final bucket; Daily / Sessions / Top
-  remain local and classified-only.
-- The opening sample is attributed to the connected account and joins that
-  account's existing history; it does not establish a visibility boundary.
-  Cumulative samples are not converted into daily rows because gaps cannot be
-  assigned to a day reliably.
-- Billing-cycle budgets are first-class records, independent of counter samples.
-  New samples still carry the value for compatibility, while historical cycles
-  use the cycle record. A one-time migration repair may fill the immediately
-  preceding missed cycle, but ordinary historical budgets are not editable and
-  older missing snapshots remain unknown.
-- Disconnecting removes only the credential. Stored samples, the account
-  attribution on them, and sync authorization are all left intact, so
-  reconnecting restores the existing history rather than starting a new one.
-- Failed polls are not persisted as zero. The last good sample remains available,
-  and ranges outside the provable current-cycle window retain local totals.
-- Run `--verify-credits` after changing any of this reconciliation behavior.
-
-## Data sources (read-only, both off the main actor)
-
-| Source | Format | Path |
-|---|---|---|
-| VS Code Copilot Chat | SQLite (`import SQLite3`, read-only) | `~/Library/Application Support/Code/User/globalStorage/github.copilot-chat/agent-traces.db` |
-| GitHub Copilot Mac App | JSONL | `~/Library/Application Support/com.github.githubapp/agent-traces.jsonl` |
-
-A missing source file is silently skipped. Only lines containing the substring
-`aiu` are JSON-parsed; parsing handles both the flat Mac-App span shape and the
-nested OTLP `resourceSpans` envelope.
-
-**The JSONL is read INCREMENTALLY — don't regress this.** It's append-only and
-grows without bound (multi-GB in practice), so re-scanning it on every 60s reload
-cost seconds of CPU and pegged machines (#23/#24). `loadJSONL(path:from:)` resumes
-from a byte offset persisted in the cache's `meta` table
-(`DataSources.jsonlOffsetKey`), scanning only the appended tail — ~1.8 GB/7s
-becomes ~KB/50ms. Rules:
-
-- The offset only ever advances to the **last complete newline**; a partially
-  written trailing line is left for the next read (consuming it would drop that
-  record permanently).
-- A file smaller than the stored offset means rotation/truncation → full re-scan
-  from 0. The first run after upgrading also does one full scan.
-- Full scans still **memory-map** (`.mappedIfSafe`); incremental tail reads use a
-  plain `FileHandle`.
-- Verify with `--verify-incremental` after touching any of it.
-
-Badge counts in `SourcesStatus` come from the **cache** (`SpanCache.countsBySource`),
-not the live read — a reload normally sees 0 new records.
+- Credits / 100 = USD cost. Current totals use account counters only, never local
+  attribution or a maximum of counter and telemetry.
+- A disconnected, failed-poll, missing, expired-cycle or old cached counter is
+  unavailable, not zero. The menu bar shows a dash and the current budget meter
+  and forecast are hidden. A successful counter value of zero remains visible.
+- Failed polls do not overwrite saved observations. Completed-cycle history is
+  still navigable and retained after reconnecting.
+- Daily deltas are assigned only when observations prove the UTC day. Unsampled
+  increases spanning UTC days remain unallocated. Never diff across a cycle
+  reset or turn a counter correction into negative usage.
+- Cycles use the actual reset instant and UTC day keys. Budgets are first-class
+  cycle records, not derived from today's preference for older history.
+- Disconnect removes only the usage credential; account history and separately
+  authorized multi-Mac sync remain intact.
+- Run `--verify-credits` and `--verify-sync` after changing these rules.
 
 ## Architecture
 
 ```
 Sources/BarPilot/
   App.swift          @main AppMain.main() → AppKit run loop; AppDelegate owns the
-                     NSStatusItem + NSPopover(NSHostingController(DetailView)).
-  Store.swift        UsageStore (@MainActor ObservableObject) — single source of
-                     truth; loads once, re-aggregates on period change; 60s timer.
-  Model.swift        Core types (UsageRecord, Report, *Row, PeriodKind) + Fmt.
-  Sources.swift      DataSources — SQLite + mmap'd JSONL loaders; telemetry detect.
-  Aggregator.swift   Aggregator + PeriodResolver — date-range & bucketing math.
-  CreditUsage.swift  Defensive `/copilot_internal/user` client + response model.
-  CreditSamples.swift  SQLite persistence for cumulative account-counter samples.
-  CreditTimeline.swift  Conservative observed daily counter deltas.
-  CreditReconciliation.swift  Pure server-total/local-attribution overlay.
-  Dump.swift         Dump.run() — the --dump output path.
-  DetailView.swift   Window UI: header, sparkline, budget bar.
-  CompactDashboard.swift  Primary server-first dashboard and chart.
-  SettingsView.swift  Settings window (budget, currency, GitHub, sync, general).
-  GlobalShortcut.swift  Persisted shortcut + Carbon hot-key registration/recorder.
-  Tabs.swift         Summary / Models / Daily / Sessions / Top tables.
-  Setup.swift        TelemetrySetup — opt-in native OTel enablement.
-  Updater.swift      Silent GitHub-Releases auto-updater (Developer ID-gated).
-  LoginItem.swift    "Start at Login" via SMAppService (macOS 13+).
-  Currency.swift     USD/AUD display currency + live USD→AUD rate (open.er-api.com).
-  ExporterHealth.swift  Watchdog: Copilot app running but its JSONL not growing
-                     ⇒ its exporter is dead (the app heartbeats ~1.5 KB/10s even
-                     when idle, so this needs no guess about user activity).
-  DiagLog.swift      Size-capped rotating support log (one line per reload).
-  Diagnose.swift     Diagnose.run() — the --diagnose support report.
+                     NSStatusItem + NSPopover(NSHostingController(CompactDashboard)).
+  Store.swift        Main-actor counter history, budgets and refresh coordination.
+  Model.swift        Billing-cycle projection and formatting helpers.
+  CreditUsage.swift  Defensive GitHub account-counter client.
+  CreditSamples.swift SQLite counter samples, cycle budgets and retirement migration.
+  TelemetryCleanup.swift Launch-time removal of the old telemetry agent and variables.
+  CreditTimeline.swift Conservative UTC daily counter deltas.
+  CreditCycle.swift  Cycle membership, current-counter availability and checks.
+  CompactDashboard.swift Primary dashboard, calendar and daily chart.
+  SettingsView.swift Settings window.
+  GlobalShortcut.swift Persisted Carbon hot-key registration and recorder.
+  SyncAggregate.swift Versioned counter payload and older-peer compatibility.
+  GitHubBackend.swift Private-Gist transport.
+  RemoteStore.swift  Atomic cached peer snapshots.
+  Updater.swift      Native signature detection and silent release updater.
+  LoginItem.swift    Start at Login via SMAppService.
+  Currency.swift     USD/AUD conversion and exchange-rate freshness.
+  DiagLog.swift      Size-capped support log.
+  Diagnose.swift     Privacy-safe support report.
 Info.plist           LSUIElement (menu-bar-only) agent bundle.
 build-app.sh         Build + assemble + stable-sign locally (ad-hoc fallback for contributors).
 ```
@@ -209,11 +134,6 @@ build-app.sh         Build + assemble + stable-sign locally (ad-hoc fallback for
 Primary data flow: `CreditUsageAPI` → `CreditSampleStore` → local observations +
 matching `MachineSyncPayload` observations → `CreditTimeline` →
 `CompactDashboard`. Account counters are unioned and deduplicated, never summed.
-
-Legacy data flow: `DataSources.loadAll()` (off-actor) → `UsageStore.allRecords`
-(cached raw) → `Aggregator.build(...)` on every period change → local `Report` →
-`CreditReconciliation.build(...)` → deprecated telemetry views. The reconciliation
-overlay never mutates local aggregation.
 
 The daily-cost chart expands sparse observations into every UTC day in the
 selected billing cycle, including future placeholders, so its geometry does not
@@ -304,8 +224,8 @@ column or date reveals that day’s date, credits and display-currency cost.
   authorized from gist sync.** A disconnected window shows a **Connect GitHub**
   CTA; there is no unsolicited startup prompt. Settings exposes
   Connect/Disconnect as a secondary account action. It polls GitHub's internal
-  account endpoint every 60 seconds and stores samples in the local span-cache
-  database. The credentials use separate Keychain entries, so disconnecting one
+  account endpoint every 60 seconds and stores samples in the existing SQLite
+  database (historical filename retained). The credentials use separate Keychain entries, so disconnecting one
   feature cannot silently disable the other. (#33)
 - **The primary UI is server-first and billing-cycle based.** It shows credits,
   USD + AUD, monthly budget progress, a daily usage bar chart, and daily
@@ -315,12 +235,15 @@ column or date reveals that day’s date, credits and display-currency cost.
   calendar. The calendar combines safely observed spend from both cycles when a
   non-midnight reset splits one UTC day, and never invents values for unallocated
   dates. The menu bar stays on the current cycle and historical cycles never
-  project forward. The
-  telemetry tabs remain temporarily accessible behind a deprecated legacy-view
-  control. (#34, #41)
-- **The menu-bar figure warns when GitHub is not authoritative.** Reuse the
-  existing warning glyph while disconnected, reconnect-required, stale, or in
-  error; the amount remains the local fallback rather than disappearing.
+  project forward. (#34, #41)
+- **Current usage disappears when unavailable.** No local fallback is shown
+  after a failed poll or disconnect, even if a peer has a saved counter. Persisted
+  history is not erased. A cached sample is not presented as current until this
+  launch completes a successful poll; its GitHub observation must be no more
+  than five minutes old. A direct poll in this process tolerates up to 30 seconds
+  of server clock lead. Future-dated peer observations are excluded. After a day
+  of ambiguous rollover, a fresh direct total can appear as provisional while
+  history, sync and projections wait for a confirmed cycle.
 - **Multi-machine sync uses schema v3 counter observations and cycle budgets.** Each Mac publishes
   the live cycle's first locally captured observation in each 15-minute UTC
   bucket plus its moving close. Completed cycles retain the first, high-water
@@ -328,8 +251,7 @@ column or date reveals that day’s date, credits and display-currency cost.
   when available for ordering and UTC-day membership, and the payload has a
   defensive 6,144-sample ceiling. That ceiling, a raw payload-size bound and
   numeric/timestamp validation use the same gate before upload and after
-  download. The complete snapshot is capped at 64 machine payloads so bounded
-  row counters cannot overflow a combined signed-64-bit report. A single
+  download. The complete snapshot is capped at 64 machine payloads. A single
   compact SQL history read avoids
   materialising every minute-level poll. Pulled samples are decoded off the main
   actor once, cached in memory, written to the separate remote store as one
@@ -351,7 +273,7 @@ column or date reveals that day’s date, credits and display-currency cost.
   every publishable field (except `updatedAt`) controls unchanged uploads; do not
   replace it with aggregate counts or totals that can collide. `--verify-sync`
   always uses a temporary remote database and
-  terminates unsuccessfully on either aggregate or persistence mismatches. A
+  terminates unsuccessfully on payload or persistence mismatches. A
   PBKDF2-derived account
   fingerprint gates merging;
   account-wide counter values are never added across machines. Before any push,
@@ -371,26 +293,28 @@ column or date reveals that day’s date, credits and display-currency cost.
   Mac missed rollover, with the UI identifying its synced origin. The fingerprint
   must stay deterministic across Macs (no per-install salt), so a plain hash of
   GitHub's small numeric id space would be reversible by a precomputed table —
-  hence the KDF. Schema v3 retains legacy
-  aggregate rows only during deprecation. Truncated gist files are fetched through
+  hence the KDF. Schema v3 retains the `rows` wire field solely for older-peer
+  decoding. Outgoing rows are empty; telemetry rows never contribute or get
+  republished. Truncated gist files are fetched through
   their authenticated `raw_url`. Payloads also carry the public USD→AUD quote and
   its provider update timestamp. The newest valid provider timestamp wins across
   Macs; local fetch time is never used to decide freshness.
 - **Cycle membership is interval containment, not calendar-month equality.**
-  `CreditReconciliation.isCurrentCycle` tests `resetAt - 1 month <= now < resetAt`.
+  `CreditCycle.isCurrentCycle` tests `resetAt - 1 month <= now < resetAt`.
   Copilot resets are not always UTC midnight on the 1st — the account response
   carries the reset in four fields, two of which encode a time-of-day, and
   anniversary-billed accounts never land on the 1st. Requiring alignment silently
-  blanked the entire dashboard for those accounts with no error shown. The legacy
-  overlay (`matchesCurrentCycle`) additionally requires an exact UTC-midnight
-  start because even a same-day 10am reset leaves prior-cycle hours in a locally
-  aggregated calendar-month range.
+  blanked the entire dashboard for those accounts with no error shown.
 - **Sample history is addressed by cycle and account, never by a mutable pointer.**
   `credit_samples.account` records which account observed each row, and
   `Store.loadCycleSamples` reads by UTC reset day + account. Exact reset instants
   remain stored, but same-day variants are coalesced for navigation because the
-  API's reset fields can disagree on time-of-day. Rollover is committed only when
-  the reset day moves forward *and* the counter drops. The former baseline
+  API's reset fields can disagree on time-of-day. An accepted early reset sets
+  the shared boundary for both adjacent cycles if it follows the previous
+  cycle's last accepted observation. A new cycle can be confirmed by
+  a counter drop, a zero reading following an observed zero after reset, or a
+  reset that shows an intervening cycle has passed. Ambiguous readings stay out
+  of history. The former baseline
   pointer is **deleted, not repurposed** — it was the only account-isolation
   mechanism, so it had to be shoved forward on every reconnect, and any change to
   fingerprint derivation made the *same* account look new and hid the whole cycle.
@@ -398,33 +322,29 @@ column or date reveals that day’s date, credits and display-currency cost.
   (guarded by a `meta` key) so a second account can never inherit the first's
   history. Never reintroduce a time-based visibility gate for account isolation.
 - **`DiagLog` and `--diagnose` carry no monetary or credit figures.** The reload
-  line records a menu-state token and a drift flag, not the total, because
+  line records a connection-state label, not the total, because
   `--diagnose` output is documented as safe to paste into a public issue.
-- **Legacy retirement does not delete the application database.** `credit_samples`
-  shares the existing SQLite file with `spans` and `meta`. Stop telemetry
-  ingestion first; leave legacy tables intact for rollback, then remove them only
-  in a later versioned migration. The remote store likewise remains during the
-  transition.
+- **Telemetry retirement preserves the application database.** On release launch,
+  `CreditSampleStore.retireLegacyTelemetry` transactionally drops only `spans`
+  and known telemetry ingestion/backfill metadata. `credit_samples`, cycle
+  budgets, account-adoption keys, migration keys and database identity remain.
+  Never delete the database or clear the complete `meta` table.
+  Cleanup of settings installed in other apps is manual and ownership-sensitive;
+  see the README. Source traces and backups are not automatically deleted.
 - **Budget = one editable monthly USD figure** (`monthlyBudgetUSD`, default $150
-  ≈ $5/day), pro-rated to a per-day rate via `avgDaysPerMonth = 30.4375` and
-  multiplied by the selected range's days. Edited in Settings via an inline field
-  + Set button (the old NSAlert prompt is gone). In the
-  compact bar, the 100% budget marker is fixed at 70% of the track, leaving the
+  ≈ $5/day). Edited in Settings; recorded independently for each UTC billing cycle.
+  In the compact bar, the 100% budget marker is fixed at 70% of the track, leaving the
   final 30% to visualize projections up to about 143% of budget. Fill widths and
   the marker use that same fixed scale; budget and projection labels use the
   selected display currency and retain actual over-budget values.
-- **Telemetry setup is opt-in and user-confirmed.** Detection is read-only; if a
-  source isn't configured, the footer shows a warning + an **Enable…** button
-  → confirm dialog → native config (patch VS Code `settings.json`; write a helper
-  script 0755 + LaunchAgent in `~/Library`, `launchctl load`). Never automatic,
-  never a startup prompt. All under `~/Library` — no admin/sudo.
-- **Auto-update is a built-in GitHub-Releases updater (NOT Sparkle)** —
-  `Updater.swift`. Silent: checks the Releases API, downloads the notarised DMG,
-  verifies Team ID `9N354A3UZK` + Gatekeeper, swaps the bundle via a detached
-  helper script, relaunches. Gated to Developer ID builds (`isDeveloperIDSigned`)
-  so dev builds never self-update. Sparkle rejected as too heavy for a
-  hand-assembled SwiftPM bundle. **The app now makes network calls** (GitHub) —
-  keep the "no network for your *data*" wording accurate.
+- **Auto-update uses GitHub Releases.** `Updater.swift` runs one check at a time
+  across manual and scheduled triggers. It stages the bundle beside the running
+  app, verifies its identity, Developer ID signature and Gatekeeper assessment,
+  and uses a helper process to exchange the two bundles atomically. The helper
+  records the transaction before the exchange and retains the original bundle
+  until the replacement confirms startup. A later launch checks for an interrupted
+  exchange before telemetry retirement and can restore the original when the
+  recorded bundles still match. Developer ID release builds use this updater.
 - **Start at Login** via `SMAppService.mainApp` (`LoginItem.swift`), toggled from
   Settings — no third-party dependency.
 - **Currency (USD/AUD):** everything is computed/stored in USD; AUD is a

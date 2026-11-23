@@ -241,10 +241,13 @@ enum StatusItemActionPolicy {
             probe.action == nil,
             "status-item presentation must not run inside button tracking"
         )
-        RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+        let deadline = Date().addingTimeInterval(2)
+        while probe.action == nil && Date() < deadline {
+            _ = RunLoop.main.run(mode: .default, before: deadline)
+        }
         precondition(
             probe.action == .togglePopover,
-            "the deferred status-item action must run on the next main-loop turn"
+            "the main run loop must deliver the deferred status-item action"
         )
     }
 }
@@ -268,11 +271,15 @@ struct CompactDashboard: View {
     @EnvironmentObject var store: UsageStore
     let connectGitHub: () -> Void
     let openSettings: () -> Void
-    let showLegacy: () -> Void
     let closePopover: () -> Void
     @ObservedObject var presentationState: PopoverPresentationState
-    @State private var selectedSpendDay: String?
-    @State private var selectedSpendCredits: Double?
+    @State private var spendDaySelection: SpendDaySelection?
+
+    private struct SpendDaySelection {
+        let date: Date
+        let accountSession: Int
+        let calendarSamples: [Int64: [CreditSample]]
+    }
 
     var body: some View {
         ZStack(alignment: .topLeading) {
@@ -287,9 +294,11 @@ struct CompactDashboard: View {
                             connectionCard
                         }
                         spendSummary
-                        CompactBudgetBar()
-                        if selectedSpendDay != nil {
-                            selectedDayCard
+                        if store.compactTotalCredits != nil, !showsProvisionalTotal {
+                            CompactBudgetBar()
+                        }
+                        if let selection = currentSpendDaySelection {
+                            selectedDayCard(selection)
                         }
                         activityCard
                     }
@@ -313,7 +322,25 @@ struct CompactDashboard: View {
             }
         }
         .frame(width: 600)
+        .onChange(of: store.creditHistorySelectionID) { _ in
+            spendDaySelection = nil
+            showingSpendCalendar = false
+        }
         .onExitCommand(perform: dismissTopLayer)
+    }
+
+    private var currentSpendDaySelection: SpendDaySelection? {
+        guard store.serverUsageEnabled, let selection = spendDaySelection,
+              selection.accountSession == store.creditHistorySelectionID else { return nil }
+        return selection
+    }
+
+    private var selectedSpendDay: String? {
+        currentSpendDaySelection.map { CreditCycleSummary.utcDayString(for: $0.date) }
+    }
+
+    private var showsProvisionalTotal: Bool {
+        store.isViewingCurrentCreditCycle && store.currentCreditTotalIsProvisional
     }
 
     /// Escape unwinds exactly one presentation level. Handling it here avoids
@@ -386,7 +413,7 @@ struct CompactDashboard: View {
 
     private var connectionMessage: String {
         if let error = store.serverUsageError { return error }
-        return "BarPilot is temporarily showing incomplete local telemetry. Connect to load GitHub’s account-wide credit total and begin daily tracking."
+        return "Connect to load GitHub’s account-wide credit total and begin daily tracking. Current usage is unavailable until GitHub responds."
     }
 
     private var header: some View {
@@ -434,8 +461,7 @@ struct CompactDashboard: View {
     private var cycleNavigator: some View {
         HStack(spacing: 12) {
             Button {
-                selectedSpendDay = nil
-                selectedSpendCredits = nil
+                spendDaySelection = nil
                 showingSpendCalendar = false
                 store.selectOlderCreditCycle()
             } label: {
@@ -461,12 +487,11 @@ struct CompactDashboard: View {
                 .frame(minWidth: 150)
             }
             .buttonStyle(.plain)
-            .disabled(store.selectedCreditCycle == nil)
+            .disabled(!store.canOpenSpendCalendar)
             .help("Choose a date and inspect observed daily spend")
 
             Button {
-                selectedSpendDay = nil
-                selectedSpendCredits = nil
+                spendDaySelection = nil
                 showingSpendCalendar = false
                 store.selectNewerCreditCycle()
             } label: {
@@ -502,11 +527,11 @@ struct CompactDashboard: View {
     }
 
     private var cycleRangeLabel: String {
-        guard let cycle = store.selectedCreditCycle,
-              let start = cycle.startAt else {
+        guard let start = store.selectedCreditCycleStart,
+              let end = store.selectedCreditCycleEnd else {
             return "Billing cycle"
         }
-        return "\(Self.cycleDateFormatter.string(from: start)) – \(Self.cycleDateFormatter.string(from: cycle.resetAt))"
+        return "\(Self.cycleDateFormatter.string(from: start)) – \(Self.cycleDateFormatter.string(from: end))"
     }
 
     private var spendCalendarOverlay: some View {
@@ -521,9 +546,10 @@ struct CompactDashboard: View {
                     guard store.selectCreditCycle(containingUTCDate: date) else {
                         return
                     }
-                    let day = CreditCycleSummary.utcDayString(for: date)
-                    selectedSpendDay = day
-                    selectedSpendCredits = store.spendCalendarDailyCredits[day]
+                    spendDaySelection = SpendDaySelection(
+                        date: date, accountSession: store.creditHistorySelectionID,
+                        calendarSamples: store.calendarSamples(on: date)
+                    )
                     showingSpendCalendar = false
                 },
                 close: { showingSpendCalendar = false }
@@ -543,28 +569,24 @@ struct CompactDashboard: View {
     }
 
     private var calendarInitialDate: Date {
-        if let selectedSpendDay {
-            return Date(
-                timeIntervalSince1970:
-                    Double(Aggregator.utcMidnightMs(selectedSpendDay)) / 1000
-            )
-        }
-        return store.selectedCreditCycle?.startAt ?? Date()
+        currentSpendDaySelection?.date ?? store.selectedCreditCycleStart ?? Date()
     }
 
-    private var selectedDayCard: some View {
+    private func selectedDayCard(_ selection: SpendDaySelection) -> some View {
         HStack(spacing: 10) {
             Image(systemName: "calendar.badge.checkmark")
                 .foregroundStyle(.tint)
             VStack(alignment: .leading, spacing: 2) {
-                Text(selectedSpendDayLabel)
+                Text("\(Self.selectedDayFormatter.string(from: selection.date)) · UTC")
                     .font(.subheadline.weight(.semibold))
                 if store.isLoadingCreditCycle {
                     Text("Loading billing-cycle history…")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                } else if let selectedSpendCredits {
-                    Text("\(Fmt.credits(selectedSpendCredits)) credits · \(store.costString(credits: selectedSpendCredits)) observed")
+                } else if let credits = store.observedCredits(
+                    on: selection.date, calendarSamples: selection.calendarSamples
+                ) {
+                    Text("\(Fmt.credits(credits)) credits · \(store.costString(credits: credits)) observed")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
@@ -575,8 +597,7 @@ struct CompactDashboard: View {
             }
             Spacer()
             Button {
-                selectedSpendDay = nil
-                selectedSpendCredits = nil
+                spendDaySelection = nil
             } label: {
                 Image(systemName: "xmark")
             }
@@ -587,21 +608,11 @@ struct CompactDashboard: View {
         .background(Color.accentColor.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
     }
 
-    private var selectedSpendDayLabel: String {
-        guard let selectedSpendDay else { return "Selected day" }
-        let date = Date(
-            timeIntervalSince1970:
-                Double(Aggregator.utcMidnightMs(selectedSpendDay)) / 1000
-        )
-        return "\(Self.selectedDayFormatter.string(from: date)) · UTC"
-    }
-
     private var spendSummary: some View {
         HStack(alignment: .top, spacing: 20) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 7) {
-                    Text(store.isViewingCurrentCreditCycle
-                         ? "SPENT THIS CYCLE" : "SPENT IN THIS CYCLE")
+                    Text(spendSummaryTitle)
                         .font(.system(size: 10, weight: .semibold))
                         .tracking(0.7)
                         .foregroundStyle(.secondary)
@@ -615,15 +626,22 @@ struct CompactDashboard: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                Text(store.displayCostString(credits: store.compactTotalCredits))
+                Text(store.compactTotalCredits.map {
+                    store.displayCostString(credits: $0)
+                } ?? "—")
                     .font(.system(size: 34, weight: .bold, design: .rounded))
                     .monospacedDigit()
                 HStack(spacing: 7) {
-                    Text("\(Fmt.credits(store.compactTotalCredits)) premium credits")
-                        .font(.caption)
-                    if let cycle = store.selectedCreditCycle {
+                    if let credits = store.compactTotalCredits {
+                        Text("\(Fmt.credits(credits)) premium credits")
+                            .font(.caption)
+                    } else {
+                        Text(store.serverUsageError ?? "Current usage unavailable")
+                            .font(.caption)
+                    }
+                    if let end = store.selectedCreditCycleEnd {
                         Text("·")
-                        Text("\(store.isViewingCurrentCreditCycle ? "Resets" : "Ended") \(Self.resetFormatter.string(from: cycle.resetAt))")
+                        Text("\(store.isViewingCurrentCreditCycle ? "Resets" : "Ended") \(Self.resetFormatter.string(from: end))")
                             .font(.caption)
                     }
                 }
@@ -653,16 +671,6 @@ struct CompactDashboard: View {
                 .tint(.accentColor)
                 .help("Compare current GitHub Copilot model token prices")
 
-                Button {
-                    showLegacy()
-                } label: {
-                    Label("Legacy telemetry", systemImage: "clock.arrow.circlepath")
-                }
-                .buttonStyle(.borderless)
-                .controlSize(.small)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .help("Open the previous telemetry-based interface unchanged")
             }
         }
         .padding(16)
@@ -676,6 +684,11 @@ struct CompactDashboard: View {
             RoundedRectangle(cornerRadius: 12, style: .continuous)
                 .strokeBorder(Color.secondary.opacity(0.16))
         }
+    }
+
+    private var spendSummaryTitle: String {
+        if showsProvisionalTotal { return "UNCONFIRMED CYCLE TOTAL" }
+        return store.isViewingCurrentCreditCycle ? "SPENT THIS CYCLE" : "SPENT IN THIS CYCLE"
     }
 
     private func relativeUpdatedLabel(_ date: Date) -> String {
@@ -720,7 +733,8 @@ struct CompactDashboard: View {
             }
             DailyCostBarChart(
                 points: timeline.daily,
-                cycle: store.selectedCreditCycle,
+                cycleStart: store.selectedCreditCycleStart,
+                cycleReset: store.selectedCreditCycleEnd,
                 cost: { store.displayCost(credits: $0) },
                 symbol: store.effectiveCurrency.symbol
             )
@@ -729,6 +743,9 @@ struct CompactDashboard: View {
     }
 
     private var dailyChartSubtitle: String {
+        if showsProvisionalTotal {
+            return "Daily tracking resumes when GitHub confirms the new cycle."
+        }
         let timeline = store.creditTimeline
         guard timeline.firstAtMs != nil else {
             return "Waiting for saved GitHub counter samples."
@@ -879,7 +896,8 @@ struct CompactDashboard: View {
     private var statusColor: Color {
         if store.serverUsageStatusIsError { return .red }
         guard store.serverUsageEnabled else { return .orange }
-        if store.currentServerUsageSample == nil || store.serverUsageIsStale { return .orange }
+        if store.currentCreditTotalIsProvisional
+            || store.currentServerUsageSample == nil || store.serverUsageIsStale { return .orange }
         return .green
     }
 
@@ -1050,10 +1068,10 @@ private struct SpendHistoryCalendar: View {
         var months: Set<Date> = []
         let today = Self.monthStart(Date())
         for cycle in store.creditCycles {
-            guard let start = cycle.startAt else { continue }
+            guard let start = cycle.startAt(in: store.creditCycles) else { continue }
             var month = Self.monthStart(start)
             let last = Self.monthStart(
-                cycle.resetAt.addingTimeInterval(-0.001)
+                cycle.endAt(in: store.creditCycles).addingTimeInterval(-0.001)
             )
             var count = 0
             while month <= last && month <= today && count < 240 {
@@ -1218,13 +1236,18 @@ private struct CompactBudgetBar: View {
     }()
 
     var body: some View {
-        let spent = store.compactTotalCredits
+        if let spent = store.compactTotalCredits {
+            budgetContent(spent: spent)
+        }
+    }
+
+    private func budgetContent(spent: Double) -> some View {
         let budgetUSD = store.compactBudgetUSD
         let budget = (budgetUSD ?? 0) * 100
         let projection = store.compactSpendProjection
         let hasBudget = (budgetUSD ?? 0) >= BudgetInput.minimumNonZero
 
-        VStack(alignment: .leading, spacing: 10) {
+        return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Monthly budget")
@@ -1513,7 +1536,7 @@ private struct CompactBudgetBar: View {
     }
 
     private var selectedCycleMonthLabel: String {
-        guard let start = store.selectedCreditCycle?.startAt else {
+        guard let start = store.selectedCreditCycleStart else {
             return "previous cycle"
         }
         return Self.budgetMonthFormatter.string(from: start)
@@ -1590,7 +1613,8 @@ struct MoneyAxisScale {
 
 private struct DailyCostBarChart: View {
     let points: [ObservedDayCredits]
-    let cycle: CreditCycleSummary?
+    let cycleStart: Date?
+    let cycleReset: Date?
     /// Credits → cost in the display currency. Injected rather than reading the
     /// store directly so the bar heights and the axis labels are guaranteed to
     /// use one conversion, and the view stays previewable.
@@ -1619,7 +1643,7 @@ private struct DailyCostBarChart: View {
     /// Keep the label count sane: one tick per day for a short cycle, thinning
     /// out as the month fills up.
     private var chartPoints: [BillingCycleDayCredits] {
-        guard let cycle, let startAt = cycle.startAt else {
+        guard let cycleStart, let cycleReset else {
             return points.map {
                 BillingCycleDayCredits(
                     id: $0.id, day: $0.day, date: $0.date,
@@ -1629,7 +1653,7 @@ private struct DailyCostBarChart: View {
             }.sorted { $0.date < $1.date }
         }
         return CreditTimeline.billingCycleDays(
-            daily: points, startAt: startAt, resetAt: cycle.resetAt
+            daily: points, startAt: cycleStart, resetAt: cycleReset
         )
     }
 

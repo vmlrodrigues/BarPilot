@@ -22,6 +22,8 @@ struct CreditSample: Equatable {
     let resetAtMs: Int64
     let creditsUsed: Double
 
+    var observedAtMs: Int64 { serverAtMs ?? capturedAtMs }
+    var observedAt: Date { Date(timeIntervalSince1970: Double(observedAtMs) / 1000) }
     var capturedAt: Date { Date(timeIntervalSince1970: Double(capturedAtMs) / 1000) }
     var resetAt: Date { Date(timeIntervalSince1970: Double(resetAtMs) / 1000) }
 }
@@ -129,13 +131,19 @@ enum CreditUsageAPI {
             throw CreditUsageError.invalidResponse
         }
 
-        let serverAtMs: Int64? = (premium["timestamp_utc"] as? String)
-            .flatMap(parseISO)
-            .flatMap { serverAt in
-                guard abs(serverAt.timeIntervalSince(capturedAt))
-                        <= maximumServerClockSkewSeconds else { return nil }
-                return timestampMilliseconds(serverAt)
+        let serverAtMs: Int64?
+        if let value = premium["timestamp_utc"], !(value is NSNull) {
+            // Falling back to capture time here would make an explicitly stale
+            // or invalid GitHub timestamp look like a fresh observation.
+            guard let timestamp = value as? String,
+                  let date = parseISO(timestamp),
+                  let milliseconds = timestampMilliseconds(date) else {
+                throw CreditUsageError.invalidResponse
             }
+            serverAtMs = milliseconds
+        } else {
+            serverAtMs = nil
+        }
         let sample = CreditSample(
             capturedAtMs: capturedAtMs,
             serverAtMs: serverAtMs,

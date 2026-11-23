@@ -1,257 +1,8 @@
 import Foundation
 
 // ---------------------------------------------------------------------------
-// Core types
-//
-// A single normalised `UsageRecord` represents one billed LLM call,
-// regardless of whether it came from the VS Code SQLite DB or the GitHub
-// Copilot Mac App JSONL trace file. All views are derived from these records.
-// ---------------------------------------------------------------------------
-
-enum SourceKind: String {
-    case vscode = "VS Code Copilot Chat"
-    case macApp = "GitHub Copilot Mac App"
-    /// One-time historical backfill from VS Code chat session files (recorded
-    /// credits only, ≥ 2026-06-01). Tagged so it stays reversible. See ChatBackfill.
-    case chatBackfill = "VS Code Chat (backfill)"
-}
-
-/// One billed LLM call (one OTel span carrying a `*_aiu` usage attribute).
-struct UsageRecord {
-    let source: SourceKind
-    let spanId: String
-    /// Raw model string as recorded by the source (may differ in punctuation,
-    /// e.g. "claude-sonnet-4-6" vs "claude-sonnet-4.6"). `nil` only for VS Code
-    /// spans with no response_model — surfaced as "unknown".
-    let model: String?
-    let startMs: Int64
-    /// AIU credits (nano-AIU / 1e9).
-    let credits: Double
-    let inputTokens: Int
-    let outputTokens: Int
-    let conversationId: String?
-    let chatSessionId: String?
-    let operationName: String
-    /// Reasoning-effort level the call ran at, as recorded by the source
-    /// ("low"…"max"); `nil` for models/calls that don't set one. Raw value —
-    /// harmonised for display in `Aggregator.normaliseLevel`.
-    let reasoningLevel: String?
-}
-
-// ---------------------------------------------------------------------------
-// Per-view aggregated rows
-// ---------------------------------------------------------------------------
-
-struct SummaryRow: Identifiable {
-    let id = UUID()
-    let model: String
-    let calls: Int
-    let credits: Double
-    var cost: Double { credits / 100.0 }
-}
-
-struct ModelRow: Identifiable {
-    let id = UUID()
-    let model: String
-    let calls: Int
-    let credits: Double
-    let inputTokens: Int
-    let outputTokens: Int
-    /// Effective per-token rates (AIU credits per token) from a least-squares
-    /// fit of `credits = inRate·input + outRate·output` over this model's spans.
-    /// `.nan` when the fit is degenerate (too few/collinear calls).
-    let inRate: Double
-    let outRate: Double
-    /// Goodness-of-fit (uncentered R², 0…1); `.nan` when unsolvable.
-    let fit: Double
-    /// Per-reasoning-level breakdown of this model's spans, sorted by ascending
-    /// effort. Always ≥ 1 element (one `nil`-level bucket for non-reasoning use);
-    /// > 1 means the model was run at multiple levels and the UI groups them.
-    let levels: [ModelLevelRow]
-    var cost: Double { credits / 100.0 }
-}
-
-/// One reasoning-level slice within a model (a child row in the Models tab).
-/// `level` is the normalised effort ("low"…"max"); `nil` = calls with no level.
-struct ModelLevelRow: Identifiable {
-    let id = UUID()
-    let level: String?
-    let calls: Int
-    let credits: Double
-    let inputTokens: Int
-    let outputTokens: Int
-    let inRate: Double
-    let outRate: Double
-    let fit: Double
-    var cost: Double { credits / 100.0 }
-}
-
-struct DailyRow: Identifiable {
-    let id = UUID()
-    let day: String
-    let model: String
-    let calls: Int
-    let credits: Double
-    var cost: Double { credits / 100.0 }
-}
-
-struct SessionRow: Identifiable {
-    let id = UUID()
-    let sessionId: String
-    let model: String
-    let startedAt: Int64
-    let lastActiveAt: Int64
-    let calls: Int
-    let credits: Double
-    let inputTokens: Int
-    let outputTokens: Int
-    var cost: Double { credits / 100.0 }
-}
-
-struct TopRow: Identifiable {
-    let id = UUID()
-    let rank: Int
-    let spanId: String
-    let model: String
-    let startedAt: Int64
-    let operationName: String
-    let credits: Double
-    let inputTokens: Int
-    let outputTokens: Int
-    var cost: Double { credits / 100.0 }
-}
-
-/// One bar in the daily mini-chart (a single day's total across all models).
-struct DayTotal: Identifiable {
-    let id = UUID()
-    let day: String
-    let credits: Double
-}
-
-// ---------------------------------------------------------------------------
-// The full report for a selected period
-// ---------------------------------------------------------------------------
-
-struct Report {
-    var fromStr: String
-    var toStr: String
-    /// Inclusive number of calendar days in [fromStr, toStr].
-    var daysInRange: Int
-    var summary: [SummaryRow]
-    var models: [ModelRow]
-    var daily: [DailyRow]
-    var dailyTotals: [DayTotal]
-    var sessions: [SessionRow]
-    var top: [TopRow]
-    var totalCredits: Double
-    /// Today's spend, evaluated with the same UTC-day bounds used elsewhere.
-    var todayCredits: Double
-
-    var totalCost: Double { totalCredits / 100.0 }
-    var todayCost: Double { todayCredits / 100.0 }
-
-    static let empty = Report(
-        fromStr: "", toStr: "", daysInRange: 1,
-        summary: [], models: [], daily: [], dailyTotals: [],
-        sessions: [], top: [],
-        totalCredits: 0, todayCredits: 0
-    )
-}
-
-/// Which data sources were found, how many records each contributed, and
-/// whether each source's OTel telemetry appears to be configured.
-struct SourcesStatus {
-    var vscodeFound = false
-    var vscodeCount = 0
-    var macAppFound = false
-    var macAppCount = 0
-    /// VS Code settings.json has all required `github.copilot.chat.otel.*` keys.
-    var vscodeConfigured = false
-    /// The Mac App OTel LaunchAgent + helper script are installed.
-    var macAppConfigured = false
-    /// The source has EVER captured usage (present in the cache, which survives
-    /// live-DB wipes). Distinguishes a fresh setup from a working source whose
-    /// live DB is momentarily empty — gates the restart nudge (#21).
-    var vscodeEverCaptured = false
-    var macAppEverCaptured = false
-    /// Last-load telemetry, for the rotating log + `--diagnose` (#24).
-    var newRecords = 0
-    var jsonlBytesScanned: Int64 = 0
-    var jsonlOffset: Int64 = 0
-    /// Newest usage timestamp per source, and when each source file last changed
-    /// — reported by `--diagnose`. nil = never/unknown.
-    var vscodeNewestMs: Int64?
-    var macAppNewestMs: Int64?
-    var vscodeFileModified: Date?
-    var macAppFileModified: Date?
-    /// Exporter-watchdog inputs (#27): how long the Copilot app's JSONL has gone
-    /// without growing, and how long since we last observed it at all.
-    var macAppSecondsSinceGrowth: TimeInterval?
-    var gapSinceLastCheck: TimeInterval?
-
-    /// Days since a source last produced usage, or nil if it never has.
-    /// Reported by `--diagnose`; NOT used to warn — absence of usage can't
-    /// distinguish a broken exporter from a user who simply isn't working. The
-    /// warning uses the heartbeat watchdog in `ExporterHealth` instead. (#27)
-    private static func staleDays(_ ms: Int64?, now: Date) -> Int? {
-        guard let ms, ms > 0 else { return nil }
-        let secs = now.timeIntervalSince1970 - Double(ms) / 1000
-        return Int(secs / 86_400)
-    }
-    func vscodeStaleDays(now: Date = Date()) -> Int? { Self.staleDays(vscodeNewestMs, now: now) }
-    func macAppStaleDays(now: Date = Date()) -> Int? { Self.staleDays(macAppNewestMs, now: now) }
-
-    var allConfigured: Bool { vscodeConfigured && macAppConfigured }
-}
-
-// ---------------------------------------------------------------------------
-// Period selection
-// ---------------------------------------------------------------------------
-
-enum PeriodKind: String, CaseIterable, Identifiable {
-    case today
-    case last7
-    case thisMonth
-    case previousMonth
-    case last30
-    case thisYear
-    case allTime
-    case custom
-
-    var id: String { rawValue }
-
-    var label: String {
-        switch self {
-        case .today: return "Today"
-        case .last7: return "Last 7 Days"
-        case .thisMonth: return "This Month"
-        case .previousMonth: return "Previous Month"
-        case .last30: return "Last 30 Days"
-        case .thisYear: return "This Year"
-        case .allTime: return "All Time"
-        case .custom: return "Custom…"
-        }
-    }
-
-    /// Heading for the budget-bar section — labels the SPEND figure it sits over
-    /// (the budget is shown separately, on the right). See #17.
-    var spendTitle: String {
-        switch self {
-        case .today: return "Today's spend"
-        case .last7: return "Last 7 days' spend"
-        case .thisMonth: return "This month's spend"
-        case .previousMonth: return "Previous month's spend"
-        case .last30: return "Last 30 days' spend"
-        case .thisYear: return "This year's spend"
-        case .allTime: return "All-time spend"
-        case .custom: return "Selected range spend"
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Spend projection (#18) — run-rate estimate of full-month spend, shown on the
-// budget bar. Pure + derived from the current report; no aggregation impact.
+// Spend projection (#18) — run-rate estimate of billing-cycle spend, shown on the
+// budget bar. Pure and derived from the account counter and billing cycle.
 // ---------------------------------------------------------------------------
 
 struct SpendProjection {
@@ -267,13 +18,6 @@ struct SpendProjection {
     var hasBudget: Bool  { budgetCredits > 0 }
     var overBudget: Bool { hasBudget && projectedCredits > budgetCredits }
     var pctOfBudget: Double { hasBudget ? projectedCredits / budgetCredits * 100 : 0 }
-
-    private static let endFormatter: DateFormatter = {
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "MMM d"
-        return f
-    }()
 
     private static let utcEndFormatter: DateFormatter = {
         let f = DateFormatter()
@@ -297,53 +41,6 @@ struct SpendProjection {
         return count
     }
 
-    /// Only projects an in-progress calendar month that has usage; nil otherwise.
-    ///
-    /// `excludeWeekends` swaps the run rate from per-calendar-day to per-working-
-    /// day and projects across the month's working days, for people who don't
-    /// work weekends and whose forecast would otherwise assume they do.
-    ///
-    /// Weekend spend that has *already happened* stays in the numerator and is
-    /// carried by the working-day rate. It was billed and cannot be un-spent, so
-    /// dropping it would forecast below the amount already owed. The setting
-    /// changes the assumption about future days, not the accounting of past ones.
-    static func compute(periodKind: PeriodKind, report: Report,
-                        monthlyBudgetUSD: Double, now: Date,
-                        calendar: Calendar = .current,
-                        excludeWeekends: Bool = false) -> SpendProjection? {
-        guard periodKind == .thisMonth,
-              let dayRange = calendar.range(of: .day, in: .month, for: now),
-              let month = calendar.dateInterval(of: .month, for: now) else { return nil }
-        let calendarDays = dayRange.count
-        let calendarElapsed = max(report.daysInRange, 1)
-        guard report.totalCredits > 0, calendarElapsed < calendarDays else { return nil }
-
-        let daysInPeriod: Int
-        let elapsed: Int
-        if excludeWeekends {
-            daysInPeriod = workdays(from: month.start, days: calendarDays, calendar: calendar)
-            elapsed = workdays(from: month.start, days: calendarElapsed, calendar: calendar)
-            // `elapsed` is 0 when the month opens on a weekend and only weekend
-            // days have passed: there is no working-day rate to project with yet.
-            // `elapsed == daysInPeriod` means only weekend days remain, so there
-            // is nothing left to project — the same reason the all-days path
-            // stops on the last day of the month.
-            guard elapsed > 0, elapsed < daysInPeriod else { return nil }
-        } else {
-            daysInPeriod = calendarDays
-            elapsed = calendarElapsed
-        }
-
-        let projected = report.totalCredits / Double(elapsed) * Double(daysInPeriod)
-        let endDate = calendar.date(byAdding: .day, value: -1, to: month.end) ?? month.end
-        return SpendProjection(
-            projectedCredits: projected,
-            budgetCredits: monthlyBudgetUSD * 100,
-            daysElapsed: elapsed, daysInPeriod: daysInPeriod,
-            endLabel: endFormatter.string(from: endDate),
-            excludesWeekends: excludeWeekends)
-    }
-
     /// Project an account counter across its actual GitHub billing cycle. This
     /// deliberately does not assume that the cycle begins on day one or ends at
     /// the end of the current calendar month.
@@ -358,20 +55,22 @@ struct SpendProjection {
     ) -> SpendProjection? {
         guard totalCredits > 0, resetAt > startAt,
               now >= startAt, now < resetAt else { return nil }
-        let cycleDays = calendar.dateComponents(
-            [.day], from: startAt, to: resetAt
-        ).day ?? 0
-        let elapsedDays = (calendar.dateComponents(
-            [.day], from: startAt, to: now
+        // Count the calendar dates on which the cycle can incur spend. The
+        // reset is exclusive, so a midnight reset does not add another day.
+        let firstDay = calendar.startOfDay(for: startAt)
+        let lastDay = calendar.startOfDay(for: resetAt.addingTimeInterval(-0.001))
+        let today = calendar.startOfDay(for: now)
+        let cycleDays = (calendar.dateComponents(
+            [.day], from: firstDay, to: lastDay
         ).day ?? 0) + 1
-        guard cycleDays > 0 else { return nil }
-        let calendarElapsed = min(cycleDays, max(1, elapsedDays))
+        let calendarElapsed = (calendar.dateComponents(
+            [.day], from: firstDay, to: today
+        ).day ?? 0) + 1
         guard calendarElapsed < cycleDays else { return nil }
 
         let daysInPeriod: Int
         let elapsed: Int
         if excludeWeekends {
-            let firstDay = calendar.startOfDay(for: startAt)
             daysInPeriod = workdays(
                 from: firstDay, days: cycleDays, calendar: calendar
             )
@@ -395,129 +94,89 @@ struct SpendProjection {
         )
     }
 
-    // Headless regression check (--verify-projection): asserts compute() on
-    // synthetic reports with a fixed clock, so the run-rate math + guards can't
-    // silently drift. Mirrors the project's --dump / --verify-sync safety nets.
     static func verify() {
-        let err = FileHandle.standardError
-        var pass = 0, fail = 0
-        func check(_ name: String, _ ok: Bool) {
-            if ok { pass += 1 } else { fail += 1 }
-            err.write(Data("  [\(ok ? "OK" : "XX")] \(name)\n".utf8))
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        calendar.locale = Locale(identifier: "en_US_POSIX")
+        let start = calendar.date(from: DateComponents(year: 2025, month: 7, day: 1))!
+        let reset = calendar.date(from: DateComponents(year: 2025, month: 8, day: 1))!
+        let now = calendar.date(from: DateComponents(year: 2025, month: 7, day: 10))!
+        func project(
+            _ credits: Double, budget: Double = 150,
+            now: Date = now, excludeWeekends: Bool = false
+        ) -> SpendProjection? {
+            computeBillingCycle(
+                totalCredits: credits, monthlyBudgetUSD: budget,
+                startAt: start, resetAt: reset, now: now,
+                calendar: calendar, excludeWeekends: excludeWeekends
+            )
         }
-        var cal = Calendar(identifier: .gregorian)
-        cal.timeZone = TimeZone(identifier: "UTC") ?? cal.timeZone
-        // Pin the locale so weekend-ness is Sat/Sun regardless of where this runs.
-        cal.locale = Locale(identifier: "en_US_POSIX")
-        let now = cal.date(from: DateComponents(year: 2025, month: 7, day: 15))!   // mid-July (31 days)
-        func report(days: Int, credits: Double) -> Report {
-            var r = Report.empty; r.daysInRange = days; r.totalCredits = credits; return r
-        }
-
-        // Under budget: 300cr over 10 days -> 300/10*31 = 930cr; budget $150 = 15000cr.
-        if let p = compute(periodKind: .thisMonth, report: report(days: 10, credits: 300), monthlyBudgetUSD: 150, now: now, calendar: cal) {
-            check("run-rate projected (930cr)", abs(p.projectedCredits - 930) < 1e-6)
-            check("days elapsed/period = 10/31", p.daysElapsed == 10 && p.daysInPeriod == 31)
-            check("under budget, budget = 15000cr", !p.overBudget && p.budgetCredits == 15000)
-        } else { check("mid-month returns a projection", false) }
-
-        // Over budget: 6000cr over 10 days -> 18600cr > 15000cr.
-        if let p = compute(periodKind: .thisMonth, report: report(days: 10, credits: 6000), monthlyBudgetUSD: 150, now: now, calendar: cal) {
-            check("over budget flagged", p.overBudget && p.projectedCredits > p.budgetCredits)
-        } else { check("over-budget returns a projection", false) }
-
-        // No budget set: still projects the amount; no over/percent.
-        if let p = compute(periodKind: .thisMonth, report: report(days: 10, credits: 300), monthlyBudgetUSD: 0, now: now, calendar: cal) {
-            check("no budget -> not over, pct 0", !p.hasBudget && !p.overBudget && p.pctOfBudget == 0)
-        } else { check("no-budget still projects", false) }
-
-        check("no usage -> nil", compute(periodKind: .thisMonth, report: report(days: 10, credits: 0), monthlyBudgetUSD: 150, now: now, calendar: cal) == nil)
-        check("last day of month -> nil", compute(periodKind: .thisMonth, report: report(days: 31, credits: 300), monthlyBudgetUSD: 150, now: now, calendar: cal) == nil)
-        check("non-thisMonth period -> nil", compute(periodKind: .previousMonth, report: report(days: 10, credits: 300), monthlyBudgetUSD: 150, now: now, calendar: cal) == nil)
-
-        // -- Weekend exclusion (#37) ----------------------------------------
-        // July 2025 opens on a Tuesday: 23 working days of 31. The first 10
-        // calendar days contain 8 working days (the 5th and 6th are a weekend).
-        if let p = compute(periodKind: .thisMonth, report: report(days: 10, credits: 300),
-                           monthlyBudgetUSD: 150, now: now, calendar: cal, excludeWeekends: true) {
-            check("workday run-rate projected (300/8*23 = 862.5cr)", abs(p.projectedCredits - 862.5) < 1e-6)
-            check("counts report workdays (8/23)", p.daysElapsed == 8 && p.daysInPeriod == 23)
-            check("flagged as excluding weekends", p.excludesWeekends)
-        } else { check("weekday mode returns a projection", false) }
-
-        // Mid-month, once a representative share of weekends has elapsed, the
-        // five-day week forecasts lower. This is NOT a universal law: very early
-        // in a month that opens on a weekend, the working-day base is small and
-        // the weekday forecast can sit higher. The rate is corrected to a
-        // working-day basis, which is not the same as being reduced.
-        if let all = compute(periodKind: .thisMonth, report: report(days: 10, credits: 300),
-                             monthlyBudgetUSD: 150, now: now, calendar: cal),
-           let week = compute(periodKind: .thisMonth, report: report(days: 10, credits: 300),
-                              monthlyBudgetUSD: 150, now: now, calendar: cal, excludeWeekends: true) {
-            check("mid-month, weekdays forecast lower than all-days", week.projectedCredits < all.projectedCredits)
-            check("default is unchanged (930cr)", abs(all.projectedCredits - 930) < 1e-6)
-            check("all-days is not flagged", !all.excludesWeekends)
-        } else { check("both modes project mid-month", false) }
-
-        // Weekend spend already made is still carried: the same credits over the
-        // same elapsed days must project at least what has already been spent.
-        if let p = compute(periodKind: .thisMonth, report: report(days: 10, credits: 300),
-                           monthlyBudgetUSD: 150, now: now, calendar: cal, excludeWeekends: true) {
-            check("forecast never dips below spend to date", p.projectedCredits >= 300)
-        } else { check("weekend-spend case projects", false) }
-
-        // February 2025 opens on a Saturday: two days in, no working day has
-        // elapsed, so there is no working-day rate to project with.
-        let febOpening = cal.date(from: DateComponents(year: 2025, month: 2, day: 2))!
-        check("no workday elapsed yet -> nil",
-              compute(periodKind: .thisMonth, report: report(days: 2, credits: 300),
-                      monthlyBudgetUSD: 150, now: febOpening, calendar: cal, excludeWeekends: true) == nil)
-        check("...but all-days still projects then",
-              compute(periodKind: .thisMonth, report: report(days: 2, credits: 300),
-                      monthlyBudgetUSD: 150, now: febOpening, calendar: cal) != nil)
-
-        // August 2025 ends on a Sat/Sun: by the 29th every working day is gone,
-        // so there is nothing left to forecast even though the month has not ended.
-        let augTail = cal.date(from: DateComponents(year: 2025, month: 8, day: 29))!
-        check("only weekend days remain -> nil",
-              compute(periodKind: .thisMonth, report: report(days: 29, credits: 300),
-                      monthlyBudgetUSD: 150, now: augTail, calendar: cal, excludeWeekends: true) == nil)
-
-        // The guards that gate the all-days path must gate this one too.
-        check("weekday mode: no usage -> nil",
-              compute(periodKind: .thisMonth, report: report(days: 10, credits: 0),
-                      monthlyBudgetUSD: 150, now: now, calendar: cal, excludeWeekends: true) == nil)
-        check("weekday mode: non-thisMonth -> nil",
-              compute(periodKind: .previousMonth, report: report(days: 10, credits: 300),
-                      monthlyBudgetUSD: 150, now: now, calendar: cal, excludeWeekends: true) == nil)
-
-        // Jun 25 -> Jul 25 is a 30-day anniversary cycle. On Jul 15,
-        // 21 cycle days have started; July's 15/31 calendar ratio is irrelevant.
-        let anniversaryStart = cal.date(
-            from: DateComponents(year: 2025, month: 6, day: 25)
-        )!
-        let anniversaryReset = cal.date(
-            from: DateComponents(year: 2025, month: 7, day: 25)
-        )!
-        if let p = computeBillingCycle(
+        let standard = project(300)!
+        precondition(abs(standard.projectedCredits - 930) < 1e-6)
+        precondition(standard.daysElapsed == 10 && standard.daysInPeriod == 31)
+        precondition(!standard.overBudget && standard.budgetCredits == 15_000)
+        precondition(project(6_000)!.overBudget)
+        let noBudget = project(300, budget: 0)!
+        precondition(!noBudget.hasBudget && noBudget.pctOfBudget == 0)
+        precondition(project(0) == nil)
+        precondition(project(300, now: reset) == nil)
+        precondition(project(300, now: start.addingTimeInterval(-1)) == nil)
+        let weekdays = project(300, excludeWeekends: true)!
+        precondition(weekdays.daysElapsed == 8 && weekdays.daysInPeriod == 23)
+        precondition(abs(weekdays.projectedCredits - 862.5) < 1e-6)
+        precondition(weekdays.excludesWeekends && weekdays.projectedCredits >= 300)
+        let febStart = calendar.date(from: DateComponents(year: 2025, month: 2, day: 1))!
+        let febReset = calendar.date(from: DateComponents(year: 2025, month: 3, day: 1))!
+        let febNow = febStart.addingTimeInterval(86_400)
+        precondition(computeBillingCycle(
+            totalCredits: 300, monthlyBudgetUSD: 150,
+            startAt: febStart, resetAt: febReset, now: febNow,
+            calendar: calendar, excludeWeekends: true
+        ) == nil, "a weekend opening has no working-day rate yet")
+        let augStart = reset
+        let augReset = calendar.date(from: DateComponents(year: 2025, month: 9, day: 1))!
+        let augNow = calendar.date(from: DateComponents(year: 2025, month: 8, day: 29))!
+        precondition(computeBillingCycle(
+            totalCredits: 300, monthlyBudgetUSD: 150,
+            startAt: augStart, resetAt: augReset, now: augNow,
+            calendar: calendar, excludeWeekends: true
+        ) == nil, "no forecast remains once all working days have elapsed")
+        let anniversaryStart = calendar.date(from: DateComponents(year: 2025, month: 6, day: 25))!
+        let anniversaryReset = calendar.date(from: DateComponents(year: 2025, month: 7, day: 25))!
+        let anniversaryNow = calendar.date(from: DateComponents(year: 2025, month: 7, day: 15))!
+        let anniversary = computeBillingCycle(
             totalCredits: 2_100, monthlyBudgetUSD: 150,
             startAt: anniversaryStart, resetAt: anniversaryReset,
-            now: now, calendar: cal
-        ) {
-            check("anniversary projection uses 21/30 cycle days",
-                  p.daysElapsed == 21 && p.daysInPeriod == 30)
-            check("anniversary projection ends at reset",
-                  p.endLabel == "Jul 25")
-            check("anniversary projection uses cycle pace",
-                  abs(p.projectedCredits - 3_000) < 1e-6)
-        } else {
-            check("anniversary cycle returns a projection", false)
+            now: anniversaryNow, calendar: calendar
+        )!
+        precondition(anniversary.daysElapsed == 21 && anniversary.daysInPeriod == 30)
+        precondition(anniversary.endLabel == "Jul 25" && anniversary.projectedCredits == 3_000)
+        let partialStart = calendar.date(from: DateComponents(
+            year: 2030, month: 3, day: 31, hour: 18
+        ))!
+        let partialReset = calendar.date(from: DateComponents(
+            year: 2030, month: 4, day: 30, hour: 8
+        ))!
+        let partialNow = calendar.date(from: DateComponents(
+            year: 2030, month: 4, day: 28, hour: 18
+        ))!
+        let partial = computeBillingCycle(
+            totalCredits: 2_900, monthlyBudgetUSD: 150,
+            startAt: partialStart, resetAt: partialReset, now: partialNow,
+            calendar: calendar
+        )
+        precondition(partial?.daysElapsed == 29 && partial?.daysInPeriod == 31
+                        && partial?.projectedCredits == 3_100,
+                     "non-midnight endpoints must count both partial UTC days")
+        precondition(computeBillingCycle(
+            totalCredits: 2_900, monthlyBudgetUSD: 150,
+            startAt: partialStart, resetAt: partialReset,
+            now: calendar.startOfDay(for: partialReset), calendar: calendar
+        ) == nil, "the projection must stop on the final partial UTC day")
+        BudgetInput.verify { name, passed in
+            precondition(passed, name)
         }
-
-        BudgetInput.verify(check)
-
-        err.write(Data("verify-projection: \(fail == 0 ? "PASS" : "FAIL") — \(pass) ok, \(fail) failed\n".utf8))
-        if fail > 0 { exit(1) }
+        print("Billing-cycle projection verification passed")
     }
 }
 
@@ -536,58 +195,18 @@ enum Fmt {
         String(format: "%.2f", n)
     }
 
-    /// 4 decimal places — used only by the `--dump` output.
-    static func credits4(_ n: Double) -> String {
-        String(format: "%.4f", n)
-    }
-
-    /// USD from credits (100 credits = $1.00), e.g. "$10.94".
-    static func cost(_ credits: Double) -> String {
-        String(format: "$%.2f", credits / 100.0)
-    }
-
-    /// USD from a dollar amount directly, e.g. "$5.00".
-    static func dollars(_ usd: Double) -> String {
-        String(format: "$%.2f", usd)
-    }
-
     /// USD without trailing ".00" for whole amounts, e.g. "$150" or "$99.50".
     static func money(_ usd: Double) -> String {
         usd == usd.rounded() ? String(format: "$%.0f", usd) : String(format: "$%.2f", usd)
-    }
-
-    private static let grouping: NumberFormatter = {
-        let f = NumberFormatter()
-        f.numberStyle = .decimal
-        f.maximumFractionDigits = 0
-        return f
-    }()
-
-    /// Thousands-separated integer, e.g. "14,641,544".
-    static func int(_ n: Int) -> String {
-        grouping.string(from: NSNumber(value: n)) ?? "\(n)"
     }
 
     /// Money for a chart axis, in a caller-supplied currency and at a caller-
     /// chosen precision. The precision must come from the axis' own tick step,
     /// not from the value: a step of 2.5 formatted to whole dollars labels its
     /// gridlines "$2" and "$8", which are simply the wrong numbers.
-    /// Separate from `money`/`dollars`, which are USD-only by construction.
+    /// Separate from `money`, which is USD-only by construction.
     static func axisMoney(_ amount: Double, symbol: String, decimals: Int) -> String {
         symbol + String(format: "%.\(decimals)f", amount)
-    }
-
-    /// Abbreviated token count: 1,397 → "1.4K", 86,264,060 → "86.3M",
-    /// 2,100,000,000 → "2.1B". One decimal below 100, none at/above.
-    static func tokens(_ n: Int) -> String {
-        func scaled(_ v: Double, _ suffix: String) -> String {
-            String(format: v >= 100 ? "%.0f" : "%.1f", v) + suffix
-        }
-        let a = abs(n)
-        if a >= 1_000_000_000 { return scaled(Double(n) / 1_000_000_000, "B") }
-        if a >= 1_000_000     { return scaled(Double(n) / 1_000_000, "M") }
-        if a >= 1_000         { return scaled(Double(n) / 1_000, "K") }
-        return "\(n)"
     }
 
     private static let dateFmt: DateFormatter = {
@@ -602,9 +221,4 @@ enum Fmt {
         dateFmt.string(from: Date(timeIntervalSince1970: Double(ms) / 1000.0))
     }
 
-    /// Truncate long ids to "prefix…suffix" (16 visible chars).
-    static func shortId(_ id: String) -> String {
-        guard id.count > 16 else { return id }
-        return "\(id.prefix(8))…\(id.suffix(8))"
-    }
 }

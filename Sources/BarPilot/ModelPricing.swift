@@ -400,15 +400,20 @@ final class ModelPricingStore: ObservableObject {
         guard !loadedCache else { return }
         loadedCache = true
 
-        var cacheIsFresh = false
-        if let cached = ModelPricingCache.load() {
-            catalog = cached.catalog
-            origin = .cache
-            lastCheckedAt = cached.modifiedAt
-            cacheIsFresh = Date().timeIntervalSince(cached.modifiedAt)
-                < ModelPricingCache.refreshInterval
+        if let cached = ModelPricingCache.load(),
+           applyCachedCatalog(cached.catalog, modifiedAt: cached.modifiedAt),
+           Date().timeIntervalSince(cached.modifiedAt) < ModelPricingCache.refreshInterval {
+            return
         }
-        if !cacheIsFresh { await refresh(force: true) }
+        await refresh(force: true)
+    }
+
+    fileprivate func applyCachedCatalog(_ cached: ModelPricingCatalog, modifiedAt: Date) -> Bool {
+        guard cached.generatedAt >= catalog.generatedAt else { return false }
+        catalog = cached
+        origin = .cache
+        lastCheckedAt = modifiedAt
+        return true
     }
 
     func refresh(force: Bool = true) async {
@@ -1476,7 +1481,7 @@ private enum ModelPricingFormat {
 
 extension ModelPricingCatalog {
     /// A compact first-launch/offline snapshot of the agreed shortlist. Network
-    /// and cached catalogues replace it as soon as either is available.
+    /// and cached catalogues can replace it when their snapshot is as recent.
     static let bundledFallback = ModelPricingCatalog(
         schemaVersion: 2,
         generatedAt: ISO8601DateFormatter().date(from: "2026-09-05T01:36:08Z")!,
@@ -1662,8 +1667,25 @@ enum ModelPricingVerification {
             precondition(Set(catalog.models.map(\.id)) == ModelPricingStore.defaultShortlist)
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
-            let decoded = try ModelPricingCodec.decode(encoder.encode(catalog)).validated()
+            let encoded = try encoder.encode(catalog)
+            let decoded = try ModelPricingCodec.decode(encoded).validated()
             precondition(decoded == catalog)
+            var snapshot = try JSONSerialization.jsonObject(with: encoded) as! [String: Any]
+            let formatter = ISO8601DateFormatter()
+            let storedAt = catalog.generatedAt.addingTimeInterval(2 * 86_400)
+            snapshot["generatedAt"] = formatter.string(
+                from: catalog.generatedAt.addingTimeInterval(-86_400)
+            )
+            let older = try ModelPricingCodec.decode(JSONSerialization.data(withJSONObject: snapshot))
+            let store = ModelPricingStore()
+            precondition(!store.applyCachedCatalog(older, modifiedAt: storedAt))
+            precondition(store.catalog == catalog && store.origin == .bundled && store.lastCheckedAt == nil)
+            snapshot["generatedAt"] = formatter.string(
+                from: catalog.generatedAt.addingTimeInterval(86_400)
+            )
+            let newer = try ModelPricingCodec.decode(JSONSerialization.data(withJSONObject: snapshot))
+            precondition(store.applyCachedCatalog(newer, modifiedAt: storedAt))
+            precondition(store.catalog == newer && store.origin == .cache && store.lastCheckedAt == storedAt)
             let sol = catalog.models.first { $0.id == "openai:gpt-5.6-sol" }!
             precondition(catalog.schemaVersion == 2)
             precondition(catalog.communityPreferenceSource?.publisher == "LM Arena")

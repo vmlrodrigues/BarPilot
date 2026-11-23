@@ -2,6 +2,39 @@
 
 All notable changes to BarPilot are documented here.
 
+## [Unreleased]
+
+### Removed
+- **Legacy local telemetry usage** (#57): removed attribution tabs, telemetry
+  ingestion, backfill, exporter monitoring and setup controls. Current usage
+  comes only from GitHub account counters and is unavailable after a failed poll
+  or disconnect. Saved counter history and cycle budgets remain intact.
+- Retired telemetry-only headless commands. Multi-Mac sync retains empty `rows`
+  for compatibility with older schema-v3 peers.
+- **Old telemetry setup is cleaned up automatically in signed releases.** BarPilot
+  removes its old Copilot telemetry login agent and helper. It clears session
+  variables only for its own active file exporter.
+
+### Fixed
+- **BarPilot no longer crashes during startup while identifying the build.**
+  Signature inspection no longer re-enters the main run loop during cached
+  initialization, including when macOS launches the app at login.
+- Stale GitHub observations stay unavailable, a clock-ahead peer cannot hide a
+  fresh poll, and resolving the account no longer makes refresh wait for Gist sync.
+- Zero-usage cycles roll over correctly. Saved billing history remains browsable
+  offline, the calendar uses observed month-end resets, and a selected day's
+  spend follows the current account's observations.
+- Ambiguous rollover readings stay out of daily spend. A fresh direct total can
+  appear as provisional a day after a missed reset. Early reset boundaries retain
+  the previous cycle’s recorded spend, and a fresh poll replaces previously
+  cached activity for its cycle.
+- Multi-Mac sync verifies that its Gist is secret before using it.
+- Automatic and manual update checks share one installer. Bundle replacement is
+  atomic. The updater keeps the original until the replacement confirms startup,
+  and interrupted updates can recover on the next launch. (#44)
+- The pricing catalogue keeps the newer bundled snapshot when the offline cache
+  predates it.
+
 ## [0.12.0] — 2026-09-11
 
 ### Added

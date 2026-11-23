@@ -5,17 +5,17 @@ import CryptoKit
 // SyncAggregate — the versioned per-machine payload used for multi-Mac sync.
 //
 // Counter observations are account-wide and are merged, never summed. Legacy
-// telemetry aggregates remain in the schema only while the old interface is
-// available. No raw spans, prompts, or content are synced.
+// telemetry rows are a wire-compatibility field only: outgoing rows are empty
+// and incoming rows never contribute to usage. No prompts or content are synced.
 //
 // This file is transport-agnostic: it computes and serializes the payload.
 // Pushing/pulling it lives behind SyncBackend (added later).
 // ---------------------------------------------------------------------------
 
-/// One (UTC-day, model, reasoning-level) bucket with regression cross-products.
+/// Compatibility shape for older peers. Never generated or used for usage.
 struct AggregateRow: Codable, Sendable {
     var utcDay: String        // "YYYY-MM-DD", UTC
-    var model: String         // normalized (Aggregator.normaliseModel)
+    var model: String
     var level: String?        // normalized reasoning level; nil = none
     var calls: Int
     var credits: Double
@@ -92,8 +92,7 @@ enum SyncAggregate {
     static let maximumSyncedCreditSamples = 6_144
     static let maximumPayloadBytes = 8 * 1_024 * 1_024
     /// Bounds the complete peer snapshot as well as each individual payload.
-    /// Together with the per-row limits below, this keeps every combined integer
-    /// accumulation inside a signed 64-bit `Int` on supported Macs.
+    /// Peer snapshots must stay bounded even when older Macs publish telemetry.
     static let maximumMachinePayloads = 64
     private static let maximumAggregateRows = 50_000
     // Copilot did not exist before this range, and no retained observation needs
@@ -102,9 +101,7 @@ enum SyncAggregate {
     // formed with `resetDayMs + dayMs`.
     private static let earliestTimestampMs: Int64 = 946_684_800_000 // 2000-01-01
     private static let latestTimestampMs: Int64 = 4_102_444_800_000 // 2100-01-01
-    // Aggregate values are summed across rows and machines. These ceilings are
-    // many orders above plausible personal usage while keeping every integer
-    // accumulation safely inside 64-bit `Int` for the bounded payload shape.
+    // Validate older peers' wire rows without using them for account usage.
     private static let maximumIntegerAggregate = 1_000_000_000_000
     private static let maximumCreditAggregate = 1_000_000_000_000.0
     private static let maximumRegressionAggregate = 1.0e30
@@ -193,47 +190,22 @@ enum SyncAggregate {
 
     private static func isValidUTCDay(_ value: String) -> Bool {
         guard value.count == 10 else { return false }
-        let timestamp = Aggregator.utcMidnightMs(value)
+        let timestamp = CreditCycle.utcMidnightMs(value)
         return isValidTimestamp(timestamp)
-            && Aggregator.utcDayStr(timestamp) == value
+            && CreditCycle.utcDayStr(timestamp) == value
     }
 
     /// Project local-only data into the payload for this machine. Re-publishing
     /// pulled observations would create feedback loops, so callers must never pass
     /// remote samples here.
-    static func project(_ records: [UsageRecord], creditSamples: [CreditSample] = [],
+    static func project(creditSamples: [CreditSample] = [],
                         cycleBudgets: [SyncedCycleBudget] = [],
                         accountFingerprint: String? = nil,
                         exchangeRateSnapshot: ExchangeRateSnapshot? = nil,
                         machineId: String, label: String?, updatedAt: String) -> MachineSyncPayload {
-        struct Key: Hashable { let day: String; let model: String; let level: String? }
-        struct Acc {
-            var calls = 0; var credits = 0.0; var inTok = 0; var outTok = 0
-            var sii = 0.0, soo = 0.0, sio = 0.0, sic = 0.0, soc = 0.0, scc = 0.0
-        }
-        var acc: [Key: Acc] = [:]
-        for r in records {
-            let k = Key(day: Aggregator.utcDayStr(r.startMs),
-                        model: Aggregator.normaliseModel(r.model ?? "unknown"),
-                        level: Aggregator.normaliseLevel(r.reasoningLevel))
-            let i = Double(r.inputTokens), o = Double(r.outputTokens), c = r.credits
-            var a = acc[k] ?? Acc()
-            a.calls += 1; a.credits += c; a.inTok += r.inputTokens; a.outTok += r.outputTokens
-            a.sii += i*i; a.soo += o*o; a.sio += i*o; a.sic += i*c; a.soc += o*c; a.scc += c*c
-            acc[k] = a
-        }
-        let rows = acc.map { k, a in
-            AggregateRow(utcDay: k.day, model: k.model, level: k.level,
-                         calls: a.calls, credits: a.credits, inTok: a.inTok, outTok: a.outTok,
-                         sii: a.sii, soo: a.soo, sio: a.sio, sic: a.sic, soc: a.soc, scc: a.scc)
-        }.sorted {
-            if $0.utcDay != $1.utcDay { return $0.utcDay < $1.utcDay }
-            if $0.model != $1.model { return $0.model < $1.model }
-            return ($0.level ?? "") < ($1.level ?? "")
-        }
         return MachineSyncPayload(
             schemaVersion: schemaVersion, machineId: machineId,
-            machineLabel: label, updatedAt: updatedAt, rows: rows,
+            machineLabel: label, updatedAt: updatedAt, rows: [],
             accountFingerprint: accountFingerprint,
             creditSamples: accountFingerprint == nil
                 ? nil
@@ -265,27 +237,8 @@ enum SyncAggregate {
             return local
         }
 
-        struct RowKey: Hashable {
-            let day: String
-            let model: String
-            let level: String?
-        }
-        var rows: [RowKey: AggregateRow] = [:]
-        for row in remote.rows {
-            rows[RowKey(day: row.utcDay, model: row.model, level: row.level)] = row
-        }
-        // A local projection is the current view of a bucket. The remote copy is
-        // retained only for buckets no longer present locally after cache loss.
-        for row in local.rows {
-            rows[RowKey(day: row.utcDay, model: row.model, level: row.level)] = row
-        }
-
         var result = local
-        result.rows = rows.values.sorted {
-            if $0.utcDay != $1.utcDay { return $0.utcDay < $1.utcDay }
-            if $0.model != $1.model { return $0.model < $1.model }
-            return ($0.level ?? "") < ($1.level ?? "")
-        }
+        result.rows = []
         result.exchangeRateSnapshot = local.exchangeRateSnapshot
             ?? remote.exchangeRateSnapshot
 
@@ -422,7 +375,9 @@ enum SyncAggregate {
     /// newest (live) cycle. Completed cycles retain the first, high-water and
     /// last sample of each UTC day: that preserves correction-aware attribution
     /// while reducing a year of history from ~39,000 rows to hundreds.
-    /// Reset-time variants on the same UTC day belong to the same cycle.
+    /// Also keep the first observation that can establish an early boundary
+    /// after the preceding cycle's final observation. Reset-time variants on
+    /// the same UTC day belong to the same cycle.
     static func compactCreditSamples(_ samples: [CreditSample]) -> [CreditSample] {
         struct Bucket: Hashable {
             var resetDayMs: Int64
@@ -442,15 +397,22 @@ enum SyncAggregate {
             let rhs = effectiveAt($1)
             return lhs == rhs ? $0.capturedAtMs < $1.capturedAtMs : lhs < rhs
         }
-        let detailedCycle = ordered.map {
-            CreditCycleSummary.dayStart(for: $0.resetAtMs)
-        }.max()
+        var lastByCycle: [Int64: CreditSample] = [:]
+        for sample in ordered {
+            lastByCycle[CreditCycleSummary.dayStart(for: sample.resetAtMs)] = sample
+        }
+        let detailedCycle = lastByCycle.keys.max()
+        let precedingObservations = precedingCycleObservations(latestByCycle: lastByCycle)
         var firstByBucket: [Bucket: CreditSample] = [:]
         var lastByCompletedDay: [Bucket: CreditSample] = [:]
         var peakByCompletedDay: [Bucket: CreditSample] = [:]
-        var lastByCycle: [Int64: CreditSample] = [:]
+        var firstAfterPreceding: [Int64: CreditSample] = [:]
         for sample in ordered {
             let resetDay = CreditCycleSummary.dayStart(for: sample.resetAtMs)
+            if firstAfterPreceding[resetDay] == nil,
+               let preceding = precedingObservations[resetDay], sample.observedAtMs > preceding {
+                firstAfterPreceding[resetDay] = sample
+            }
             let bucketWidth = resetDay == detailedCycle
                 ? Int64(15 * 60 * 1000)
                 : CreditCycleSummary.dayMs
@@ -467,12 +429,12 @@ enum SyncAggregate {
                     peakByCompletedDay[bucket] = sample
                 }
             }
-            lastByCycle[resetDay] = sample
         }
         var retained: [RetainedKey: CreditSample] = [:]
         for group in [
             Array(firstByBucket.values), Array(peakByCompletedDay.values),
-            Array(lastByCompletedDay.values), Array(lastByCycle.values)
+            Array(lastByCompletedDay.values), Array(lastByCycle.values),
+            Array(firstAfterPreceding.values)
         ] {
             for sample in group {
                 retained[RetainedKey(
@@ -538,27 +500,55 @@ enum SyncAggregate {
         local: [CreditCycleSummary],
         additionalSamples: [CreditSample]
     ) -> [CreditCycleSummary] {
-        var latestByDay = Dictionary(
-            uniqueKeysWithValues: local.map {
-                ($0.resetDayMs, $0.latestSample)
-            }
-        )
+        let localByDay = Dictionary(uniqueKeysWithValues: local.map { ($0.resetDayMs, $0) })
+        var cyclesByDay = localByDay
         for sample in additionalSamples {
             let day = CreditCycleSummary.dayStart(for: sample.resetAtMs)
-            let sampleAt = sample.serverAtMs ?? sample.capturedAtMs
-            let previous = latestByDay[day]
-            let previousAt = previous.map {
-                $0.serverAtMs ?? $0.capturedAtMs
-            } ?? .min
-            if sampleAt > previousAt
-                || (sampleAt == previousAt
-                    && sample.capturedAtMs >= (previous?.capturedAtMs ?? .min)) {
-                latestByDay[day] = sample
+            guard let previous = cyclesByDay[day] else {
+                cyclesByDay[day] = CreditCycleSummary(latestSample: sample)
+                continue
+            }
+            let earlier = min(sample.observedAtMs, previous.firstObservedAtMs)
+            let latest = previous.latestSample
+            let isNewer = sample.observedAtMs > latest.observedAtMs
+                || (sample.observedAtMs == latest.observedAtMs && sample.capturedAtMs >= latest.capturedAtMs)
+            guard isNewer || earlier < previous.firstObservedAtMs else { continue }
+            cyclesByDay[day] = CreditCycleSummary(
+                latestSample: isNewer ? sample : latest, firstObservedAtMs: earlier
+            )
+        }
+
+        let precedingObservations = precedingCycleObservations(latestByCycle: cyclesByDay.mapValues(\.latestSample))
+        var firstAfterPreceding: [Int64: Int64] = [:]
+        for sample in additionalSamples {
+            let day = CreditCycleSummary.dayStart(for: sample.resetAtMs)
+            let observedAt = sample.observedAtMs
+            if let preceding = precedingObservations[day], observedAt > preceding {
+                firstAfterPreceding[day] = min(firstAfterPreceding[day] ?? observedAt, observedAt)
             }
         }
-        return latestByDay.values
-            .map { CreditCycleSummary(latestSample: $0) }
-            .sorted { $0.resetDayMs > $1.resetDayMs }
+        return cyclesByDay.values.map { cycle in
+            guard let preceding = precedingObservations[cycle.resetDayMs],
+                  cycle.firstObservedAtMs <= preceding else {
+                return CreditCycleSummary(latestSample: cycle.latestSample, firstObservedAtMs: cycle.firstObservedAtMs)
+            }
+            let local = localByDay[cycle.resetDayMs]
+            let firstAfter = [
+                local?.firstObservedAtMs, local?.firstObservationAfterPrecedingCycleAtMs,
+                firstAfterPreceding[cycle.resetDayMs], cycle.latestSample.observedAtMs
+            ].compactMap { $0 }.filter { $0 > preceding }.min()
+            return CreditCycleSummary(
+                latestSample: cycle.latestSample, firstObservedAtMs: cycle.firstObservedAtMs,
+                firstObservationAfterPrecedingCycleAtMs: firstAfter
+            )
+        }.sorted { $0.resetDayMs > $1.resetDayMs }
+    }
+
+    private static func precedingCycleObservations(latestByCycle: [Int64: CreditSample]) -> [Int64: Int64] {
+        let ordered = latestByCycle.sorted { $0.key < $1.key }
+        return Dictionary(uniqueKeysWithValues: zip(ordered.dropFirst(), ordered).map { current, preceding in
+            (current.key, preceding.value.observedAtMs)
+        })
     }
 
     /// Select the newest valid account-counter observation available to this
@@ -568,10 +558,20 @@ enum SyncAggregate {
         local: CreditSample?,
         remotes: [MachineSyncPayload],
         accountFingerprint: String?,
+        localWasDirectlyPolled: Bool = false,
+        knownCycles: [CreditCycleSummary] = [],
         now: Date = Date()
     ) -> CurrentCreditObservation? {
+        let rangesByDay = Dictionary(uniqueKeysWithValues: knownCycles.compactMap { cycle in
+            CreditCycle.range(for: cycle, in: knownCycles).map { (cycle.id, $0) }
+        })
+        func isEligible(_ sample: CreditSample, directlyPolled: Bool) -> Bool {
+            let cycleDay = CreditCycleSummary.dayStart(for: sample.resetAtMs)
+            return CreditCycle.isCurrentCycle(sample, knownRange: rangesByDay[cycleDay], now: now)
+                && CreditCycle.hasArrived(sample, directlyPolled: directlyPolled, now: now)
+        }
         var candidates: [CurrentCreditObservation] = []
-        if let local, CreditReconciliation.isCurrentCycle(local, now: now) {
+        if let local, isEligible(local, directlyPolled: localWasDirectlyPolled) {
             candidates.append(CurrentCreditObservation(
                 sample: local, cameFromRemote: false
             ))
@@ -581,12 +581,12 @@ enum SyncAggregate {
                 .filter { $0.accountFingerprint == accountFingerprint }
                 .flatMap { $0.creditSamples ?? [] }
                 .map(\.creditSample)
-                .filter { CreditReconciliation.isCurrentCycle($0, now: now) }
+                .filter { isEligible($0, directlyPolled: false) }
                 .map { CurrentCreditObservation(sample: $0, cameFromRemote: true) }
         }
         return candidates.max {
-            let lhs = $0.sample.serverAtMs ?? $0.sample.capturedAtMs
-            let rhs = $1.sample.serverAtMs ?? $1.sample.capturedAtMs
+            let lhs = $0.sample.observedAtMs
+            let rhs = $1.sample.observedAtMs
             if lhs != rhs { return lhs < rhs }
             // Prefer the direct local observation on an exact timestamp tie.
             if $0.cameFromRemote != $1.cameFromRemote {
@@ -608,14 +608,9 @@ enum SyncAggregate {
         BudgetPersistenceCompletionPolicy.verify()
         SyncPublishPolicy.verify()
         GitHubBackend.verifyDiscoveryPolicy()
-        let (records, _) = DataSources.loadAll()
-        let today = PeriodResolver.todayStr()
-        let range = PeriodResolver.range(kind: .allTime, customFrom: Date(), customTo: Date())
-        let raw = Aggregator.build(records: records, fromStr: range.from, toStr: range.to, todayStr: today)
-
         // Project, then round-trip through JSON to also exercise Codable + size.
-        let sampleStart = Aggregator.utcMidnightMs("2030-01-10")
-        let reset = Aggregator.utcMidnightMs("2030-02-01")
+        let sampleStart = CreditCycle.utcMidnightMs("2030-01-10")
+        let reset = CreditCycle.utcMidnightMs("2030-02-01")
         let sampleFixture = [
             CreditSample(capturedAtMs: sampleStart, serverAtMs: nil, resetAtMs: reset, creditsUsed: 100),
             CreditSample(capturedAtMs: sampleStart + 60_000, serverAtMs: nil, resetAtMs: reset, creditsUsed: 100),
@@ -633,7 +628,7 @@ enum SyncAggregate {
             sourceMachineId: "self"
         )
         let agg = project(
-            records, creditSamples: sampleFixture,
+            creditSamples: sampleFixture,
             cycleBudgets: [budgetFixture],
             accountFingerprint: "same-account",
             exchangeRateSnapshot: rateFixture,
@@ -642,10 +637,14 @@ enum SyncAggregate {
         let data = try! JSONEncoder().encode(agg)
         let decoded = try! JSONDecoder().decode(MachineSyncPayload.self, from: data)
         precondition(decoded.schemaVersion == 3
+                     && decoded.rows.isEmpty
                      && decoded.creditSamples?.count == 3
                      && decoded.cycleBudgets == [budgetFixture]
                      && decoded.exchangeRateSnapshot == rateFixture,
                      "sync v3 must retain counter history, cycle budgets, and the exchange-rate snapshot")
+        let wire = try! JSONSerialization.jsonObject(with: data) as? [String: Any]
+        precondition((wire?["rows"] as? [Any])?.isEmpty == true,
+                     "older peers require the rows field even when it is empty")
         let originalFingerprint = contentFingerprint(agg)
         var timestampOnlyChange = agg
         timestampOnlyChange.updatedAt = "later"
@@ -713,7 +712,7 @@ enum SyncAggregate {
         )
         var implausibleClockPayload = agg
         implausibleClockPayload.creditSamples = [SyncedCreditSample(CreditSample(
-            capturedAtMs: Aggregator.utcMidnightMs("2099-01-01"),
+            capturedAtMs: CreditCycle.utcMidnightMs("2099-01-01"),
             serverAtMs: nil,
             resetAtMs: reset,
             creditsUsed: 1
@@ -798,14 +797,14 @@ enum SyncAggregate {
                 && contentFingerprint(oversizedOutgoingPayload) == nil,
             "a payload this build would reject must never be published"
         )
-        let olderReset = Aggregator.utcMidnightMs("2030-01-01")
+        let olderReset = CreditCycle.utcMidnightMs("2030-01-01")
         let olderBudget = SyncedCycleBudget(
             resetDayMs: olderReset, budgetUSD: 125,
             updatedAtMs: sampleStart - 3_600_000,
             sourceMachineId: "self"
         )
         let multiCycle = project(
-            [], creditSamples: sampleFixture + [
+            creditSamples: sampleFixture + [
                 CreditSample(
                     capturedAtMs: sampleStart - 3_600_000,
                     serverAtMs: nil,
@@ -824,7 +823,7 @@ enum SyncAggregate {
             "a sync payload must retain every locally stored billing cycle"
         )
         let emptySelf = project(
-            [], creditSamples: [], accountFingerprint: "same-account",
+            creditSamples: [], accountFingerprint: "same-account",
             machineId: "self", label: nil, updatedAt: "new"
         )
         let recoveredSelf = reconciledSelfPayload(
@@ -837,6 +836,17 @@ enum SyncAggregate {
         precondition(
             recoveredSelf.cycleBudgets == multiCycle.cycleBudgets,
             "a recreated local database must recover historical cycle budgets"
+        )
+        var oldSelf = agg
+        oldSelf.rows = [validRow]
+        let retiredSelf = reconciledSelfPayload(
+            local: emptySelf, remote: oldSelf, recoverRemoteHistory: true
+        )
+        precondition(
+            decodeSupportedPayload(try! JSONEncoder().encode(oldSelf)) != nil
+                && retiredSelf.rows.isEmpty
+                && retiredSelf.creditSamples == agg.creditSamples,
+            "older peer telemetry must remain decodable but never be republished"
         )
         precondition(
             cycleBudget(
@@ -869,7 +879,7 @@ enum SyncAggregate {
             "invalid legacy targets must be discarded before publishing"
         )
         let disconnectedSelf = project(
-            [], machineId: "self", label: nil, updatedAt: "new"
+            machineId: "self", label: nil, updatedAt: "new"
         )
         precondition(
             reconciledSelfPayload(
@@ -879,7 +889,7 @@ enum SyncAggregate {
             "a disconnected install must preserve its published counter identity"
         )
         let switchedAccount = project(
-            [], creditSamples: [], accountFingerprint: "different-account",
+            creditSamples: [], accountFingerprint: "different-account",
             machineId: "self", label: nil, updatedAt: "new"
         )
         precondition(
@@ -981,7 +991,7 @@ enum SyncAggregate {
         // This is a valid upper-shape fixture, not malformed input: non-midnight
         // resets can make each completed cycle touch an extra UTC day, with three
         // distinct correction-aware observations retained for each day.
-        let detailedStart = Aggregator.utcMidnightMs("2031-01-01") + 60_000
+        let detailedStart = CreditCycle.utcMidnightMs("2031-01-01") + 60_000
         let detailedReset = detailedStart + 31 * CreditCycleSummary.dayMs
         var retentionFixture = [CreditSample(
             capturedAtMs: detailedStart, serverAtMs: nil,
@@ -1036,7 +1046,7 @@ enum SyncAggregate {
                 == maximumSyncedCreditSamples,
             "malformed or oversized counter history must respect the payload ceiling"
         )
-        let remoteOnlyReset = Aggregator.utcMidnightMs("2030-03-01")
+        let remoteOnlyReset = CreditCycle.utcMidnightMs("2030-03-01")
         let mergedCycles = mergedCreditCycles(
             local: [CreditCycleSummary(latestSample: sampleFixture.last!)],
             additionalSamples: [
@@ -1068,7 +1078,7 @@ enum SyncAggregate {
             resetAtMs: remoteOnlyReset, creditsUsed: 125
         )
         let remoteCurrent = project(
-            [], creditSamples: [remoteCurrentSample],
+            creditSamples: [remoteCurrentSample],
             accountFingerprint: "same-account",
             machineId: "remote", label: nil, updatedAt: ""
         )
@@ -1093,7 +1103,84 @@ enum SyncAggregate {
             tiedObservation?.cameFromRemote == false,
             "an equally current direct observation must win over its synced copy"
         )
-        let skewReset = Aggregator.utcMidnightMs("2030-04-01")
+        let futurePeerSample = CreditSample(
+            capturedAtMs: remoteCurrentSample.capturedAtMs + 120_000,
+            serverAtMs: nil, resetAtMs: remoteOnlyReset, creditsUsed: 127
+        )
+        let futurePeer = project(
+            creditSamples: [futurePeerSample],
+            accountFingerprint: "same-account",
+            machineId: "clock-ahead", label: nil, updatedAt: ""
+        )
+        let validObservation = currentCreditObservation(
+            local: remoteCurrentSample, remotes: [futurePeer],
+            accountFingerprint: "same-account", now: currentNow
+        )
+        precondition(
+            validObservation?.cameFromRemote == false
+                && CreditCycle.visibleCurrentCredits(
+                    sample: validObservation?.sample, connected: true,
+                    pollFailed: false, hasSuccessfulPoll: true, now: currentNow
+                ) == remoteCurrentSample.creditsUsed,
+            "future peer timestamps must not hide an eligible local observation"
+        )
+        let modestFutureServer = CreditSample(
+            capturedAtMs: remoteCurrentSample.capturedAtMs,
+            serverAtMs: remoteCurrentSample.capturedAtMs + 15_000,
+            resetAtMs: remoteOnlyReset, creditsUsed: 126
+        )
+        let futureServerPeer = project(
+            creditSamples: [modestFutureServer],
+            accountFingerprint: "same-account",
+            machineId: "future-server-peer", label: nil, updatedAt: ""
+        )
+        precondition(
+            currentCreditObservation(
+                local: remoteCurrentSample, remotes: [futureServerPeer],
+                accountFingerprint: "same-account",
+                localWasDirectlyPolled: true, now: currentNow
+            )?.sample == remoteCurrentSample,
+            "even a modest future server timestamp must remain ineligible from a peer"
+        )
+        precondition(
+            currentCreditObservation(
+                local: modestFutureServer, remotes: [remoteCurrent],
+                accountFingerprint: "same-account",
+                localWasDirectlyPolled: true, now: currentNow
+            )?.sample == modestFutureServer,
+            "a direct poll with a modest server clock lead must be eligible"
+        )
+        precondition(
+            currentCreditObservation(
+                local: modestFutureServer, remotes: [remoteCurrent],
+                accountFingerprint: "same-account", now: currentNow
+            )?.sample == remoteCurrentSample,
+            "a persisted sample must not receive the direct-poll clock allowance"
+        )
+        let reportedReset = CreditCycle.utcMidnightMs("2030-09-01")
+        let beforeReportedReset = Date(timeIntervalSince1970: Double(reportedReset - 60_000) / 1_000)
+        let endingCycle = CreditSample(
+            capturedAtMs: reportedReset - 120_000, serverAtMs: nil,
+            resetAtMs: reportedReset, creditsUsed: 90
+        )
+        let earlyRollover = CreditSample(
+            capturedAtMs: reportedReset - 60_000, serverAtMs: nil,
+            resetAtMs: CreditCycle.utcMidnightMs("2030-10-01"), creditsUsed: 0
+        )
+        let rolloverPeer = project(
+            creditSamples: [earlyRollover], accountFingerprint: "same-account",
+            machineId: "rollover-peer", label: nil, updatedAt: ""
+        )
+        let observedCycles = mergedCreditCycles(
+            local: [CreditCycleSummary(latestSample: endingCycle)],
+            additionalSamples: [earlyRollover]
+        )
+        precondition(currentCreditObservation(
+            local: endingCycle, remotes: [rolloverPeer], accountFingerprint: "same-account",
+            knownCycles: observedCycles, now: beforeReportedReset
+        )?.sample == earlyRollover,
+        "a valid early rollover becomes current at its observed boundary")
+        let skewReset = CreditCycle.utcMidnightMs("2030-04-01")
         let serverNewer = CreditSample(
             capturedAtMs: sampleStart,
             serverAtMs: sampleStart + 3_600_000,
@@ -1186,13 +1273,13 @@ enum SyncAggregate {
         precondition(isolated.count == sampleFixture.count,
                      "counter observations from another account must be ignored")
 
-        let gapStart = Aggregator.utcMidnightMs("2030-01-10") + 23 * 3_600_000
+        let gapStart = CreditCycle.utcMidnightMs("2030-01-10") + 23 * 3_600_000
         let localGap = [
             CreditSample(capturedAtMs: gapStart, serverAtMs: nil, resetAtMs: reset, creditsUsed: 100),
             CreditSample(capturedAtMs: gapStart + 3 * 3_600_000, serverAtMs: nil, resetAtMs: reset, creditsUsed: 160)
         ]
         let remoteGap = project(
-            [], creditSamples: [
+            creditSamples: [
                 CreditSample(capturedAtMs: gapStart + 3_600_000, serverAtMs: nil, resetAtMs: reset, creditsUsed: 120),
                 CreditSample(capturedAtMs: gapStart + 2 * 3_600_000, serverAtMs: nil, resetAtMs: reset, creditsUsed: 150)
             ],
@@ -1207,41 +1294,8 @@ enum SyncAggregate {
                      && filledTimeline.unallocatedCredits == 0,
                      "remote observations must fill a local cross-day sampling gap")
 
-        struct S {
-            var calls = 0; var credits = 0.0; var inTok = 0; var outTok = 0
-            var sii = 0.0, soo = 0.0, sio = 0.0, sic = 0.0, soc = 0.0, scc = 0.0
-        }
-        var byModel: [String: S] = [:]
-        for r in decoded.rows {
-            var s = byModel[r.model] ?? S()
-            s.calls += r.calls; s.credits += r.credits; s.inTok += r.inTok; s.outTok += r.outTok
-            s.sii += r.sii; s.soo += r.soo; s.sio += r.sio; s.sic += r.sic; s.soc += r.soc; s.scc += r.scc
-            byModel[r.model] = s
-        }
-
-        func approx(_ a: Double, _ b: Double) -> Bool {
-            if a.isNaN && b.isNaN { return true }
-            if a.isNaN != b.isNaN { return false }
-            return abs(a - b) <= 1e-6 * max(1, abs(a), abs(b))
-        }
-        func fmtNaN(_ x: Double) -> String { x.isNaN ? "—" : String(format: "%.4f", x) }
-
         let err = FileHandle.standardError
-        err.write(Data("verify-sync: \(range.from) → \(range.to) · \(decoded.rows.count) rows · \(byModel.count) models · \(data.count) bytes JSON\n".utf8))
-        var allOK = byModel.count == raw.models.count
-        for m in raw.models {
-            guard let s = byModel[m.model] else { print("MISS \(m.model)"); allOK = false; continue }
-            let f = Aggregator.fitRates(sii: s.sii, soo: s.soo, sio: s.sio, sic: s.sic, soc: s.soc, scc: s.scc)
-            let ok = s.calls == m.calls && approx(s.credits, m.credits)
-                && approx(f.inRate, m.inRate) && approx(f.outRate, m.outRate) && approx(f.fit, m.fit)
-            if !ok { allOK = false }
-            print("\(ok ? "OK " : "XX ") \(m.model)  credits raw=\(Fmt.credits4(m.credits)) agg=\(Fmt.credits4(s.credits))  fit raw=\(fmtNaN(m.fit)) agg=\(fmtNaN(f.fit))")
-        }
-        precondition(allOK,
-                     "sync aggregate does not reproduce every raw model")
-        err.write(Data(
-            "verify-sync: PASS — aggregate reproduces the raw Models fit for every model\n".utf8
-        ))
+        err.write(Data("verify-sync: PASS - counter payloads and account isolation\n".utf8))
 
         // Always exercise persistence inside a throwaway database. Keeping the
         // isolation here means every caller—including `make verify` and CI—runs
@@ -1301,38 +1355,5 @@ enum SyncAggregate {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Combined-view preview (--sync-preview): pool this machine's real aggregate
-    // with ONE simulated identical second machine (a mirror), so the combined
-    // total is an obvious ×2. Demonstrates the payoff before any UI/transport.
-    // -----------------------------------------------------------------------
-    static func preview() {
-        let (records, _) = DataSources.loadAll()
-        let local = project(records, machineId: "this-mac", label: "this machine", updatedAt: "")
-        // Real sync pulls each OTHER machine's actual aggregate; here we mirror.
-        let sim = MachineSyncPayload(schemaVersion: schemaVersion, machineId: "sim-mac-2",
-                                   machineLabel: "simulated machine 2", updatedAt: "", rows: local.rows)
 
-        func perModel(_ macs: [MachineSyncPayload]) -> [String: (calls: Int, credits: Double)] {
-            var m: [String: (Int, Double)] = [:]
-            for mac in macs { for r in mac.rows {
-                var t = m[r.model] ?? (0, 0.0); t.0 += r.calls; t.1 += r.credits; m[r.model] = t
-            } }
-            return m
-        }
-        let localM = perModel([local]), combM = perModel([local, sim])
-        let localTotal = local.rows.reduce(0.0) { $0 + $1.credits }
-        let combTotal = [local, sim].flatMap { $0.rows }.reduce(0.0) { $0 + $1.credits }
-        func pad(_ s: String, _ n: Int) -> String { s.count >= n ? s : s + String(repeating: " ", count: n - s.count) }
-
-        let err = FileHandle.standardError
-        err.write(Data("sync-preview: simulating ONE identical second machine (a mirror); real sync pulls each other machine's actual aggregate.\n".utf8))
-        err.write(Data("Summary / Models / Daily / total combine across machines; Sessions & Top stay per-machine.\n\n".utf8))
-        print(pad("model", 24) + pad("this machine", 22) + "combined (2 machines)")
-        for model in localM.keys.sorted(by: { (localM[$0]?.credits ?? 0) > (localM[$1]?.credits ?? 0) }) {
-            let l = localM[model]!, c = combM[model] ?? (0, 0.0)
-            print(pad(model, 24) + pad("\(Fmt.cost(l.credits)) (\(l.calls))", 22) + "\(Fmt.cost(c.credits)) (\(c.calls))")
-        }
-        print(pad("TOTAL", 24) + pad(Fmt.cost(localTotal), 22) + Fmt.cost(combTotal))
-    }
 }

@@ -23,6 +23,6 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSHumanReadableCopyright</key>
-    <string>Reads local OTel telemetry. Network used only to check for app updates.</string>
+    <string>Tracks GitHub Copilot account credits, with optional multi-Mac sync.</string>
 </dict>
 </plist>

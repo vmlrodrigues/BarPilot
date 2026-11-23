@@ -20,8 +20,8 @@
   <a href="https://github.com/vmlrodrigues/BarPilot/releases/latest/download/BarPilot.dmg"><img alt="Download BarPilot for Mac" src="https://img.shields.io/badge/Download_for_Mac-007AFF?style=for-the-badge&amp;logo=apple&amp;logoColor=white"></a>
 </p>
 
-BarPilot keeps the current Copilot billing cycle in the menu bar, with the full
-breakdown one click away. It is built with SwiftUI and AppKit, contains no web
+BarPilot keeps the current Copilot billing cycle in the menu bar, with daily activity and history
+one click away. It is built with SwiftUI and AppKit, contains no web
 view, and stays out of the Dock. The dashboard keeps spend, budget progress and
 daily activity primary; model prices, billing history and multi-Mac sync remain
 close at hand without crowding the normal view.
@@ -54,15 +54,15 @@ See the [0.12.0 release notes](https://github.com/vmlrodrigues/BarPilot/releases
   rankings. The last valid catalogue remains available offline.
 - Optional private-Gist sync that combines observations from multiple Macs
   without double-counting the account-wide total.
-- Clear disconnected, stale and unavailable states while preserving the last
-  trustworthy reading.
-- A temporary, explicitly marked legacy telemetry view for per-model and
-  per-session detail during the transition to GitHub-backed usage data.
+- Clear disconnected, stale and unavailable states without displaying a cached
+  amount as current usage. Stored counter history remains available.
 
-The menu bar normally shows the current cycle's cost. A warning glyph appears
-when GitHub is disconnected, stale or unavailable, so an incomplete local
-fallback is never presented as current account data. Credits are shown to two
-decimal places; 100 credits equal US$1.00.
+The menu bar normally shows the current cycle's cost. If GitHub is disconnected,
+a poll fails, or no recent current-cycle counter is available, the amount is
+replaced with a dash. A cached amount is not shown as current until this launch
+has completed a successful GitHub poll, and GitHub's observation must also be
+recent. There is no local telemetry fallback. Credits are shown to two decimal
+places; 100 credits equal US$1.00.
 
 > [!NOTE]
 > **On first launch the menu-bar icon may not be visible if your menu bar is
@@ -97,7 +97,7 @@ can be assigned to that day, while an unsampled increase crossing a day boundary
 remains unallocated. Failed polls never write a zero.
 
 GitHub connection is the dashboard’s normal setup state, not an optional usage
-mode. If no credential is available, the window explains the local fallback and
+mode. If no credential is available, the window explains that usage is unavailable and
 offers **Connect GitHub**. Connection management also lives under
 **Settings → GitHub**. Disconnecting removes only this credential; saved
 observations and multi-machine sync remain intact.
@@ -134,27 +134,33 @@ replacement runs outside the UI actor and late cache or budget writes are
 discarded after sync or account generations change. Cached peer cycles are
 recombined with local history regardless of which launch read finishes first.
 
-## Legacy telemetry sources
+## Upgrading from legacy telemetry
 
-The deprecated detail view reads these attribution sources directly off disk:
+Local telemetry ingestion, attribution tabs, exporter monitoring, setup and
+backfill have been removed. All Copilot clients contributing to the connected
+account counter are included; there is no dependency on an IDE writing traces.
+GitHub's internal account endpoint remains unsupported and may change.
 
-| Source | Format | Path |
-|---|---|---|
-| VS Code Copilot Chat | SQLite | `~/Library/Application Support/Code/User/globalStorage/github.copilot-chat/agent-traces.db` |
-| GitHub Copilot Mac App | JSONL | `~/Library/Application Support/com.github.githubapp/agent-traces.jsonl` |
+When a signed release launches, BarPilot removes the telemetry-only `spans`
+table and its ingestion metadata. It retains the database file, including its
+account-counter observations, cycle budgets, identity, and account-adoption metadata.
+The historical `spans-cache.db` filename is retained to preserve upgrades.
+Schema-v3 sync still sends `rows: []` so older Macs can read the counter payload;
+their telemetry rows are never used or republished by this version.
 
-**Copilot for Xcode and JetBrains IDEs (Android Studio, IntelliJ, etc.) are not supported** — those clients do not write local OTel telemetry to disk. Support will follow if GitHub adds it.
+### Cleanup of previously enabled telemetry
 
-A source is silently skipped if its file is absent. Credits = `nano_aiu / 1e9`;
-cost = `credits / 100` (100 credits = $1.00). Model names are normalised so
-`claude-sonnet-4-6` (VS Code) and `claude-sonnet-4.6` (Mac App) merge.
+Signed release builds also unload and remove the old Copilot Mac app telemetry
+login agent and helper after checking BarPilot's ownership marker, agent label,
+and program path. Cleanup checks the loaded job's program and origin before
+unloading it. Session variables are cleared when the active file export
+path belongs to BarPilot and the variables still hold their original values.
+Cleanup retains the helper for retry if unloading or clearing fails. Relaunch
+the Copilot app afterwards so it picks up the updated session configuration.
 
-The account endpoint is internal and unsupported. Local telemetry remains
-available temporarily as a fallback and for the explicitly marked legacy view.
-
-The JSONL file is large (100 MB+), so it's memory-mapped and scanned in a single
-pass — only the few hundred lines carrying a usage attribute are JSON-parsed.
-A full refresh of both sources takes well under a second.
+VS Code settings and existing trace files are not changed or deleted; they may be
+used by other tools. Never delete BarPilot's live `spans-cache.db`, because it
+also contains counter history.
 
 ## Requirements
 
@@ -181,36 +187,39 @@ make local
 make run
 ```
 
-### Headless output
-
-The binary has a `--dump` mode that prints the per-model summary as JSON — handy
-for scripting or regression-checking the aggregation:
+### Headless verification
 
 ```sh
-.build/release/BarPilot --dump --from 2026-06-01 --to 2026-06-10
+make verify
+.build/debug/BarPilot --verify-credits
+.build/debug/BarPilot --verify-sync
+.build/debug/BarPilot --diagnose
 ```
+
+`--diagnose` reports configuration, storage counts and timing without usage
+amounts or credentials. Telemetry commands (`--dump`, `--sync-preview`,
+`--verify-incremental`, `--verify-watchdog`) now exit with an explicit removal
+message rather than starting the app.
 
 ## Project layout
 
 ```
 Sources/BarPilot/
   App.swift          Entry point (@main) + AppKit NSStatusItem & NSPopover host
-  Store.swift        UsageStore — loads, caches, re-aggregates, 60s refresh
-  Model.swift        Core types + formatting helpers
-  Sources.swift      SQLite + memory-mapped JSONL loaders; telemetry detection
-  Aggregator.swift   Date-range math, model normalisation, per-view rows
+  Store.swift        Account-counter history, budgets, sync and 60s refresh
+  Model.swift        Billing-cycle projection and formatting helpers
   CreditUsage.swift  GitHub account-counter client + defensive response parser
-  CreditSamples.swift Persistent cumulative credit samples
+  CreditSamples.swift Persistent samples, cycle budgets and telemetry retirement
+  TelemetryCleanup.swift Removes the old telemetry login agent and variables
   CreditTimeline.swift Conservative daily sample projection
-  CreditReconciliation.swift Server total + local attribution overlay
-  CompactDashboard.swift Primary current-cycle dashboard + legacy transition
-  ModelPricing.swift  Offline-first pricing catalogue client + interactive dialogue
-  SyncAggregate.swift Versioned counter-observation + legacy sync payload
+  CreditCycle.swift  UTC cycle rules, counter availability and regression checks
+  CompactDashboard.swift Current-cycle dashboard, calendar and activity chart
+  SettingsView.swift Budget, currency, GitHub, sync and general settings
+  ModelPricing.swift Offline-first pricing catalogue + interactive dialogue
+  SyncAggregate.swift Counter-observation payload + older-peer wire compatibility
   GitHubBackend.swift Private-gist multi-machine sync transport
-  DetailView.swift   Window UI: header, sparkline, budget bar, status footer
-  Tabs.swift         Summary / Models / Daily / Sessions / Top tables
-  Setup.swift        Native opt-in OTel telemetry enablement (the "Enable…" button)
-  Dump.swift         Headless --dump output path
+  RemoteStore.swift  Durable peer snapshot
+  Diagnose.swift     Privacy-safe support report
 Info.plist           LSUIElement (menu-bar-only) agent bundle metadata
 build-app.sh         Build + assemble the .app bundle
 Scripts/model_pricing_catalog.py  Builds the price + community-preference contract
@@ -234,7 +243,7 @@ If you truly see nothing, confirm it's running: `pgrep -lf BarPilot`.
 ## Notes
 
 - The app refreshes automatically every 60 seconds, on window open, and when you
-  press the refresh button. The legacy view remembers its selected period.
+  press the refresh button.
 - **Auto-update:** BarPilot checks GitHub for a newer release shortly after launch
   and every few hours. When one is found it downloads the notarised DMG, verifies
   it's signed by the same developer, then installs it and relaunches — silently, in

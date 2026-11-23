@@ -5,30 +5,65 @@ private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self
 
 struct CreditCycleSummary: Identifiable, Equatable {
     static let dayMs: Int64 = 24 * 60 * 60 * 1000
+    private static let adjacentResetTolerance: TimeInterval = 4 * 86_400
 
     let resetDayMs: Int64
     let latestSample: CreditSample
+    let firstObservedAtMs: Int64
+    let firstObservationAfterPrecedingCycleAtMs: Int64?
 
-    init(latestSample: CreditSample) {
+    init(
+        latestSample: CreditSample, firstObservedAtMs: Int64? = nil,
+        firstObservationAfterPrecedingCycleAtMs: Int64? = nil
+    ) {
         self.resetDayMs = Self.dayStart(for: latestSample.resetAtMs)
         self.latestSample = latestSample
+        self.firstObservedAtMs = firstObservedAtMs ?? latestSample.observedAtMs
+        self.firstObservationAfterPrecedingCycleAtMs = firstObservationAfterPrecedingCycleAtMs
     }
 
     var id: Int64 { resetDayMs }
     var resetAtMs: Int64 { latestSample.resetAtMs }
     var resetAt: Date { latestSample.resetAt }
-    var startAt: Date? { CreditReconciliation.cycleStart(for: latestSample) }
+    var startAt: Date? { CreditCycle.cycleStart(for: latestSample) }
+
+    func startAt(in cycles: [CreditCycleSummary]) -> Date? {
+        let preceding = cycles.first { $0.resetDayMs < resetDayMs }
+        return preceding.flatMap { startAt(after: $0) } ?? startAt
+    }
+
+    func endAt(in cycles: [CreditCycleSummary]) -> Date {
+        let following = cycles.last { $0.resetDayMs > resetDayMs }
+        return following.flatMap { $0.startAt(after: self) } ?? resetAt
+    }
+
+    private func startAt(after preceding: CreditCycleSummary) -> Date? {
+        // Monthly date arithmetic can clamp to a shorter month's last day.
+        // Use the preceding cycle's reported reset when it fits the cadence.
+        // Three days cover the difference in month lengths. The extra day
+        // allows the API's reset fields to differ in time-of-day.
+        guard let estimate = startAt,
+              abs(preceding.resetAt.timeIntervalSince(estimate)) < Self.adjacentResetTolerance
+        else { return nil }
+
+        // The earlier boundary must leave the preceding cycle's accepted
+        // observations inside its exclusive range. A stale timestamp on the
+        // opening poll cannot move that boundary behind saved spend.
+        let previousObservation = preceding.latestSample.observedAtMs
+        let earliestPossible = firstObservedAtMs > previousObservation
+            ? firstObservedAtMs : firstObservationAfterPrecedingCycleAtMs
+        if let earliestPossible, earliestPossible > previousObservation {
+            let observed = Date(timeIntervalSince1970: Double(earliestPossible) / 1_000)
+            if observed < preceding.resetAt,
+               preceding.resetAt.timeIntervalSince(observed) < Self.adjacentResetTolerance {
+                return observed
+            }
+        }
+        return preceding.resetAt <= latestSample.capturedAt ? preceding.resetAt : nil
+    }
 
     static func dayStart(for resetAtMs: Int64) -> Int64 {
         resetAtMs / dayMs * dayMs
-    }
-
-    static func liveCycleDay(
-        currentSample: CreditSample?,
-        cycles: [CreditCycleSummary]
-    ) -> Int64? {
-        currentSample.map { dayStart(for: $0.resetAtMs) }
-            ?? cycles.first?.resetDayMs
     }
 
     /// A UTC calendar day can straddle a non-midnight billing reset. Choose the
@@ -38,18 +73,9 @@ struct CreditCycleSummary: Identifiable, Equatable {
         containingUTCDate date: Date,
         in cycles: [CreditCycleSummary]
     ) -> CreditCycleSummary? {
-        let dateMs = Int64(date.timeIntervalSince1970 * 1000)
-        let dayStartMs = dayStart(for: dateMs)
-        let dayEndMs = dayStartMs + dayMs
         var best: (cycle: CreditCycleSummary, overlap: Int64)?
         for cycle in cycles {
-            guard let start = cycle.startAt else { continue }
-            let startMs = Int64(start.timeIntervalSince1970 * 1000)
-            let endMs = cycle.resetAtMs
-            let overlap = max(
-                0,
-                min(dayEndMs, endMs) - max(dayStartMs, startMs)
-            )
+            let overlap = cycle.overlapOnUTCDay(date, in: cycles)
             if overlap > (best?.overlap ?? 0) {
                 best = (cycle, overlap)
             }
@@ -57,18 +83,29 @@ struct CreditCycleSummary: Identifiable, Equatable {
         return best?.cycle
     }
 
+    func overlapOnUTCDay(_ date: Date, in cycles: [CreditCycleSummary]) -> Int64 {
+        guard let start = startAt(in: cycles) else { return 0 }
+        let dateMs = Int64(date.timeIntervalSince1970 * 1000)
+        let dayStartMs = Self.dayStart(for: dateMs)
+        let dayEndMs = dayStartMs + Self.dayMs
+        let startMs = Int64((start.timeIntervalSince1970 * 1000).rounded())
+        let endMs = Int64((endAt(in: cycles).timeIntervalSince1970 * 1000).rounded())
+        return max(0, min(dayEndMs, endMs) - max(dayStartMs, startMs))
+    }
+
     static func overlapsUTCMonth(
         _ cycle: CreditCycleSummary,
-        containing date: Date
+        containing date: Date,
+        in cycles: [CreditCycleSummary]
     ) -> Bool {
-        guard let start = cycle.startAt else { return false }
+        guard let start = cycle.startAt(in: cycles) else { return false }
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "UTC")!
         guard let monthStart = calendar.date(
             from: calendar.dateComponents([.year, .month], from: date)
         ), let monthEnd = calendar.date(byAdding: .month, value: 1, to: monthStart)
         else { return false }
-        return start < monthEnd && cycle.resetAt > monthStart
+        return start < monthEnd && cycle.endAt(in: cycles) > monthStart
     }
 
     static func utcMonthKey(for date: Date) -> String {
@@ -93,15 +130,434 @@ struct CreditCycleSummary: Identifiable, Equatable {
     }
 }
 
+struct CreditCycleNavigation {
+    let older: CreditCycleSummary?
+    let newer: CreditCycleSummary?
+    let canReturnToCurrent: Bool
+
+    init(cycles: [CreditCycleSummary], selectedDay: Int64?, liveDay: Int64? = nil, now: Date = Date()) {
+        let completed = cycles.filter { Self.isCompleted($0, in: cycles, liveDay: liveDay, now: now) }
+        if let selectedDay {
+            older = completed.first { $0.resetDayMs < selectedDay }
+            newer = completed.last { $0.resetDayMs > selectedDay }
+            canReturnToCurrent = newer == nil
+        } else {
+            older = completed.first
+            newer = nil
+            canReturnToCurrent = false
+        }
+    }
+
+    static func isCompleted(
+        _ cycle: CreditCycleSummary, in cycles: [CreditCycleSummary], liveDay: Int64?, now: Date
+    ) -> Bool {
+        if let liveDay { return cycle.resetDayMs < liveDay }
+        return cycle.endAt(in: cycles) <= now
+    }
+
+    static func verify() {
+        let hour: Int64 = 60 * 60 * 1000
+        func date(_ day: String) -> Date {
+            Date(timeIntervalSince1970: Double(CreditCycle.utcMidnightMs(day)) / 1000)
+        }
+        func cycle(_ end: String) -> CreditCycleSummary {
+            let reset = CreditCycle.utcMidnightMs(end) + 18 * hour
+            return CreditCycleSummary(latestSample: CreditSample(
+                capturedAtMs: reset - hour, serverAtMs: nil,
+                resetAtMs: reset, creditsUsed: 50
+            ))
+        }
+
+        let november = cycle("2029-11-30")
+        let january = cycle("2030-01-31")
+        let february = cycle("2030-02-28")
+        let march = cycle("2030-03-31")
+        let now = date("2030-03-03")
+        let historical = [february, january]
+        let withCurrent = [march] + historical
+
+        precondition(february.startAt(in: historical) == january.resetAt)
+        precondition(february.startAt(in: [february, november]) == february.startAt)
+        precondition(CreditCycleSummary.cycle(containingUTCDate: date("2030-01-29"),
+                                              in: historical) == january,
+                     "the February cycle must not claim days before the known January reset")
+        let split = date("2030-01-31")
+        precondition(january.overlapOnUTCDay(split, in: historical) == 18 * hour)
+        precondition(february.overlapOnUTCDay(split, in: historical) == 6 * hour)
+        precondition(CreditCycleSummary.cycle(containingUTCDate: split, in: historical) == january)
+
+        let offline = CreditCycleNavigation(cycles: historical, selectedDay: nil, now: now)
+        let online = CreditCycleNavigation(cycles: withCurrent, selectedDay: nil, now: now)
+        precondition(offline.older == february && online.older == february,
+                     "the older arrow must enter the latest completed cycle even without a live reading")
+        let latest = CreditCycleNavigation(cycles: historical, selectedDay: february.resetDayMs, now: now)
+        precondition(latest.older == january && latest.newer == nil && latest.canReturnToCurrent,
+                     "the newer arrow from the latest completed cycle must return to the current view")
+        let older = CreditCycleNavigation(cycles: historical, selectedDay: january.resetDayMs, now: now)
+        precondition(older.older == nil && older.newer == february && !older.canReturnToCurrent)
+
+        let planned = CreditCycle.utcMidnightMs("2030-02-01")
+        let observed = planned - 15 * 60_000
+        let nextReset = CreditCycle.utcMidnightMs("2030-03-01")
+        let previousSample = CreditSample(
+            capturedAtMs: observed - 60_000, serverAtMs: nil, resetAtMs: planned, creditsUsed: 60
+        )
+        let early = CreditSample(
+            capturedAtMs: observed, serverAtMs: nil, resetAtMs: nextReset, creditsUsed: 0
+        )
+        let later = CreditSample(
+            capturedAtMs: observed + 10 * 60_000, serverAtMs: nil, resetAtMs: nextReset, creditsUsed: 25
+        )
+        CreditSampleStore.withTemporaryStore {
+            for sample in [previousSample, early, later] {
+                precondition(CreditSampleStore.save(sample, account: "fixture"))
+            }
+            let cycles = CreditSampleStore.cycles(account: "fixture")
+            precondition(cycles.count == 2)
+            precondition(cycles == CreditSampleStore.compactedHistory(account: "fixture")?.cycles)
+            let live = cycles[0]
+            let prior = cycles[1]
+            precondition(live.firstObservedAtMs == observed)
+            precondition(live.startAt(in: cycles) == early.capturedAt)
+            precondition(prior.endAt(in: cycles) == early.capturedAt)
+            let nav = CreditCycleNavigation(cycles: cycles, selectedDay: nil,
+                                            liveDay: live.id, now: later.capturedAt)
+            precondition(nav.older == prior, "a confirmed early reset must make the previous cycle navigable")
+            let beforeMidnight = date("2030-01-31")
+            precondition(CreditCycleSummary.cycle(containingUTCDate: beforeMidnight, in: cycles) == prior)
+            precondition(live.overlapOnUTCDay(beforeMidnight, in: cycles) == 15 * 60_000)
+            precondition(CreditCycleSummary.overlapsUTCMonth(live, containing: beforeMidnight, in: cycles),
+                         "the calendar must include a new cycle that recorded spend in the previous month")
+            let daily = CreditTimeline.combinedDaily(samplesByCycle: [[previousSample], [early, later]],
+                                                      monthKey: "2030-01")
+            precondition(daily["2030-01-31"] == 25)
+            let merged = SyncAggregate.mergedCreditCycles(
+                local: [CreditCycleSummary(latestSample: later), prior], additionalSamples: [early]
+            )
+            precondition(merged == cycles, "an earlier peer observation must keep the early reset after a merge")
+        }
+
+        let februaryStart = CreditCycle.utcMidnightMs("2030-02-01")
+        let februaryReset = februaryStart + 2 * hour
+        let marchReset = CreditCycle.utcMidnightMs("2030-03-01") + 2 * hour
+        let minute: Int64 = 60_000
+        let previousSamples = [CreditSample(
+            capturedAtMs: februaryStart + 5 * minute, serverAtMs: nil,
+            resetAtMs: februaryReset, creditsUsed: 100
+        ), CreditSample(
+            capturedAtMs: februaryStart + 20 * minute, serverAtMs: nil,
+            resetAtMs: februaryReset, creditsUsed: 150
+        ), CreditSample(
+            capturedAtMs: februaryStart + 25 * minute, serverAtMs: februaryStart + 10 * minute,
+            resetAtMs: februaryReset, creditsUsed: 100
+        )]
+        let nextSamples = [CreditSample(
+            capturedAtMs: februaryReset + minute, serverAtMs: februaryStart - 15 * minute,
+            resetAtMs: marchReset, creditsUsed: 0
+        ), CreditSample(
+            capturedAtMs: februaryReset + 2 * minute, serverAtMs: nil,
+            resetAtMs: marchReset, creditsUsed: 0
+        ), CreditSample(
+            capturedAtMs: februaryReset + 3 * minute, serverAtMs: nil,
+            resetAtMs: marchReset, creditsUsed: 10
+        )]
+        CreditSampleStore.withTemporaryStore {
+            for sample in previousSamples + nextSamples {
+                precondition(CreditSampleStore.save(sample, account: "fixture"))
+            }
+            let cycles = CreditSampleStore.cycles(account: "fixture")
+            precondition(cycles.count == 2 && cycles == CreditSampleStore.compactedHistory(account: "fixture")?.cycles)
+            let closed = cycles[1]
+            precondition(closed.latestSample == previousSamples[1],
+                         "sample order must prefer observation time over capture time")
+            let opening = CreditCycleSummary(latestSample: nextSamples[0])
+            precondition(closed.endAt(in: [opening, closed]) == closed.resetAt)
+            precondition(closed.endAt(in: cycles) == closed.resetAt)
+            precondition(cycles[0].startAt(in: cycles) == closed.resetAt)
+            let month = date("2030-02-01")
+            let calendarCycles = cycles.filter { CreditCycleSummary.overlapsUTCMonth($0, containing: month, in: cycles) }
+            let daily = CreditTimeline.combinedDaily(
+                samplesByCycle: calendarCycles.map { CreditSampleStore.loadCycle(resetDayMs: $0.id, account: "fixture") },
+                monthKey: "2030-02"
+            )
+            precondition(daily["2030-02-01"] == 60,
+                         "a stale new-cycle timestamp must leave recorded prior-cycle spend in the calendar")
+        }
+        verifyBoundaryAfterStaleOpening()
+    }
+
+    private static func verifyBoundaryAfterStaleOpening() {
+        let january31 = CreditCycle.utcMidnightMs("2030-01-31")
+        let previousReset = CreditCycle.utcMidnightMs("2030-02-01")
+        let currentReset = CreditCycle.utcMidnightMs("2030-03-01")
+        let minute: Int64 = 60_000
+        let previous = [CreditSample(
+            capturedAtMs: january31 + minute, serverAtMs: nil,
+            resetAtMs: previousReset, creditsUsed: 40
+        ), CreditSample(
+            capturedAtMs: january31 + 4 * minute, serverAtMs: nil,
+            resetAtMs: previousReset, creditsUsed: 100
+        )]
+        let opening = CreditSample(
+            capturedAtMs: january31 + 5 * minute, serverAtMs: january31 + 3 * minute,
+            resetAtMs: currentReset, creditsUsed: 0
+        )
+        let firstAfter = CreditSample(
+            capturedAtMs: january31 + 6 * minute, serverAtMs: nil,
+            resetAtMs: currentReset, creditsUsed: 10
+        )
+        let spend = CreditSample(
+            capturedAtMs: january31 + 16 * minute, serverAtMs: nil,
+            resetAtMs: currentReset, creditsUsed: 30
+        )
+        let afterMidnight = CreditSample(
+            capturedAtMs: previousReset + minute, serverAtMs: nil,
+            resetAtMs: currentReset, creditsUsed: 30
+        )
+        let beforeMidnight = previous + [opening, firstAfter, spend]
+        let all = beforeMidnight + [afterMidnight]
+
+        func verifyView(_ cycles: [CreditCycleSummary], samplesByCycle: [[CreditSample]]) {
+            precondition(cycles.count == 2)
+            let live = cycles[0]
+            let closed = cycles[1]
+            let start = firstAfter.observedAt
+            precondition(closed.endAt(in: cycles) == start && live.startAt(in: cycles) == start,
+                         "later polls must preserve the first supported boundary after a stale opening")
+            let januaryCycles = cycles.filter { CreditCycleSummary.overlapsUTCMonth($0, containing: start, in: cycles) }
+            precondition(januaryCycles == cycles)
+            let daily = CreditTimeline.combinedDaily(samplesByCycle: samplesByCycle, monthKey: "2030-01")
+            precondition(daily["2030-01-31"] == 90,
+                         "the calendar must retain the recorded spend from both sides of the early boundary")
+            let timeline = CreditTimeline.build(samples: samplesByCycle[0])
+            let chart = CreditTimeline.billingCycleDays(
+                daily: timeline.daily, startAt: start, resetAt: live.resetAt, now: afterMidnight.capturedAt
+            )
+            precondition(chart.first?.credits == 30 && chart.first?.day == "2030-01-31",
+                         "the new cycle chart must retain the confirmed spend before midnight")
+        }
+
+        let before = SyncAggregate.mergedCreditCycles(local: [], additionalSamples: beforeMidnight)
+        let after = SyncAggregate.mergedCreditCycles(local: before, additionalSamples: [afterMidnight])
+        verifyView(after, samplesByCycle: [[opening, firstAfter, spend, afterMidnight], previous])
+        let unskewed = SyncAggregate.mergedCreditCycles(
+            local: [], additionalSamples: previous + [firstAfter, spend, afterMidnight]
+        )
+        precondition(SyncAggregate.mergedCreditCycles(local: unskewed, additionalSamples: [opening]) == after,
+                     "a stale peer observation must preserve the valid boundary already known locally")
+
+        CreditSampleStore.withTemporaryStore {
+            for sample in all {
+                precondition(CreditSampleStore.save(sample, account: "fixture"))
+            }
+            guard let stored = CreditSampleStore.compactedHistory(account: "fixture") else {
+                preconditionFailure("compacted history unavailable")
+            }
+            let diskCycles = CreditSampleStore.cycles(account: "fixture")
+            precondition(diskCycles == after && stored.cycles == after)
+            let raw = diskCycles.map { CreditSampleStore.loadCycle(resetDayMs: $0.id, account: "fixture") }
+            verifyView(diskCycles, samplesByCycle: raw)
+            let compacted = stored.cycles.map { stored.samplesByCycle[$0.id] ?? [] }
+            precondition(compacted[0].contains(firstAfter),
+                         "the boundary observation must survive SQLite compaction within its opening bucket")
+            verifyView(stored.cycles, samplesByCycle: compacted)
+
+            let peer = SyncAggregate.project(
+                creditSamples: stored.samples, accountFingerprint: "fixture",
+                machineId: "early-rollover-peer", label: nil, updatedAt: ""
+            )
+            let synced = peer.creditSamples?.map(\.creditSample) ?? []
+            precondition(synced.contains(firstAfter), "the boundary observation must survive sync compaction")
+            let merged = SyncAggregate.mergedCreditCycles(local: [], additionalSamples: synced)
+            let fromPeer = merged.map { cycle in
+                SyncAggregate.mergedCreditSamples(
+                    local: [], remotes: [peer], resetAtMs: cycle.resetAtMs, accountFingerprint: "fixture"
+                )
+            }
+            verifyView(merged, samplesByCycle: fromPeer)
+
+            let followingCycle = CreditSample(
+                capturedAtMs: currentReset + minute, serverAtMs: nil,
+                resetAtMs: CreditCycle.utcMidnightMs("2030-04-01"), creditsUsed: 0
+            )
+            precondition(CreditSampleStore.save(followingCycle, account: "fixture"))
+            guard let completed = CreditSampleStore.compactedHistory(account: "fixture") else {
+                preconditionFailure("completed history unavailable")
+            }
+            precondition(completed.samplesByCycle[currentReset]?.contains(firstAfter) == true,
+                         "the boundary observation must survive compaction of the completed cycle")
+            precondition(SyncAggregate.compactCreditSamples(all + [followingCycle]).contains(firstAfter))
+
+            let lateClose = CreditSample(
+                capturedAtMs: january31 + 9 * minute, serverAtMs: nil,
+                resetAtMs: previousReset, creditsUsed: 105
+            )
+            let latePeer = SyncAggregate.project(
+                creditSamples: [lateClose], accountFingerprint: "fixture",
+                machineId: "late-rollover-peer", label: nil, updatedAt: ""
+            )
+            let lateSamples = latePeer.creditSamples?.map(\.creditSample) ?? []
+            let beforePeer = completed.mergingCycles(with: [followingCycle])
+            let afterPeer = completed.mergingCycles(with: lateSamples + [followingCycle])
+            precondition(afterPeer.first { $0.id == currentReset }?.startAt(in: afterPeer) == spend.observedAt,
+                         "a late peer close must use the next eligible boundary in retained local history")
+
+            func januarySpend(_ cycles: [CreditCycleSummary], peers: [MachineSyncPayload]) -> Double? {
+                let eligible = cycles.filter {
+                    CreditCycleSummary.overlapsUTCMonth($0, containing: spend.observedAt, in: cycles)
+                }
+                let samples = eligible.map { cycle in
+                    SyncAggregate.mergedCreditSamples(
+                        local: completed.samplesByCycle[cycle.id] ?? [], remotes: peers,
+                        resetAtMs: cycle.resetAtMs, accountFingerprint: "fixture"
+                    )
+                }
+                return CreditTimeline.combinedDaily(samplesByCycle: samples, monthKey: "2030-01")["2030-01-31"]
+            }
+
+            precondition(januarySpend(beforePeer, peers: []) == 90)
+            precondition(januarySpend(afterPeer, peers: [latePeer]) == 95,
+                         "the calendar should add the peer's five credits without dropping the newer cycle")
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CreditSampleStore — cumulative server-counter observations.
 //
-// Samples live beside the legacy span cache but in their own durable table. The
-// database remains after telemetry retirement. Poll failures are never written,
-// and reconciliation never diffs across a reset or decrease.
+// Keep the historical filename so upgrades preserve samples and cycle budgets.
+// Poll failures are never written, and timelines never diff across a reset.
 // ---------------------------------------------------------------------------
 
 enum CreditSampleStore {
+    static var path: String {
+        if let override = ProcessInfo.processInfo.environment["BARPILOT_CACHE_PATH"],
+           !override.isEmpty { return override }
+        return FileManager.default.homeDirectoryForCurrentUser.path
+            + "/Library/Application Support/com.victorrodrigues.barpilot/spans-cache.db"
+    }
+
+    static func getMeta(_ key: String) -> String? {
+        guard let db = open() else { return nil }
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            db, "SELECT value FROM meta WHERE key=?", -1, &statement, nil
+        ) == SQLITE_OK else {
+            NSLog("BarPilot: unable to read credit metadata")
+            return nil
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, key, -1, sqliteTransient)
+        let result = sqlite3_step(statement)
+        if result == SQLITE_ROW, let value = sqlite3_column_text(statement, 0) {
+            return String(cString: value)
+        }
+        if result != SQLITE_DONE {
+            NSLog("BarPilot: credit metadata read failed")
+        }
+        return nil
+    }
+
+    static func setMeta(_ key: String, _ value: String) {
+        guard let db = open() else { return }
+        defer { sqlite3_close(db) }
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(
+            db, "INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+            -1, &statement, nil
+        ) == SQLITE_OK else {
+            NSLog("BarPilot: unable to prepare credit metadata write")
+            return
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, key, -1, sqliteTransient)
+        sqlite3_bind_text(statement, 2, value, -1, sqliteTransient)
+        if sqlite3_step(statement) != SQLITE_DONE {
+            NSLog("BarPilot: credit metadata write failed")
+        }
+    }
+
+    /// Retire only telemetry-owned storage. Account adoption, budget migration
+    /// and database identity metadata must survive this upgrade.
+    static func retireLegacyTelemetry() -> Bool {
+        guard let db = open() else { return false }
+        defer { sqlite3_close(db) }
+        guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else {
+            NSLog("BarPilot: unable to start telemetry retirement")
+            return false
+        }
+        let retired = sqlite3_exec(db, """
+        DROP TABLE IF EXISTS spans;
+        DELETE FROM meta WHERE key IN (
+            'macAppJSONLOffset', 'macAppJSONLLastSize', 'macAppJSONLLastGrowthAt',
+            'lastSourceCheckAt', 'backfill_version', 'reasoning_backfill_version'
+        );
+        """, nil, nil, nil) == SQLITE_OK
+        if retired && sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK {
+            return true
+        }
+        sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+        NSLog("BarPilot: telemetry retirement failed; credit history retained")
+        return false
+    }
+
+    static func verifyTelemetryRetirement() {
+        withTemporaryStore {
+            let identity = storeIdentity()
+            let sample = CreditSample(
+                capturedAtMs: CreditCycle.utcMidnightMs("2030-01-10"),
+                serverAtMs: nil, resetAtMs: CreditCycle.utcMidnightMs("2030-02-01"),
+                creditsUsed: 123
+            )
+            precondition(save(sample, account: "fixture", budgetUSD: 150))
+            setMeta(adoptionKey, "fixture")
+            guard let db = open() else { preconditionFailure("fixture database unavailable") }
+            precondition(sqlite3_exec(db, """
+            CREATE TABLE spans(span_id TEXT PRIMARY KEY, credits REAL);
+            INSERT INTO spans VALUES('retired',999);
+            INSERT INTO meta VALUES('macAppJSONLOffset','1234');
+            INSERT INTO meta VALUES('backfill_version','2');
+            CREATE TRIGGER prevent_retirement BEFORE DELETE ON meta
+            WHEN OLD.key='macAppJSONLOffset'
+            BEGIN SELECT RAISE(ABORT,'fixture retirement failure'); END;
+            """, nil, nil, nil) == SQLITE_OK)
+            sqlite3_close(db)
+            precondition(!retireLegacyTelemetry(), "failed retirement must report failure")
+            precondition(getMeta("macAppJSONLOffset") == "1234")
+            guard let rollback = open() else { preconditionFailure("rollback database unavailable") }
+            var restored: OpaquePointer?
+            precondition(sqlite3_prepare_v2(
+                rollback, "SELECT COUNT(*) FROM spans", -1, &restored, nil
+            ) == SQLITE_OK, "a failed cleanup must restore the dropped table")
+            precondition(sqlite3_step(restored) == SQLITE_ROW && sqlite3_column_int(restored, 0) == 1)
+            sqlite3_finalize(restored)
+            precondition(sqlite3_exec(
+                rollback, "DROP TRIGGER prevent_retirement", nil, nil, nil
+            ) == SQLITE_OK)
+            sqlite3_close(rollback)
+            precondition(retireLegacyTelemetry())
+            precondition(retireLegacyTelemetry(), "retirement must be idempotent")
+            precondition(storeIdentity() == identity)
+            precondition(load(resetAtMs: sample.resetAtMs, account: "fixture") == [sample])
+            precondition(cycleBudget(
+                resetDayMs: CreditCycleSummary.dayStart(for: sample.resetAtMs),
+                account: "fixture"
+            ) == 150, "telemetry retirement must preserve cycle budgets")
+            precondition(getMeta(adoptionKey) == "fixture")
+            precondition(getMeta("macAppJSONLOffset") == nil && getMeta("backfill_version") == nil)
+            guard let checked = open() else { preconditionFailure("retired database unavailable") }
+            defer { sqlite3_close(checked) }
+            var statement: OpaquePointer?
+            precondition(sqlite3_prepare_v2(
+                checked, "SELECT 1 FROM sqlite_master WHERE name='spans'",
+                -1, &statement, nil
+            ) == SQLITE_OK)
+            defer { sqlite3_finalize(statement) }
+            precondition(sqlite3_step(statement) == SQLITE_DONE, "telemetry table must be removed")
+        }
+    }
+
     struct HistorySnapshot {
         let cycles: [CreditCycleSummary]
         let samplesByCycle: [Int64: [CreditSample]]
@@ -111,6 +567,15 @@ enum CreditSampleStore {
             samplesByCycle.values.flatMap { $0 }
                 .sorted { $0.capturedAtMs < $1.capturedAtMs }
         }
+
+        func mergingCycles(with additionalSamples: [CreditSample]) -> [CreditCycleSummary] {
+            // A peer's later prior-cycle reading can invalidate the boundary
+            // in a saved summary while leaving a later retained row eligible.
+            SyncAggregate.mergedCreditCycles(
+                local: cycles,
+                additionalSamples: samplesByCycle.values.flatMap { $0 } + additionalSamples
+            )
+        }
     }
 
     /// Stable identity stored inside the database itself. UsageStore mirrors it
@@ -118,29 +583,33 @@ enum CreditSampleStore {
     /// and enables one-time recovery from this machine's remote payload.
     static func storeIdentity() -> String? {
         let key = "credit_history_store_id"
-        if let existing = SpanCache.getMeta(key), !existing.isEmpty {
+        if let existing = CreditSampleStore.getMeta(key), !existing.isEmpty {
             return existing
         }
         let created = UUID().uuidString
-        SpanCache.setMeta(key, created)
-        return SpanCache.getMeta(key) == created ? created : nil
+        CreditSampleStore.setMeta(key, created)
+        return CreditSampleStore.getMeta(key) == created ? created : nil
     }
 
     private static func open() -> OpaquePointer? {
-        let path = SpanCache.path
-        try? FileManager.default.createDirectory(
-            atPath: (path as NSString).deletingLastPathComponent,
-            withIntermediateDirectories: true)
+        let path = CreditSampleStore.path
+        do {
+            try FileManager.default.createDirectory(
+                atPath: (path as NSString).deletingLastPathComponent,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            NSLog("BarPilot: unable to create credit history directory")
+            return nil
+        }
         var db: OpaquePointer?
         guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil) == SQLITE_OK else {
+            NSLog("BarPilot: unable to open credit history database")
             if let db { sqlite3_close(db) }
             return nil
         }
         sqlite3_exec(db, "PRAGMA journal_mode=WAL", nil, nil, nil)
-        // Credit samples are written from a different task than the span
-        // merge, so two writers now contend for this file. WAL allows
-        // concurrent readers but still only one writer: without a timeout the
-        // loser gets SQLITE_BUSY immediately instead of waiting its turn.
+        // Budget edits, polling and sync recovery may write concurrently.
         sqlite3_busy_timeout(db, 5000)
         sqlite3_exec(db, """
         CREATE TABLE IF NOT EXISTS credit_samples (
@@ -250,7 +719,7 @@ enum CreditSampleStore {
     /// account connecting later cannot inherit the first account's history.
     @discardableResult
     static func adoptUnattributed(account: String) -> Int {
-        guard SpanCache.getMeta(adoptionKey) == nil else { return 0 }
+        guard CreditSampleStore.getMeta(adoptionKey) == nil else { return 0 }
         guard let db = open() else { return 0 }
         defer { sqlite3_close(db) }
         guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK
@@ -303,7 +772,7 @@ enum CreditSampleStore {
             return 0
         }
         committed = true
-        SpanCache.setMeta(adoptionKey, account)
+        CreditSampleStore.setMeta(adoptionKey, account)
         return adoptedCount
     }
 
@@ -351,7 +820,7 @@ enum CreditSampleStore {
         try? FileManager.default.createDirectory(
             atPath: dir, withIntermediateDirectories: true)
         setenv("BARPILOT_CACHE_PATH", dir + "/spans-cache.db", 1)
-        precondition(SpanCache.path.hasPrefix(dir),
+        precondition(CreditSampleStore.path.hasPrefix(dir),
                      "verification must not run against the real database")
         body()
         if let previous { setenv("BARPILOT_CACHE_PATH", previous, 1) }
@@ -690,14 +1159,14 @@ enum CreditSampleStore {
     ) -> Int64? {
         guard let account else { return nil }
         let key = budgetMigrationKey(account: account)
-        if let stored = SpanCache.getMeta(key) {
+        if let stored = CreditSampleStore.getMeta(key) {
             if stored == budgetMigrationComplete { return nil }
             if let resetDayMs = Int64(stored),
                let cycle = cycles.first(where: { $0.resetDayMs == resetDayMs }),
                resetDayMs != liveResetDayMs,
                cycle.startAt.map(CreditCycleSummary.utcMonthKey) == eligibleStartMonth {
                 guard cycleBudget(resetDayMs: resetDayMs, account: account) == nil else {
-                    SpanCache.setMeta(key, budgetMigrationComplete)
+                    CreditSampleStore.setMeta(key, budgetMigrationComplete)
                     return nil
                 }
                 return resetDayMs
@@ -714,16 +1183,16 @@ enum CreditSampleStore {
             return nil
         }
         guard cycleBudget(resetDayMs: candidate.resetDayMs, account: account) == nil else {
-            SpanCache.setMeta(key, budgetMigrationComplete)
+            CreditSampleStore.setMeta(key, budgetMigrationComplete)
             return nil
         }
-        SpanCache.setMeta(key, String(candidate.resetDayMs))
+        CreditSampleStore.setMeta(key, String(candidate.resetDayMs))
         return candidate.resetDayMs
     }
 
     static func completeBudgetMigration(account: String?) {
         guard let account else { return }
-        SpanCache.setMeta(
+        CreditSampleStore.setMeta(
             budgetMigrationKey(account: account), budgetMigrationComplete
         )
     }
@@ -791,89 +1260,7 @@ enum CreditSampleStore {
     static func compactedHistory(account: String?) -> HistorySnapshot? {
         guard let db = open() else { return nil }
         defer { sqlite3_close(db) }
-        let accountClause = account.map {
-            "(account IS NULL OR account = '\(escape($0))')"
-        } ?? "account IS NULL"
-        let bucketMs: Int64 = 15 * 60 * 1000
-        let sql = """
-        WITH source AS (
-            SELECT captured_at_ms, server_at_ms, reset_at_ms, credits_used,
-                   (reset_at_ms / \(CreditCycleSummary.dayMs)) AS reset_day,
-                   COALESCE(server_at_ms, captured_at_ms) AS effective_at,
-                   (COALESCE(server_at_ms, captured_at_ms)
-                       / \(CreditCycleSummary.dayMs)) AS observed_day
-            FROM credit_samples
-            WHERE \(accountClause)
-        ),
-        ranked AS (
-            SELECT captured_at_ms, server_at_ms, reset_at_ms, credits_used,
-                   reset_day,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY reset_day,
-                                    (effective_at / \(bucketMs))
-                       ORDER BY effective_at ASC, captured_at_ms ASC
-                   ) AS bucket_rank,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY reset_day, observed_day
-                       ORDER BY effective_at ASC, captured_at_ms ASC
-                   ) AS day_first_rank,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY reset_day, observed_day
-                       ORDER BY effective_at DESC, captured_at_ms DESC
-                   ) AS day_last_rank,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY reset_day, observed_day
-                       ORDER BY credits_used DESC, effective_at DESC,
-                                captured_at_ms DESC
-                   ) AS day_peak_rank,
-                   ROW_NUMBER() OVER (
-                       PARTITION BY reset_day
-                       ORDER BY effective_at DESC, captured_at_ms DESC
-                   ) AS cycle_last_rank,
-                   MAX(reset_day) OVER () AS newest_reset_day
-            FROM source
-        )
-        SELECT captured_at_ms, server_at_ms, reset_at_ms, credits_used,
-               reset_day, cycle_last_rank
-        FROM ranked
-        WHERE (reset_day = newest_reset_day
-               AND (bucket_rank = 1 OR cycle_last_rank = 1))
-           OR (reset_day != newest_reset_day
-               AND (day_first_rank = 1 OR day_peak_rank = 1
-                    OR day_last_rank = 1
-                    OR cycle_last_rank = 1))
-        ORDER BY reset_day DESC,
-                 COALESCE(server_at_ms, captured_at_ms) ASC,
-                 captured_at_ms ASC
-        """
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            return nil
-        }
-        defer { sqlite3_finalize(stmt) }
-
-        var samplesByCycle: [Int64: [CreditSample]] = [:]
-        var latestByCycle: [Int64: CreditSample] = [:]
-        var stepResult = sqlite3_step(stmt)
-        while stepResult == SQLITE_ROW {
-            let sample = CreditSample(
-                capturedAtMs: sqlite3_column_int64(stmt, 0),
-                serverAtMs: sqlite3_column_type(stmt, 1) == SQLITE_NULL
-                    ? nil : sqlite3_column_int64(stmt, 1),
-                resetAtMs: sqlite3_column_int64(stmt, 2),
-                creditsUsed: sqlite3_column_double(stmt, 3)
-            )
-            let resetDay = sqlite3_column_int64(stmt, 4)
-                * CreditCycleSummary.dayMs
-            samplesByCycle[resetDay, default: []].append(sample)
-            if sqlite3_column_int64(stmt, 5) == 1 {
-                latestByCycle[resetDay] = sample
-            }
-            stepResult = sqlite3_step(stmt)
-        }
-        // A mid-query SQLite failure is not a smaller valid history. Returning
-        // nil prevents callers from publishing or presenting a partial snapshot.
-        guard stepResult == SQLITE_DONE else { return nil }
+        guard let samplesByCycle = loadCompactedSamples(db, account: account) else { return nil }
         let budgetAccountKey = accountKey(account)
         let budgetSQL = """
         SELECT reset_day_ms, budget_usd, updated_at_ms
@@ -909,9 +1296,7 @@ enum CreditSampleStore {
             budgetStep = sqlite3_step(budgetStmt)
         }
         guard budgetStep == SQLITE_DONE else { return nil }
-        let cycles = latestByCycle
-            .map { CreditCycleSummary(latestSample: $0.value) }
-            .sorted { $0.resetDayMs > $1.resetDayMs }
+        let cycles = summarizeCycles(samplesByCycle)
         return HistorySnapshot(
             cycles: cycles,
             samplesByCycle: samplesByCycle,
@@ -927,56 +1312,110 @@ enum CreditSampleStore {
     static func cycles(account: String?) -> [CreditCycleSummary] {
         guard let db = open() else { return [] }
         defer { sqlite3_close(db) }
+        guard let samplesByCycle = loadCompactedSamples(db, account: account) else { return [] }
+        return summarizeCycles(samplesByCycle)
+    }
+
+    private static func summarizeCycles(_ samplesByCycle: [Int64: [CreditSample]]) -> [CreditCycleSummary] {
+        SyncAggregate.mergedCreditCycles(local: [], additionalSamples: samplesByCycle.values.flatMap { $0 })
+    }
+
+    /// Keep the first sample after the previous cycle's final observation,
+    /// even when a stale timestamp ranks ahead of it in the same bucket.
+    private static func loadCompactedSamples(
+        _ db: OpaquePointer, account: String?
+    ) -> [Int64: [CreditSample]]? {
         let accountClause = account.map {
             "(account IS NULL OR account = '\(escape($0))')"
         } ?? "account IS NULL"
-        let daysSQL = """
-        SELECT DISTINCT (reset_at_ms / \(CreditCycleSummary.dayMs))
-        FROM credit_samples
-        WHERE \(accountClause)
-        ORDER BY 1 DESC
-        """
-        var daysStmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, daysSQL, -1, &daysStmt, nil) == SQLITE_OK else {
-            return []
-        }
-        defer { sqlite3_finalize(daysStmt) }
-        var resetDays: [Int64] = []
-        while sqlite3_step(daysStmt) == SQLITE_ROW {
-            resetDays.append(
-                sqlite3_column_int64(daysStmt, 0) * CreditCycleSummary.dayMs
-            )
-        }
-
-        var out: [CreditCycleSummary] = []
-        for resetDay in resetDays {
-            let end = resetDay + CreditCycleSummary.dayMs
-            let latestSQL = """
-            SELECT captured_at_ms, server_at_ms, reset_at_ms, credits_used
+        let bucketMs: Int64 = 15 * 60 * 1000
+        let sql = """
+        WITH source AS (
+            SELECT captured_at_ms, server_at_ms, reset_at_ms, credits_used,
+                   (reset_at_ms / \(CreditCycleSummary.dayMs)) AS reset_day,
+                   COALESCE(server_at_ms, captured_at_ms) AS effective_at,
+                   (COALESCE(server_at_ms, captured_at_ms)
+                       / \(CreditCycleSummary.dayMs)) AS observed_day
             FROM credit_samples
-            WHERE reset_at_ms >= \(resetDay) AND reset_at_ms < \(end)
-              AND \(accountClause)
-            ORDER BY captured_at_ms DESC
-            LIMIT 1
-            """
-            var latestStmt: OpaquePointer?
-            guard sqlite3_prepare_v2(
-                db, latestSQL, -1, &latestStmt, nil
-            ) == SQLITE_OK else {
-                continue
-            }
-            if sqlite3_step(latestStmt) == SQLITE_ROW {
-                out.append(CreditCycleSummary(latestSample: CreditSample(
-                    capturedAtMs: sqlite3_column_int64(latestStmt, 0),
-                    serverAtMs: sqlite3_column_type(latestStmt, 1) == SQLITE_NULL
-                        ? nil : sqlite3_column_int64(latestStmt, 1),
-                    resetAtMs: sqlite3_column_int64(latestStmt, 2),
-                    creditsUsed: sqlite3_column_double(latestStmt, 3)
-                )))
-            }
-            sqlite3_finalize(latestStmt)
+            WHERE \(accountClause)
+        ),
+        cycle_ends AS (
+            SELECT reset_day,
+                   LAG(MAX(effective_at)) OVER (ORDER BY reset_day) AS preceding_latest_at
+            FROM source
+            GROUP BY reset_day
+        ),
+        ranked AS (
+            SELECT captured_at_ms, server_at_ms, reset_at_ms, credits_used,
+                   reset_day,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY reset_day,
+                                    (effective_at / \(bucketMs))
+                       ORDER BY effective_at ASC, captured_at_ms ASC
+                   ) AS bucket_rank,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY reset_day, observed_day
+                       ORDER BY effective_at ASC, captured_at_ms ASC
+                   ) AS day_first_rank,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY reset_day, observed_day
+                       ORDER BY effective_at DESC, captured_at_ms DESC
+                   ) AS day_last_rank,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY reset_day, observed_day
+                       ORDER BY credits_used DESC, effective_at DESC,
+                                captured_at_ms DESC
+                   ) AS day_peak_rank,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY reset_day
+                       ORDER BY effective_at DESC, captured_at_ms DESC
+                   ) AS cycle_last_rank,
+                   MAX(reset_day) OVER () AS newest_reset_day,
+                   effective_at > preceding_latest_at AS follows_preceding,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY reset_day, (effective_at > preceding_latest_at)
+                       ORDER BY effective_at ASC, captured_at_ms ASC
+                   ) AS boundary_rank
+            FROM source JOIN cycle_ends USING (reset_day)
+        )
+        SELECT captured_at_ms, server_at_ms, reset_at_ms, credits_used, reset_day
+        FROM ranked
+        WHERE (reset_day = newest_reset_day
+               AND (bucket_rank = 1 OR cycle_last_rank = 1))
+           OR (reset_day != newest_reset_day
+               AND (day_first_rank = 1 OR day_peak_rank = 1
+                    OR day_last_rank = 1
+                    OR cycle_last_rank = 1))
+           OR (follows_preceding AND boundary_rank = 1)
+        ORDER BY reset_day DESC,
+                 COALESCE(server_at_ms, captured_at_ms) ASC,
+                 captured_at_ms ASC
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return nil
         }
-        return out
+        defer { sqlite3_finalize(stmt) }
+
+        var samplesByCycle: [Int64: [CreditSample]] = [:]
+        var stepResult = sqlite3_step(stmt)
+        while stepResult == SQLITE_ROW {
+            let sample = CreditSample(
+                capturedAtMs: sqlite3_column_int64(stmt, 0),
+                serverAtMs: sqlite3_column_type(stmt, 1) == SQLITE_NULL
+                    ? nil : sqlite3_column_int64(stmt, 1),
+                resetAtMs: sqlite3_column_int64(stmt, 2),
+                creditsUsed: sqlite3_column_double(stmt, 3)
+            )
+            let resetDay = sqlite3_column_int64(stmt, 4)
+                * CreditCycleSummary.dayMs
+            samplesByCycle[resetDay, default: []].append(sample)
+            stepResult = sqlite3_step(stmt)
+        }
+        // A mid-query SQLite failure is not a smaller valid history. Returning
+        // nil prevents callers from publishing or presenting a partial snapshot.
+        guard stepResult == SQLITE_DONE else { return nil }
+        return samplesByCycle
     }
 
     /// Fingerprints are hex, but never build SQL from unvalidated text.

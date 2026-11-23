@@ -106,39 +106,30 @@ enum BudgetPersistenceCompletionPolicy {
 }
 
 enum CreditCycleTransitionPolicy {
-    private static let boundaryWindowMs: Int64 = 24 * 60 * 60 * 1_000
-
-    /// GitHub can advance the reset boundary one response before its cumulative
-    /// counter resets. Do not persist that ambiguous first response into the new
-    /// cycle: if it is the old counter, it would become an artificial high-water
-    /// mark for the entire month.
-    static func needsConfirmation(
-        previous: CreditSample?, current: CreditSample
-    ) -> Bool {
-        guard let previous else { return false }
-        let observedAtMs = current.serverAtMs ?? current.capturedAtMs
-        let distanceFromBoundary = abs(
-            Double(observedAtMs) - Double(previous.resetAtMs)
-        )
-        return distanceFromBoundary <= Double(boundaryWindowMs)
-            && CreditCycleSummary.dayStart(for: current.resetAtMs)
-                > CreditCycleSummary.dayStart(for: previous.resetAtMs)
-            && current.creditsUsed >= previous.creditsUsed
+    enum Disposition: Equatable {
+        case record
+        case wait
+        case showProvisional
     }
 
-    /// A response for the same new boundary confirms it only after the counter
-    /// falls below the previous cycle's high-water mark. Mere movement is not
-    /// enough: the stale old counter may still be increasing while fields settle.
-    static func confirms(
-        previous: CreditSample,
-        pending: CreditSample,
-        current: CreditSample
-    ) -> Bool {
-        CreditCycleSummary.dayStart(for: pending.resetAtMs)
-            == CreditCycleSummary.dayStart(for: current.resetAtMs)
-            && CreditCycleSummary.dayStart(for: current.resetAtMs)
-                > CreditCycleSummary.dayStart(for: previous.resetAtMs)
-            && current.creditsUsed < previous.creditsUsed
+    /// GitHub can advance the reported reset before its counter resets. Allow
+    /// the fresh direct total after one day without adding an unverified
+    /// opening balance to history. The saved prior reset anchors the delay
+    /// across restarts.
+    static func disposition(
+        previous: CreditSample?, current: CreditSample
+    ) -> Disposition {
+        guard let previous,
+              CreditCycleSummary.dayStart(for: current.resetAtMs)
+                > CreditCycleSummary.dayStart(for: previous.resetAtMs),
+              current.creditsUsed >= previous.creditsUsed,
+              current.resetAt.timeIntervalSince(previous.resetAt)
+                <= CreditCycle.maximumCycleLength else { return .record }
+
+        let sinceResetMs = current.observedAtMs - previous.resetAtMs
+        if current.creditsUsed == 0, sinceResetMs >= 0 { return .record }
+        if sinceResetMs >= CreditCycleSummary.dayMs { return .showProvisional }
+        return .wait
     }
 
     static func changed(previous: CreditSample?, current: CreditSample) -> Bool {
@@ -157,59 +148,107 @@ enum CreditCycleTransitionPolicy {
     }
 
     static func verify() {
-        let oldReset = Aggregator.utcMidnightMs("2030-01-01")
-        let newReset = Aggregator.utcMidnightMs("2030-02-01")
-        let previous = CreditSample(
-            capturedAtMs: oldReset - 1, serverAtMs: nil,
-            resetAtMs: oldReset, creditsUsed: 1_000
-        )
-        let staleCounter = CreditSample(
-            capturedAtMs: oldReset, serverAtMs: nil,
-            resetAtMs: newReset, creditsUsed: 1_000
-        )
+        let oldReset = CreditCycle.utcMidnightMs("2030-01-01")
+        let newReset = CreditCycle.utcMidnightMs("2030-02-01")
+        let day = CreditCycleSummary.dayMs
+
+        func sample(
+            at timestamp: Int64, credits: Double, reset: Int64 = newReset,
+            serverAtMs: Int64? = nil
+        ) -> CreditSample {
+            CreditSample(
+                capturedAtMs: timestamp, serverAtMs: serverAtMs,
+                resetAtMs: reset, creditsUsed: credits
+            )
+        }
+
+        let previous = sample(at: oldReset - 1, credits: 1_000, reset: oldReset)
+        let staleCounter = sample(at: oldReset, credits: 1_000)
         precondition(changed(previous: previous, current: staleCounter))
         precondition(!rolledOver(previous: previous, current: staleCounter))
-        precondition(needsConfirmation(
-            previous: previous, current: staleCounter
-        ))
-        let delayedReconnect = CreditSample(
-            capturedAtMs: oldReset + 3 * CreditCycleSummary.dayMs,
-            serverAtMs: nil,
-            resetAtMs: newReset,
-            creditsUsed: 1_200
+        precondition(disposition(previous: previous, current: staleCounter) == .wait)
+        let staleAfterDay = sample(at: oldReset + day, credits: 1_000)
+        precondition(disposition(previous: previous, current: staleAfterDay) == .showProvisional)
+        let lateCaptureOfOldCounter = sample(
+            at: oldReset + day, credits: 1_000, serverAtMs: oldReset + 1
         )
-        precondition(!needsConfirmation(
-            previous: previous, current: delayedReconnect
-        ))
-        let resetCounter = CreditSample(
-            capturedAtMs: oldReset + 1, serverAtMs: nil,
-            resetAtMs: newReset, creditsUsed: 10
+        precondition(disposition(previous: previous, current: lateCaptureOfOldCounter) == .wait,
+                     "a late capture must not make an earlier server observation provisional")
+        let skippedCycle = sample(
+            at: newReset + 3 * day, credits: 1_200, reset: CreditCycle.utcMidnightMs("2030-03-01")
         )
+        precondition(disposition(previous: previous, current: skippedCycle) == .record,
+                     "an intervening cycle invalidates the old comparison counter")
+        let resetCounter = sample(at: oldReset + 1, credits: 10)
         precondition(rolledOver(previous: previous, current: resetCounter))
-        precondition(confirms(
-            previous: previous, pending: staleCounter, current: resetCounter
-        ))
-        precondition(!needsConfirmation(
-            previous: staleCounter, current: resetCounter
-        ))
-        let growingNewCounter = CreditSample(
-            capturedAtMs: oldReset + 2, serverAtMs: nil,
-            resetAtMs: newReset, creditsUsed: 1_001
-        )
-        precondition(!confirms(
-            previous: previous,
-            pending: staleCounter,
-            current: growingNewCounter
-        ))
-        let zeroBoundary = CreditSample(
-            capturedAtMs: oldReset + 3, serverAtMs: nil,
-            resetAtMs: newReset, creditsUsed: 0
-        )
-        precondition(confirms(
-            previous: previous,
-            pending: zeroBoundary,
-            current: zeroBoundary
-        ))
+        precondition(disposition(previous: previous, current: resetCounter) == .record)
+        let earlyDrop = sample(at: oldReset - 1, credits: 10)
+        precondition(disposition(previous: previous, current: earlyDrop) == .record)
+        let growingNewCounter = sample(at: oldReset + 2, credits: 1_001)
+        precondition(disposition(previous: previous, current: growingNewCounter) == .wait)
+
+        CreditSampleStore.withTemporaryStore {
+            for oldCredits in [0.0, 1.0] {
+                let account = "rollover-fixture-\(Int(oldCredits))"
+                let prior = sample(at: oldReset - 1 - Int64(oldCredits),
+                                   credits: oldCredits, reset: oldReset)
+                precondition(CreditSampleStore.save(prior, account: account))
+                for (dayOfCycle, credits) in [(3, 2.0), (7, 3.0), (27, 8.0)] {
+                    // Each attempt starts from durable history, as after relaunch.
+                    let stored = CreditSampleStore.latest(account: account)
+                    let current = sample(at: oldReset + Int64(dayOfCycle) * day, credits: credits)
+                    precondition(stored == prior)
+                    precondition(disposition(previous: stored, current: current) == .showProvisional,
+                                 "missing the opening zero must not leave the amount unavailable")
+                    let now = current.capturedAt
+                    precondition(CreditCycle.visibleCurrentCredits(
+                        sample: current, connected: true, pollFailed: false,
+                        hasSuccessfulPoll: true, directlyPolled: true, now: now
+                    ) == credits)
+                    precondition(CreditCycle.visibleCurrentCredits(
+                        sample: current, connected: true, pollFailed: true,
+                        hasSuccessfulPoll: true, directlyPolled: true, now: now
+                    ) == nil)
+                    precondition(CreditCycle.visibleCurrentCredits(
+                        sample: current, connected: true, pollFailed: false,
+                        hasSuccessfulPoll: true, directlyPolled: true,
+                        now: now.addingTimeInterval(301)
+                    ) == nil)
+                    precondition(CreditSampleStore.loadCycle(resetDayMs: newReset, account: account).isEmpty)
+                }
+            }
+
+            let account = "rollover-fixture-zero"
+            let zeroPrevious = sample(at: oldReset - 3, credits: 0, reset: oldReset)
+            let earlyZero = sample(at: oldReset - 1, credits: 0)
+            precondition(disposition(previous: zeroPrevious, current: earlyZero) == .wait)
+            let zeroBoundary = sample(at: oldReset, credits: 0)
+            precondition(disposition(previous: zeroPrevious, current: zeroBoundary) == .record)
+            precondition(CreditSampleStore.save(zeroPrevious, account: account))
+            let delayedOldSpend = sample(at: oldReset + 1, credits: 80)
+            precondition(disposition(previous: zeroPrevious, current: delayedOldSpend) == .wait)
+            let prolongedCarryover = sample(at: oldReset + day, credits: 80)
+            precondition(disposition(
+                previous: CreditSampleStore.latest(account: account), current: prolongedCarryover
+            ) == .showProvisional)
+            let confirmedZero = sample(at: oldReset + day + 60_000, credits: 0)
+            precondition(disposition(
+                previous: CreditSampleStore.latest(account: account), current: confirmedZero
+            ) == .record)
+            precondition(CreditSampleStore.save(confirmedZero, account: account))
+            let newSpend = sample(at: oldReset + day + 120_000, credits: 50)
+            precondition(disposition(
+                previous: CreditSampleStore.latest(account: account), current: newSpend
+            ) == .record)
+            precondition(CreditSampleStore.save(newSpend, account: account))
+            let history = CreditSampleStore.loadCycle(resetDayMs: newReset, account: account)
+            precondition(history == [confirmedZero, newSpend])
+            precondition(CreditTimeline.build(samples: history).observedCredits == 50,
+                         "an unverified carryover must not suppress confirmed daily increases")
+            precondition(CreditSampleStore.compactedHistory(account: account)?
+                .samplesByCycle[newReset] == [confirmedZero, newSpend],
+                         "only confirmed observations may be included in sync history")
+        }
     }
 }
 
@@ -223,8 +262,19 @@ enum CreditHistoryMergePolicy {
         SyncAggregate.compactCycleBudgets(stored + live)
     }
 
+    static func rollingActivity(
+        live: [ObservedDayCredits], liveCycleDay: Int64?,
+        savedByCycle: [Int64: [ObservedDayCredits]]
+    ) -> [ObservedDayCredits] {
+        CreditTimeline.mergedDailyRows(
+            [live] + savedByCycle.compactMap { day, rows in
+                day == liveCycleDay ? nil : rows
+            }
+        )
+    }
+
     static func verify() {
-        let day = Aggregator.utcMidnightMs("2030-02-01")
+        let day = CreditCycle.utcMidnightMs("2030-02-01")
         let stale = SyncedCycleBudget(
             resetDayMs: day, budgetUSD: 100, updatedAtMs: day - 2
         )
@@ -234,6 +284,21 @@ enum CreditHistoryMergePolicy {
         precondition(cycleBudgets(
             stored: [stale], live: [edited]
         ).first?.budgetUSD == 200)
+        let splitDay = "2030-01-31"
+        let saved = [
+            day: [ObservedDayCredits(id: splitDay, day: splitDay, credits: 10)],
+            day - CreditCycleSummary.dayMs: [
+                ObservedDayCredits(id: splitDay, day: splitDay, credits: 5)
+            ]
+        ]
+        precondition(rollingActivity(
+            live: [], liveCycleDay: nil, savedByCycle: saved
+        ).first?.credits == 15, "saved rows remain visible before a live cycle resolves")
+        precondition(rollingActivity(
+            live: [ObservedDayCredits(id: splitDay, day: splitDay, credits: 12)],
+            liveCycleDay: day, savedByCycle: saved
+        ).first?.credits == 17,
+        "a newly eligible live cycle replaces its cached rows without hiding another cycle's spend")
     }
 }
 
@@ -327,21 +392,8 @@ enum SyncPublishPolicy {
 
 @MainActor
 final class UsageStore: ObservableObject {
-    @Published private(set) var report: Report = .empty
-    @Published private(set) var currentMonthReport: Report = .empty
     @Published private(set) var isLoading = false
-    @Published private(set) var lastUpdated: Date?
-    @Published private(set) var status = SourcesStatus()
-    /// Server-authoritative overlay for the current billing cycle. The raw
-    /// `report` above always remains the local/classified report.
-    @Published private(set) var reconciled = ReconciledUsage.local(.empty)
-
-    @Published var periodKind: PeriodKind { didSet { onPeriodChanged() } }
-    @Published var customFrom: Date { didSet { if periodKind == .custom { recompute() } } }
-    @Published var customTo: Date { didSet { if periodKind == .custom { recompute() } } }
-
-    /// Monthly budget in USD. The per-period budget is derived from this by
-    /// pro-rating across the days in the selected range (a per-day rate).
+    private var hasCompletedInitialReload = false
     @Published var monthlyBudget: Double {
         didSet { persistBudget(previousValue: oldValue) }
     }
@@ -359,7 +411,7 @@ final class UsageStore: ObservableObject {
     private var exchangeRateSnapshot: ExchangeRateSnapshot?
 
     /// Multi-machine sync (opt-in, default OFF). The primary timeline unions
-    /// account-counter observations; legacy aggregate tabs still combine rows.
+    /// account-counter observations.
     @Published var syncEnabled: Bool { didSet { UserDefaults.standard.set(syncEnabled, forKey: Self.syncKey); recompute() } }
     /// Machines contributing to the combined view (this + remotes); 1 when OFF.
     @Published private(set) var syncMachineCount: Int = 1
@@ -397,13 +449,20 @@ final class UsageStore: ObservableObject {
     @Published private(set) var serverUsageSample: CreditSample?
     @Published private(set) var serverUsageError: String?
     @Published private(set) var isConnectingServerUsage = false
+    /// A persisted sample is not shown as current until this process has
+    /// completed a successful account-counter poll. Keep the direct observation
+    /// distinct from the newest local row, which can be recovered through sync.
+    private var lastSuccessfulServerUsagePoll: CreditSample?
+    /// A direct reading following an ambiguous rollover can drive the headline
+    /// but never becomes an input to cycle history or sync.
+    private var provisionalServerUsagePoll: CreditSample?
     /// The in-flight device-flow poll, retained so the user can cancel it.
     private var serverUsageConnectTask: Task<Void, Never>?
     /// Cached in `recompute()` — see `updateCreditCycleView()`.
     @Published private(set) var creditTimeline: CreditTimeline = .empty
-    /// Completed-cycle rows retained beside the live cycle so Recent activity
-    /// remains a true rolling history when a new billing cycle begins.
-    @Published private(set) var previousCreditActivity: [ObservedDayCredits] = []
+    /// Keep cycle IDs until display so a change in live eligibility can
+    /// replace the saved rows without loading the history again.
+    @Published private var savedCreditActivityByCycle: [Int64: [ObservedDayCredits]] = [:]
     @Published private(set) var creditCycles: [CreditCycleSummary] = []
     @Published private(set) var selectedCreditCycleDayMs: Int64?
     @Published private(set) var isLoadingCreditCycle = false
@@ -415,6 +474,7 @@ final class UsageStore: ObservableObject {
     @Published private(set) var isLoadingSpendCalendar = false
     @Published private(set) var counterSyncMachineCount = 1
     private var creditSamples: [CreditSample] = []
+    private var spendCalendarLocalSamples: [Int64: [CreditSample]] = [:]
     /// Local-only compacted history published by this Mac. Remote observations
     /// are deliberately never copied here, which prevents sync feedback loops.
     private var syncCreditSamples: [CreditSample] = []
@@ -449,30 +509,11 @@ final class UsageStore: ObservableObject {
         let task: Task<CreditSampleStore.HistorySnapshot?, Never>
     }
     private var activeCreditHistoryLoad: ActiveCreditHistoryLoad?
-    /// An ambiguous first response after GitHub advances the reset boundary.
-    /// It remains in memory only and cannot seed the new cycle's high-water mark
-    /// until another response confirms the transition.
-    private var pendingCycleTransitionSample: CreditSample?
-
     /// Text shown in the menu bar (the compact current-month total cost).
     @Published private(set) var menuBarTitle: String = "—"
-    /// Is the Copilot app recording telemetry right now? Drives the menu-bar
-    /// warning glyph and the window banner (#27).
-    @Published private(set) var exporterVerdict: ExporterHealth.Verdict = .healthy
-    private var simulatingExporterDown = false
-
-    /// Whether to actually SHOW the exporter warning. Off by default while the
-    /// detection is unreliable (#32) — the dev simulation flag still forces it so
-    /// the UI can be worked on.
-    var showExporterWarning: Bool {
-        (ExporterHealth.warningsEnabled || simulatingExporterDown) && exporterVerdict.isWarning
-    }
-
-    private var allRecords: [UsageRecord] = []
     private var timer: Timer?
     private var rateTimer: Timer?
 
-    private static let periodKey = "selectedPeriodKind"
     private static let budgetKey = "monthlyBudgetUSD"
     private static let budgetUpdatedAtKey = "monthlyBudgetUpdatedAtMs"
     private static let excludeWeekendsKey = "excludeWeekendsFromProjection"
@@ -491,18 +532,12 @@ final class UsageStore: ObservableObject {
         calendar.timeZone = TimeZone(identifier: "UTC")!
         return calendar
     }()
-    /// Average days per month (365.25 / 12) — used to convert the monthly
-    /// budget into a stable per-day rate for any selected range.
-    private static let avgDaysPerMonth = 30.4375
     /// True only when the database identity differs from the one seen on the
     /// prior launch. Normal retention must not resurrect pruned remote rows.
     private var needsSelfHistoryRecovery = false
     private var creditStoreIdentity: String?
 
     init() {
-        let saved = UserDefaults.standard.string(forKey: Self.periodKey)
-        periodKind = PeriodKind(rawValue: saved ?? "") ?? .thisMonth
-
         if UserDefaults.standard.object(forKey: Self.budgetKey) != nil {
             let stored = UserDefaults.standard.double(forKey: Self.budgetKey)
             if case let .ok(value) = BudgetInput.parse(String(stored)) {
@@ -542,11 +577,6 @@ final class UsageStore: ObservableObject {
         syncEnabled = UserDefaults.standard.bool(forKey: Self.syncKey)   // default false
         syncLogin = UserDefaults.standard.string(forKey: "syncLogin")
 
-        let cal = Calendar.current
-        let now = Date()
-        customTo = now
-        customFrom = cal.date(from: cal.dateComponents([.year, .month], from: now)) ?? now
-
         // Connection is credential-driven, not an optional feature toggle. A
         // disconnected install presents its setup CTA in the primary dashboard.
         let explicitlyDisconnected = UserDefaults.standard.bool(
@@ -575,11 +605,13 @@ final class UsageStore: ObservableObject {
         // even though the samples were sitting in the database.
         let latest = CreditSampleStore.latest(account: serverUsageAccountFingerprint)
         if let latest {
-            creditCycles = [CreditCycleSummary(latestSample: latest)]
             serverUsageSample = latest
             creditSamples = Self.loadCycleSamples(
                 resetAtMs: latest.resetAtMs, account: serverUsageAccountFingerprint
             )
+            creditCycles = [CreditCycleSummary(
+                latestSample: latest, firstObservedAtMs: creditSamples.lazy.map(\.observedAtMs).min()
+            )]
             syncCreditSamples = creditSamples
             selectedCreditCycleSamples = creditSamples
         }
@@ -601,12 +633,8 @@ final class UsageStore: ObservableObject {
     // Loading
     // -----------------------------------------------------------------------
 
-    /// Re-read both data sources from disk, then re-aggregate.
+    /// Refresh the saved peer snapshot and poll GitHub without overlapping reloads.
     func reload() async {
-        // Single-flight: reload() is triggered from six places (60s timer, launch,
-        // refresh, popover-open, telemetry setup, budget/currency change). Without
-        // this, two triggers close together (typically on wake) each run a full
-        // loadAll() — concurrent whole-file JSONL scans that peg CPU + memory. (#23)
         guard !isLoading else { return }
         isLoading = true
         let t0 = Date()
@@ -614,7 +642,6 @@ final class UsageStore: ObservableObject {
         let remoteCacheGeneration = syncGeneration
         let machineId = Self.machineId
         let loaded = await Task.detached(priority: .utility) {
-            let usage = DataSources.loadAll()
             let remotes: [MachineSyncPayload]?
             let remoteCacheReadFailed: Bool
             if loadRemoteCache {
@@ -630,14 +657,11 @@ final class UsageStore: ObservableObject {
                 remoteCacheReadFailed = false
             }
             return (
-                usage: usage,
                 remotes: remotes,
                 remoteCacheReadFailed: remoteCacheReadFailed
             )
         }.value
         let loadMs = Int(Date().timeIntervalSince(t0) * 1000)
-        allRecords = loaded.usage.records
-        status = loaded.usage.status
         var installedCurrentRemoteCache = false
         if let remotes = loaded.remotes, syncEnabled,
            syncGeneration == remoteCacheGeneration {
@@ -648,26 +672,7 @@ final class UsageStore: ObservableObject {
                   syncGeneration == remoteCacheGeneration {
             syncError = "Saved multi-Mac usage couldn’t be read. BarPilot kept its current view and will retry."
         }
-        lastUpdated = Date()
-        isLoading = false
-
-        // Watchdog: the Copilot app heartbeats into its JSONL every ~10s, so if
-        // it's running and the file isn't growing, its exporter is dead. Checked
-        // here (main actor) because NSWorkspace is a UI-layer API. (#27)
-        let copilot = NSWorkspace.shared.runningApplications
-            .first { $0.bundleIdentifier == ExporterHealth.copilotBundleId }
-        exporterVerdict = ExporterHealth.evaluate(
-            appRunning: copilot != nil,
-            appUptime: copilot?.launchDate.map { Date().timeIntervalSince($0) },
-            secondsSinceGrowth: status.macAppSecondsSinceGrowth,
-            gapSinceLastCheck: status.gapSinceLastCheck)
-        // Dev-only: force the warning state to eyeball the UI without having to
-        // break a real exporter. Gated to dev builds so a release can never be
-        // coaxed into showing a false alarm.
-        simulatingExporterDown = Updater.isDevBuild
-            && ProcessInfo.processInfo.environment["BARPILOT_SIMULATE_EXPORTER_DOWN"] != nil
-        if simulatingExporterDown { exporterVerdict = .silent(minutes: 14) }
-
+        hasCompletedInitialReload = true
         if RemoteCacheApplicationPolicy.shouldReapplyHistory(
             installedCurrentCache: installedCurrentRemoteCache,
             hasLocalHistory: localCreditHistory != nil
@@ -679,65 +684,26 @@ final class UsageStore: ObservableObject {
         } else {
             recompute()
         }
-        // Rotating support log (#24): load cost + what the reload actually computed
-        // vs the menu title it set — also the #13 display-vs-data drift diagnostic.
-        DiagLog.write("reload: \(loadMs)ms · scanned \(DiagLog.humanBytes(status.jsonlBytesScanned)) · +\(status.newRecords) new · \(allRecords.count) cached · period \(periodKind.rawValue) · menu \(menuBarTitle.hasPrefix("⚠︎") ? "warn" : "ok")\(menuBarTitle.hasSuffix(costString(credits: currentCompactTotalCredits)) ? "" : " · DRIFT")")
-        if syncEnabled { Task { await self.syncNow() } }   // background push/pull
-        if serverUsageEnabled { Task { await self.refreshServerUsage() } }
+        if serverUsageEnabled { await refreshServerUsage() }
+        isLoading = false
+        DiagLog.write("reload: \(loadMs)ms cache read - GitHub \(serverUsageStatusLabel)")
+        // Gist sync is independent of the account-counter poll. Do not hold the
+        // reload single-flight gate while it performs its slower network work.
+        if syncEnabled { Task { await syncNow() } }
     }
-
-    // -----------------------------------------------------------------------
-    // Aggregation (cheap; runs on the main actor)
-    // -----------------------------------------------------------------------
 
     private func recompute() {
         refreshCurrentCreditObservation()
-        // Don't paint the menu bar before the first load lands: init() kicks off
-        // reload() and refreshRate() concurrently, and if the rate fetch wins the
-        // race it would recompute with allRecords still empty — showing a
-        // remote-only (sync) or $0 total until reload finishes. reload() sets
-        // lastUpdated just before its own recompute, so this holds "—" until then. (#20)
-        guard lastUpdated != nil else { return }
-        let range = PeriodResolver.range(kind: periodKind, customFrom: customFrom, customTo: customTo)
-        let today = PeriodResolver.todayStr()
-        if syncEnabled {
-            let remotes = currentRemoteAggregates()
-            syncMachineCount = remotes.count + 1
-            report = Aggregator.buildCombined(
-                localRecords: allRecords, remoteAggregates: remotes,
-                fromStr: range.from, toStr: range.to, todayStr: today)
-        } else {
-            syncMachineCount = 1
-            report = Aggregator.build(
-                records: allRecords, fromStr: range.from, toStr: range.to, todayStr: today)
-        }
-        let monthRange = PeriodResolver.range(
-            kind: .thisMonth, customFrom: customFrom, customTo: customTo)
-        if range.from == monthRange.from && range.to == monthRange.to {
-            currentMonthReport = report
-        } else if syncEnabled {
-            currentMonthReport = Aggregator.buildCombined(
-                localRecords: allRecords, remoteAggregates: currentRemoteAggregates(),
-                fromStr: monthRange.from, toStr: monthRange.to, todayStr: today)
-        } else {
-            currentMonthReport = Aggregator.build(
-                records: allRecords, fromStr: monthRange.from,
-                toStr: monthRange.to, todayStr: today)
-        }
-        reconciled = CreditReconciliation.build(
-            report: report,
-            periodKind: periodKind,
-            snapshot: serverUsageEnabled ? serverUsageSample : nil,
-        )
         updateCreditCycleView()
+        syncMachineCount = syncEnabled ? remoteAggregates.count + 1 : 1
         counterSyncMachineCount = countCounterSyncMachines()
-        // The menu-bar figure must signal when it is a local fallback rather than
-        // the authoritative GitHub total. Reuse the existing warning glyph.
-        let cost = costString(credits: currentCompactTotalCredits)
-        let needsWarning = !serverUsageEnabled || serverUsageStatusIsError
-            || currentServerUsageSample == nil || serverUsageIsStale
-            || showExporterWarning
-        menuBarTitle = needsWarning ? "⚠︎ " + cost : cost
+        if let total = confirmedCurrentCredits {
+            menuBarTitle = costString(credits: total)
+        } else if let provisional = visibleProvisionalPoll {
+            menuBarTitle = "≈" + costString(credits: provisional.creditsUsed)
+        } else {
+            menuBarTitle = "—"
+        }
     }
 
     /// Other machines' payloads from the last successful pull. Excludes this
@@ -777,7 +743,7 @@ final class UsageStore: ObservableObject {
         return syncMachineCount
     }
 
-    /// Turn sync off. Local raw cache untouched; remote data cache cleared and
+    /// Turn sync off. Local counter history untouched; remote data cache cleared and
     /// the token removed. Does NOT delete the remote gist (offered separately).
     func disableSync() {
         syncGeneration += 1
@@ -933,7 +899,7 @@ final class UsageStore: ObservableObject {
         let remotes = snapshot.filter { $0.machineId != Self.machineId }
 
         let projected = SyncAggregate.project(
-            allRecords, creditSamples: syncCreditSamples,
+            creditSamples: syncCreditSamples,
             cycleBudgets: syncCycleBudgets,
             accountFingerprint: accountFingerprint,
             exchangeRateSnapshot: exchangeRateSnapshot,
@@ -1142,6 +1108,10 @@ final class UsageStore: ObservableObject {
         let generation = serverUsageGeneration
         UserDefaults.standard.set(true, forKey: Self.serverUsageDisconnectedKey)
         serverUsageError = nil
+        if provisionalServerUsagePoll != nil {
+            provisionalServerUsagePoll = nil
+            recompute()
+        }
 
         guard let fingerprint = await CreditUsageAPI.accountFingerprint(token: token) else {
             guard generation == serverUsageGeneration else { return false }
@@ -1164,17 +1134,17 @@ final class UsageStore: ObservableObject {
         let budgetChangedAtMs = budgetUpdatedAtMs
         let previous = serverUsageAccountFingerprint == fingerprint
             ? serverUsageSample : nil
-        let transitionNeedsConfirmation = CreditCycleTransitionPolicy
-            .needsConfirmation(previous: previous, current: sample)
+        let disposition = CreditCycleTransitionPolicy.disposition(previous: previous, current: sample)
 
         guard CreditUsageKeychain.saveToken(token) else {
             serverUsageError = "GitHub authenticated, but the credential couldn’t be saved securely."
             recompute()
             return false
         }
-        if transitionNeedsConfirmation {
+        if disposition != .record {
             return finishServerUsageConnectionAwaitingTransition(
-                sample: sample, fingerprint: fingerprint
+                fingerprint: fingerprint,
+                provisionalSample: disposition == .showProvisional ? sample : nil
             )
         }
         let saved = await Task.detached(priority: .utility) {
@@ -1210,15 +1180,15 @@ final class UsageStore: ObservableObject {
         )
     }
 
-    /// Reconnect without persisting a boundary response that still carries the
-    /// previous cycle's counter. The normal poll path will accept it only after
-    /// GitHub supplies a value below that prior high-water mark.
+    /// Keep the saved previous sample as the comparison point when reconnecting
+    /// during an ambiguous rollover.
     private func finishServerUsageConnectionAwaitingTransition(
-        sample: CreditSample, fingerprint: String
+        fingerprint: String, provisionalSample: CreditSample?
     ) -> Bool {
         resetCreditCycleSelection()
         resetSpendCalendar()
-        pendingCycleTransitionSample = sample
+        lastSuccessfulServerUsagePoll = nil
+        provisionalServerUsagePoll = provisionalSample
         serverUsageAccountFingerprint = fingerprint
         UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
         serverUsageEnabled = true
@@ -1240,11 +1210,12 @@ final class UsageStore: ObservableObject {
         let accountChanged = serverUsageAccountFingerprint != fingerprint
         resetCreditCycleSelection()
         resetSpendCalendar()
-        pendingCycleTransitionSample = nil
         serverUsageAccountFingerprint = fingerprint
+        lastSuccessfulServerUsagePoll = sample
         if accountChanged {
             syncCycleBudgets = []
             localCreditHistory = nil
+            savedCreditActivityByCycle = [:]
         }
         UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
         serverUsageEnabled = true
@@ -1285,22 +1256,13 @@ final class UsageStore: ObservableObject {
     private func resetSpendCalendar() {
         spendCalendarLoadGeneration += 1
         spendCalendarDailyCredits = [:]
+        spendCalendarLocalSamples = [:]
         spendCalendarMonthKey = nil
         isLoadingSpendCalendar = false
     }
 
     private func upsertCreditCycle(_ sample: CreditSample) {
-        let summary = CreditCycleSummary(latestSample: sample)
-        if let index = creditCycles.firstIndex(where: {
-            $0.resetDayMs == summary.resetDayMs
-        }) {
-            if sample.capturedAtMs >= creditCycles[index].latestSample.capturedAtMs {
-                creditCycles[index] = summary
-            }
-        } else {
-            creditCycles.append(summary)
-        }
-        creditCycles.sort { $0.resetDayMs > $1.resetDayMs }
+        creditCycles = SyncAggregate.mergedCreditCycles(local: creditCycles, additionalSamples: [sample])
     }
 
     private func refreshCreditCycles() async {
@@ -1366,11 +1328,11 @@ final class UsageStore: ObservableObject {
             stored: stored.cycleBudgets, live: syncCycleBudgets
         )
 
-        // A disconnected dashboard intentionally falls back to local telemetry.
+        // A disconnected dashboard intentionally has no current usage amount.
         // The history load above exists only to keep the sync upload complete;
         // do not leak retained account-counter rows back into that fallback UI.
         guard serverUsageEnabled else {
-            previousCreditActivity = []
+            savedCreditActivityByCycle = [:]
             recompute()
             return
         }
@@ -1385,30 +1347,19 @@ final class UsageStore: ObservableObject {
         } else {
             remoteSamples = []
         }
-        creditCycles = SyncAggregate.mergedCreditCycles(
-            local: stored.cycles,
-            additionalSamples: remoteSamples
-                + [serverUsageSample].compactMap { $0 }
+        creditCycles = stored.mergingCycles(
+            with: remoteSamples + creditSamples + [serverUsageSample].compactMap { $0 }
         )
-        refreshCurrentCreditObservation()
-        let liveDay = CreditCycleSummary.liveCycleDay(
-            currentSample: currentServerUsageSample, cycles: creditCycles
-        )
-        previousCreditActivity = CreditTimeline.combinedDailyRows(
-            samplesByCycle: creditCycles.compactMap { cycle in
-                guard cycle.resetDayMs != liveDay else { return nil }
-                let local = stored.samplesByCycle[cycle.resetDayMs] ?? []
-                if let account {
-                    return SyncAggregate.mergedCreditSamples(
-                        local: local,
-                        remotes: remotes,
-                        resetAtMs: cycle.resetAtMs,
-                        accountFingerprint: account
-                    )
-                }
-                return local
-            }
-        )
+        savedCreditActivityByCycle = Dictionary(uniqueKeysWithValues: creditCycles.map { cycle in
+            let local = stored.samplesByCycle[cycle.resetDayMs] ?? []
+            let samples = account.map {
+                SyncAggregate.mergedCreditSamples(
+                    local: local, remotes: remotes,
+                    resetAtMs: cycle.resetAtMs, accountFingerprint: $0
+                )
+            } ?? local
+            return (cycle.resetDayMs, CreditTimeline.build(samples: samples).daily)
+        })
         if let selectedCreditCycleDayMs,
            !creditCycles.contains(where: {
                $0.resetDayMs == selectedCreditCycleDayMs
@@ -1428,9 +1379,10 @@ final class UsageStore: ObservableObject {
 
     private func transitionToDisconnectedServerUsage(error: String?) {
         serverUsageEnabled = false
-        pendingCycleTransitionSample = nil
+        lastSuccessfulServerUsagePoll = nil
+        provisionalServerUsagePoll = nil
         budgetMigrationCycleDayMs = nil
-        previousCreditActivity = []
+        savedCreditActivityByCycle = [:]
         resetCreditCycleSelection()
         resetSpendCalendar()
         UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
@@ -1528,38 +1480,6 @@ final class UsageStore: ObservableObject {
                   !Task.isCancelled else {
                 return .notNeeded
             }
-            let previous = serverUsageSample
-            var confirmedPendingTransition = false
-            if let pending = pendingCycleTransitionSample {
-                if CreditCycleTransitionPolicy.confirms(
-                    previous: previous ?? pending,
-                    pending: pending,
-                    current: sample
-                ) {
-                    confirmedPendingTransition = true
-                    pendingCycleTransitionSample = nil
-                } else if CreditCycleSummary.dayStart(for: pending.resetAtMs)
-                            == CreditCycleSummary.dayStart(for: sample.resetAtMs) {
-                    // A repeated non-zero value is still indistinguishable from
-                    // the old cycle's cached counter. Keep waiting without ever
-                    // writing it into the new cycle.
-                    serverUsageError = nil
-                    recompute()
-                    return .refreshed
-                } else {
-                    pendingCycleTransitionSample = nil
-                }
-            }
-            if !confirmedPendingTransition,
-               CreditCycleTransitionPolicy.needsConfirmation(
-                   previous: previous, current: sample
-               ) {
-                pendingCycleTransitionSample = sample
-                serverUsageError = nil
-                recompute()
-                return .refreshed
-            }
-
             let resolvedAccountDuringRefresh = serverUsageAccountFingerprint == nil
             if resolvedAccountDuringRefresh {
                 guard let fingerprint = await CreditUsageAPI.accountFingerprint(token: token) else {
@@ -1580,6 +1500,16 @@ final class UsageStore: ObservableObject {
                 syncCycleBudgets = []
                 UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
             }
+            let previous = serverUsageSample
+            let disposition = CreditCycleTransitionPolicy.disposition(previous: previous, current: sample)
+            provisionalServerUsagePoll = disposition == .showProvisional ? sample : nil
+            guard disposition == .record else {
+                serverUsageError = nil
+                recompute()
+                if resolvedAccountDuringRefresh { await refreshCreditCycles() }
+                return .refreshed
+            }
+
             let account = serverUsageAccountFingerprint
             let budgetUSD = monthlyBudget
             let budgetChangedAtMs = self.budgetUpdatedAtMs
@@ -1604,6 +1534,7 @@ final class UsageStore: ObservableObject {
                 return .notNeeded
             }
             budgetPersistenceError = nil
+            lastSuccessfulServerUsagePoll = sample
             upsertLocalCycleBudget(
                 resetDayMs: CreditCycleSummary.dayStart(for: sample.resetAtMs),
                 budgetUSD: budgetUSD, updatedAtMs: budgetChangedAtMs
@@ -1620,7 +1551,7 @@ final class UsageStore: ObservableObject {
             let rolledOver = CreditCycleTransitionPolicy.rolledOver(
                 previous: previous, current: sample
             )
-            if rolledOver || confirmedPendingTransition {
+            if rolledOver {
                 creditSamples = [sample]
             } else if previous == nil || sample.resetAtMs != previous?.resetAtMs {
                 // First sample of the session, or the reset instant shifted within
@@ -1650,8 +1581,10 @@ final class UsageStore: ObservableObject {
             } else {
                 await refreshBudgetMigrationCycle()
             }
-            if resolvedAccountDuringRefresh, syncEnabled {
-                await syncNow()
+            // Reload schedules its own sync once it releases the foreground
+            // loading state. A standalone wake poll can schedule sync directly.
+            if resolvedAccountDuringRefresh, syncEnabled, !isLoading {
+                Task { await syncNow() }
             }
             return .refreshed
         } catch {
@@ -1659,6 +1592,7 @@ final class UsageStore: ObservableObject {
             guard serverUsageEnabled, generation == serverUsageGeneration else {
                 return .notNeeded
             }
+            provisionalServerUsagePoll = nil
             serverUsageError = Self.serverUsageErrorMessage(error)
             if case .unauthorized = error as? CreditUsageError {
                 let message = serverUsageError
@@ -1738,15 +1672,16 @@ final class UsageStore: ObservableObject {
         )
     }
 
-    var displayTotalCredits: Double { reconciled.totalCredits }
     var rollingCreditActivity: [ObservedDayCredits] {
-        CreditTimeline.mergedDailyRows([
-            creditTimeline.daily, previousCreditActivity
-        ])
+        CreditHistoryMergePolicy.rollingActivity(
+            live: creditTimeline.daily,
+            liveCycleDay: selectedCreditCycle?.resetDayMs,
+            savedByCycle: savedCreditActivityByCycle
+        )
     }
     private func refreshCurrentCreditObservation() {
-        // Gated on the connection too: an explicit disconnect drops the headline
-        // to local telemetry. While connected, however, a matching peer may be
+        // Gated on the connection too: an explicit disconnect clears the current
+        // headline. While connected, however, a matching peer may be
         // the only Mac that observed the current cycle rollover.
         guard serverUsageEnabled else {
             resolvedCurrentCreditObservation = nil
@@ -1755,7 +1690,9 @@ final class UsageStore: ObservableObject {
         resolvedCurrentCreditObservation = SyncAggregate.currentCreditObservation(
             local: serverUsageSample,
             remotes: syncEnabled ? currentRemoteAggregates() : [],
-            accountFingerprint: serverUsageAccountFingerprint
+            accountFingerprint: serverUsageAccountFingerprint,
+            localWasDirectlyPolled: serverUsageSample == lastSuccessfulServerUsagePoll,
+            knownCycles: creditCycles
         )
     }
     private var currentServerUsageObservation: CurrentCreditObservation? {
@@ -1768,30 +1705,48 @@ final class UsageStore: ObservableObject {
         currentServerUsageObservation?.cameFromRemote == true
     }
     var currentServerUsageObservedAt: Date? {
-        guard let sample = currentServerUsageSample else { return nil }
-        return Date(timeIntervalSince1970: Double(
-            sample.serverAtMs ?? sample.capturedAtMs
-        ) / 1000)
+        visibleProvisionalPoll?.observedAt ?? currentServerUsageSample?.observedAt
     }
-    var compactTotalCredits: Double {
+    var compactTotalCredits: Double? {
         if selectedCreditCycleDayMs != nil {
             return selectedHistoricalTotalCredits
                 ?? selectedCreditCycle?.latestSample.creditsUsed
-                ?? currentCompactTotalCredits
         }
-        return currentCompactTotalCredits
+        return confirmedCurrentCredits ?? visibleProvisionalPoll?.creditsUsed
     }
 
-    private var currentCompactTotalCredits: Double {
-        guard serverUsageEnabled, let sample = currentServerUsageSample else {
-            return currentMonthReport.totalCredits
+    var currentCreditTotalIsProvisional: Bool { visibleProvisionalPoll != nil }
+
+    private var visibleProvisionalPoll: CreditSample? {
+        guard confirmedCurrentCredits == nil, let provisionalServerUsagePoll,
+              CreditCycle.visibleCurrentCredits(
+                sample: provisionalServerUsagePoll,
+                connected: serverUsageEnabled,
+                pollFailed: serverUsageError != nil,
+                hasSuccessfulPoll: true,
+                directlyPolled: true
+              ) != nil else { return nil }
+        return provisionalServerUsagePoll
+    }
+
+    private var confirmedCurrentCredits: Double? {
+        let sample = currentServerUsageSample
+        let range = sample.flatMap { current in
+            let day = CreditCycleSummary.dayStart(for: current.resetAtMs)
+            return creditCycles.first { $0.resetDayMs == day }.flatMap {
+                CreditCycle.range(for: $0, in: creditCycles)
+            }
         }
-        guard CreditReconciliation.matchesCurrentCycle(
-            snapshot: sample, report: currentMonthReport, now: Date()
-        ) else {
-            return sample.creditsUsed
-        }
-        return max(sample.creditsUsed, currentMonthReport.totalCredits)
+        return CreditCycle.visibleCurrentCredits(
+            sample: sample,
+            connected: serverUsageEnabled,
+            pollFailed: serverUsageError != nil,
+            hasSuccessfulPoll: lastSuccessfulServerUsagePoll != nil
+                || provisionalServerUsagePoll != nil,
+            directlyPolled: !currentServerUsageSampleIsRemote
+                && sample == lastSuccessfulServerUsagePoll,
+            knownRange: range
+        )
     }
 
     var selectedCreditCycle: CreditCycleSummary? {
@@ -1885,67 +1840,61 @@ final class UsageStore: ObservableObject {
         budgetMigrationCycleDayMs = candidate
     }
 
+    var canOpenSpendCalendar: Bool {
+        serverUsageEnabled && !creditCycles.isEmpty
+    }
+
+    private var creditCycleNavigation: CreditCycleNavigation {
+        CreditCycleNavigation(
+            cycles: creditCycles, selectedDay: selectedCreditCycleDayMs, liveDay: currentCreditCycleDay
+        )
+    }
+
+    private var currentCreditCycleDay: Int64? {
+        currentServerUsageSample.map { CreditCycleSummary.dayStart(for: $0.resetAtMs) }
+    }
+
     var canSelectOlderCreditCycle: Bool {
-        guard let selectedCreditCycle,
-              let index = creditCycles.firstIndex(of: selectedCreditCycle) else {
-            return false
-        }
-        return creditCycles.indices.contains(index + 1)
+        serverUsageEnabled && creditCycleNavigation.older != nil
     }
 
     var canSelectNewerCreditCycle: Bool {
-        guard let selectedCreditCycle,
-              let index = creditCycles.firstIndex(of: selectedCreditCycle) else {
-            return false
-        }
-        return index > 0
+        guard serverUsageEnabled else { return false }
+        let navigation = creditCycleNavigation
+        return navigation.newer != nil || navigation.canReturnToCurrent
     }
 
     func selectOlderCreditCycle() {
-        guard let selectedCreditCycle,
-              let index = creditCycles.firstIndex(of: selectedCreditCycle),
-              creditCycles.indices.contains(index + 1) else {
-            return
-        }
-        selectCreditCycle(creditCycles[index + 1].resetDayMs)
+        guard serverUsageEnabled, let older = creditCycleNavigation.older else { return }
+        selectCreditCycle(older.resetDayMs)
     }
 
     func selectNewerCreditCycle() {
-        guard let selectedCreditCycle,
-              let index = creditCycles.firstIndex(of: selectedCreditCycle),
-              index > 0 else {
-            return
-        }
-        let newer = creditCycles[index - 1]
-        let liveDay = CreditCycleSummary.liveCycleDay(
-            currentSample: currentServerUsageSample, cycles: creditCycles
-        )
-        if newer.resetDayMs == liveDay {
-            selectedCreditCycleDayMs = nil
-            selectedCreditCycleSamples = creditSamples
-            selectedHistoricalBudgetUSD = nil
-            updateCreditCycleView()
-        } else {
+        guard serverUsageEnabled, !isLoadingCreditCycle else { return }
+        let navigation = creditCycleNavigation
+        if let newer = navigation.newer {
             selectCreditCycle(newer.resetDayMs)
+        } else if navigation.canReturnToCurrent {
+            resetCreditCycleSelection()
+            updateCreditCycleView()
         }
     }
 
     @discardableResult
     func selectCreditCycle(containingUTCDate date: Date) -> Bool {
-        guard !isLoadingCreditCycle,
+        guard serverUsageEnabled, !isLoadingCreditCycle,
               let target = CreditCycleSummary.cycle(
                   containingUTCDate: date, in: creditCycles
               ) else {
             return false
         }
-        let liveDay = CreditCycleSummary.liveCycleDay(
-            currentSample: currentServerUsageSample, cycles: creditCycles
-        )
-        if target.resetDayMs == liveDay {
+        if CreditCycleNavigation.isCompleted(target, in: creditCycles, liveDay: currentCreditCycleDay, now: Date()) {
+            selectCreditCycle(target.resetDayMs)
+        } else if currentCreditCycleDay == nil || currentCreditCycleDay == target.resetDayMs {
             resetCreditCycleSelection()
             updateCreditCycleView()
         } else {
-            selectCreditCycle(target.resetDayMs)
+            return false
         }
         return true
     }
@@ -1957,9 +1906,10 @@ final class UsageStore: ObservableObject {
         let account = serverUsageAccountFingerprint
         let monthKey = CreditCycleSummary.utcMonthKey(for: month)
         let cycles = creditCycles.filter {
-            CreditCycleSummary.overlapsUTCMonth($0, containing: month)
+            CreditCycleSummary.overlapsUTCMonth($0, containing: month, in: creditCycles)
         }
         spendCalendarDailyCredits = [:]
+        spendCalendarLocalSamples = [:]
         spendCalendarMonthKey = nil
         guard serverUsageEnabled, !cycles.isEmpty else {
             isLoadingSpendCalendar = false
@@ -2005,19 +1955,14 @@ final class UsageStore: ObservableObject {
             spendCalendarDailyCredits = CreditTimeline.combinedDaily(
                 samplesByCycle: samplesByCycle, monthKey: monthKey
             )
+            spendCalendarLocalSamples = Dictionary(uniqueKeysWithValues: stored.map { ($0.0.id, $0.1) })
             spendCalendarMonthKey = monthKey
             isLoadingSpendCalendar = false
         }
     }
 
     private func selectCreditCycle(_ resetDayMs: Int64) {
-        let liveDay = CreditCycleSummary.liveCycleDay(
-            currentSample: currentServerUsageSample, cycles: creditCycles
-        )
-        guard resetDayMs != liveDay,
-              !isLoadingCreditCycle else {
-            return
-        }
+        guard !isLoadingCreditCycle else { return }
         let account = serverUsageAccountFingerprint
         let generation = serverUsageGeneration
         creditCycleLoadGeneration += 1
@@ -2103,6 +2048,51 @@ final class UsageStore: ObservableObject {
         }
     }
 
+    var creditHistorySelectionID: Int { serverUsageGeneration }
+
+    var selectedCreditCycleStart: Date? {
+        selectedCreditCycle?.startAt(in: creditCycles)
+    }
+
+    var selectedCreditCycleEnd: Date? {
+        selectedCreditCycle?.endAt(in: creditCycles)
+    }
+
+    func calendarSamples(on date: Date) -> [Int64: [CreditSample]] {
+        guard spendCalendarMonthKey == CreditCycleSummary.utcMonthKey(for: date) else { return [:] }
+        return spendCalendarLocalSamples
+    }
+
+    func observedCredits(on date: Date, calendarSamples: [Int64: [CreditSample]]) -> Double? {
+        guard serverUsageEnabled else { return nil }
+        let day = CreditCycleSummary.utcDayString(for: date)
+        let selectedID = selectedCreditCycle?.id
+        var credits = creditTimeline.daily.first { $0.day == day }?.credits
+
+        // A split reset day can include spend from a second cycle. Keep that
+        // cycle's detailed calendar samples since compacting them can change
+        // which increases are attributed to this day.
+        let remotes = syncEnabled ? currentRemoteAggregates() : []
+        let localCycleDay = serverUsageSample.map {
+            CreditCycleSummary.dayStart(for: $0.resetAtMs)
+        }
+        for cycle in creditCycles where cycle.id != selectedID
+            && (calendarSamples[cycle.id] != nil || cycle.id == currentCreditCycleDay) {
+            let local = localCycleDay == cycle.id
+                ? creditSamples : calendarSamples[cycle.id] ?? []
+            let samples = serverUsageAccountFingerprint.map {
+                SyncAggregate.mergedCreditSamples(
+                    local: local, remotes: remotes,
+                    resetAtMs: cycle.resetAtMs, accountFingerprint: $0
+                )
+            } ?? local
+            if let other = CreditTimeline.build(samples: samples).daily.first(where: { $0.day == day }) {
+                credits = (credits ?? 0) + other.credits
+            }
+        }
+        return credits
+    }
+
     private func countCounterSyncMachines() -> Int {
         guard syncEnabled, let accountFingerprint = serverUsageAccountFingerprint else { return 1 }
         let matching = currentRemoteAggregates().filter {
@@ -2111,25 +2101,13 @@ final class UsageStore: ObservableObject {
         }
         return matching.count + 1
     }
-    var classifiedTotalCredits: Double { reconciled.classifiedCredits }
-    var sessionClassifiedTotalCredits: Double {
-        report.sessions.reduce(0) { $0 + $1.credits }
-    }
-    var unclassifiedCredits: Double { reconciled.unclassifiedCredits }
-    var summaryRows: [SummaryRow] { reconciled.summary }
-    var modelRows: [ModelRow] { reconciled.models }
-    var dailyRows: [DailyRow] { reconciled.daily }
-
     var serverUsageIsStale: Bool {
         guard let observedAt = currentServerUsageObservedAt else { return false }
         return Date().timeIntervalSince(observedAt) > 5 * 60
     }
 
-    /// A failed direct poll is not a dashboard failure when a fresh matching Mac
-    /// supplied the same authoritative account counter through sync.
     var serverUsageStatusIsError: Bool {
         serverUsageError != nil
-            && !(currentServerUsageSampleIsRemote && !serverUsageIsStale)
     }
 
     var serverUsageStatusLabel: String {
@@ -2137,6 +2115,7 @@ final class UsageStore: ObservableObject {
             return serverUsageError == nil ? "GitHub · disconnected" : "GitHub · reconnect required"
         }
         if serverUsageStatusIsError { return "GitHub · error" }
+        if visibleProvisionalPoll != nil { return "GitHub · cycle unconfirmed" }
         if currentServerUsageSample == nil && serverUsageSample == nil {
             return "GitHub · connecting"
         }
@@ -2149,11 +2128,6 @@ final class UsageStore: ObservableObject {
             return "GitHub · via sync"
         }
         return "GitHub · connected"
-    }
-
-    private func onPeriodChanged() {
-        UserDefaults.standard.set(periodKind.rawValue, forKey: Self.periodKey)
-        recompute()
     }
 
     private func persistBudget(previousValue: Double) {
@@ -2241,7 +2215,7 @@ final class UsageStore: ObservableObject {
         let changed = adoptNewestExchangeRate(from: [snapshot])
         // reload() owns the initial sync. If the network wins the launch race,
         // publishing here would replace this machine's gist rows with an empty set.
-        if changed, syncEnabled, lastUpdated != nil { await syncNow() }
+        if changed, syncEnabled, hasCompletedInitialReload { await syncNow() }
     }
 
     @discardableResult
@@ -2331,155 +2305,20 @@ final class UsageStore: ObservableObject {
     /// progress through the month (matching the "This month's budget" label),
     /// rather than a per-day pro-ration that collapses to a single day on the 1st.
     /// Every other period pro-rates the daily rate across the days in its range.
-    var periodBudgetCredits: Double {
-        if periodKind == .thisMonth {
-            return monthlyBudget * 100.0
-        }
-        let perDayCredits = (monthlyBudget * 100.0) / Self.avgDaysPerMonth
-        return perDayCredits * Double(max(report.daysInRange, 1))
-    }
-
-    var spendTitle: String { periodKind.spendTitle }
-
-    /// Run-rate projection of full-month spend (nil unless viewing an in-progress
-    /// month with usage). Pure + derived from the current report — see #18.
-    var spendProjection: SpendProjection? {
-        var displayReport = report
-        displayReport.totalCredits = reconciled.totalCredits
-        displayReport.todayCredits = reconciled.todayCredits
-        return SpendProjection.compute(periodKind: periodKind, report: displayReport,
-                                monthlyBudgetUSD: monthlyBudget, now: Date(),
-                                excludeWeekends: excludeWeekendsFromProjection)
-    }
-
     var compactSpendProjection: SpendProjection? {
         guard isViewingCurrentCreditCycle,
-              let cycle = selectedCreditCycle,
-              let startAt = cycle.startAt else { return nil }
+              let totalCredits = confirmedCurrentCredits,
+              let startAt = selectedCreditCycleStart,
+              let endAt = selectedCreditCycleEnd else { return nil }
         return SpendProjection.computeBillingCycle(
-            totalCredits: currentCompactTotalCredits,
+            totalCredits: totalCredits,
             monthlyBudgetUSD: monthlyBudget,
             startAt: startAt,
-            resetAt: cycle.resetAt,
+            resetAt: endAt,
             now: Date(),
             calendar: Self.utcCalendar,
             excludeWeekends: excludeWeekendsFromProjection)
     }
 
-    // -----------------------------------------------------------------------
-    // Sparkline series
-    // -----------------------------------------------------------------------
 
-    /// Daily series for the header sparkline. For short periods it spans the
-    /// period's FULL calendar extent — so "This Month" shows the whole month with
-    /// only used days drawn and the rest blank, filling in as the month
-    /// progresses. This Year / All Time (and any range > 45 days) keep the raw
-    /// data-day series, since a bar-per-day won't fit the strip.
-    var sparklineTotals: [DayTotal] {
-        // In sync mode the combined dailyTotals are UTC-keyed; the full-extent grid
-        // keys by local day, so they wouldn't match — fall back to the raw series.
-        guard !syncEnabled, let (start, end) = sparklineExtent() else { return reconciled.dailyTotals }
-        let cal = Calendar.current
-        let days = (cal.dateComponents([.day], from: start, to: end).day ?? 0) + 1
-        guard days >= 1, days <= 45 else { return reconciled.dailyTotals }
-        var byDay: [String: Double] = [:]
-        for t in reconciled.dailyTotals { byDay[t.day] = t.credits }
-        var out: [DayTotal] = []
-        var d = start
-        for _ in 0..<days {
-            let key = Self.dayString(d, cal)
-            out.append(DayTotal(day: key, credits: byDay[key] ?? 0))
-            guard let next = cal.date(byAdding: .day, value: 1, to: d) else { break }
-            d = next
-        }
-        return out
-    }
-
-    /// Full calendar extent (local calendar) to chart for the current period, or
-    /// nil for periods that keep the raw data-day series (This Year / All Time).
-    private func sparklineExtent() -> (start: Date, end: Date)? {
-        let cal = Calendar.current
-        let today = cal.startOfDay(for: Date())
-        switch periodKind {
-        case .today:
-            return (today, today)
-        case .last7:
-            return (cal.date(byAdding: .day, value: -6, to: today) ?? today, today)
-        case .last30:
-            return (cal.date(byAdding: .day, value: -29, to: today) ?? today, today)
-        case .thisMonth:
-            let comps = cal.dateComponents([.year, .month], from: today)
-            guard let first = cal.date(from: comps),
-                  let range = cal.range(of: .day, in: .month, for: today) else { return nil }
-            return (first, cal.date(byAdding: .day, value: range.count - 1, to: first) ?? first)
-        case .previousMonth:
-            let comps = cal.dateComponents([.year, .month], from: today)
-            guard let firstOfThis = cal.date(from: comps),
-                  let lastOfPrev = cal.date(byAdding: .day, value: -1, to: firstOfThis),
-                  let firstOfPrev = cal.date(from: cal.dateComponents([.year, .month], from: lastOfPrev))
-                  else { return nil }
-            return (firstOfPrev, lastOfPrev)
-        case .custom:
-            let a = cal.startOfDay(for: customFrom), b = cal.startOfDay(for: customTo)
-            return a <= b ? (a, b) : (b, a)
-        case .thisYear, .allTime:
-            return nil
-        }
-    }
-
-    /// "YYYY-MM-DD" in the local calendar — matches `Aggregator.localDayStr` keys.
-    private static func dayString(_ d: Date, _ cal: Calendar) -> String {
-        let c = cal.dateComponents([.year, .month, .day], from: d)
-        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
-    }
-
-    // -----------------------------------------------------------------------
-    // Telemetry setup (explicit, user-confirmed)
-    // -----------------------------------------------------------------------
-
-    /// Confirm, then natively enable OTel telemetry for any unconfigured source.
-    func runTelemetrySetup() {
-        let planned = TelemetrySetup.plannedChanges()
-        guard !planned.isEmpty else { return }
-
-        let confirm = NSAlert()
-        confirm.messageText = "Enable Copilot telemetry?"
-        confirm.informativeText = """
-        BarPilot will make these changes (all in your ~/Library — no admin needed):
-
-        • \(planned.joined(separator: "\n• "))
-
-        macOS may show a “Background Items Added” notice for the LaunchAgent. \
-        Afterwards, restart VS Code and quit & relaunch the GitHub Copilot app.
-        """
-        confirm.addButton(withTitle: "Enable")
-        confirm.addButton(withTitle: "Cancel")
-        NSApp.activate(ignoringOtherApps: true)
-        guard confirm.runModal() == .alertFirstButtonReturn else { return }
-
-        let result = TelemetrySetup.enableAll()
-
-        let done = NSAlert()
-        if result.ok {
-            done.messageText = "Telemetry enabled"
-            done.informativeText = """
-            Applied:
-            • \(result.changes.joined(separator: "\n• "))
-
-            Next: restart VS Code, and quit & relaunch the GitHub Copilot app, then \
-            use Copilot to start recording usage.
-            """
-        } else {
-            done.alertStyle = .warning
-            done.messageText = "Setup partly failed"
-            let applied = result.changes.isEmpty ? "" : "Applied:\n• \(result.changes.joined(separator: "\n• "))\n\n"
-            done.informativeText = applied + "Problems:\n• \(result.errors.joined(separator: "\n• "))"
-        }
-        done.runModal()
-
-        Task { await reload() }
-    }
-
-    /// Set the monthly budget via a simple input dialog (right-click menu entry).
-    /// Input is in the displayed currency; stored canonically in USD.
 }
