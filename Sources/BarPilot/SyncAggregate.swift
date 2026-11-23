@@ -375,7 +375,9 @@ enum SyncAggregate {
     /// newest (live) cycle. Completed cycles retain the first, high-water and
     /// last sample of each UTC day: that preserves correction-aware attribution
     /// while reducing a year of history from ~39,000 rows to hundreds.
-    /// Reset-time variants on the same UTC day belong to the same cycle.
+    /// Also keep the first observation that can establish an early boundary
+    /// after the preceding cycle's final observation. Reset-time variants on
+    /// the same UTC day belong to the same cycle.
     static func compactCreditSamples(_ samples: [CreditSample]) -> [CreditSample] {
         struct Bucket: Hashable {
             var resetDayMs: Int64
@@ -395,15 +397,22 @@ enum SyncAggregate {
             let rhs = effectiveAt($1)
             return lhs == rhs ? $0.capturedAtMs < $1.capturedAtMs : lhs < rhs
         }
-        let detailedCycle = ordered.map {
-            CreditCycleSummary.dayStart(for: $0.resetAtMs)
-        }.max()
+        var lastByCycle: [Int64: CreditSample] = [:]
+        for sample in ordered {
+            lastByCycle[CreditCycleSummary.dayStart(for: sample.resetAtMs)] = sample
+        }
+        let detailedCycle = lastByCycle.keys.max()
+        let precedingObservations = precedingCycleObservations(latestByCycle: lastByCycle)
         var firstByBucket: [Bucket: CreditSample] = [:]
         var lastByCompletedDay: [Bucket: CreditSample] = [:]
         var peakByCompletedDay: [Bucket: CreditSample] = [:]
-        var lastByCycle: [Int64: CreditSample] = [:]
+        var firstAfterPreceding: [Int64: CreditSample] = [:]
         for sample in ordered {
             let resetDay = CreditCycleSummary.dayStart(for: sample.resetAtMs)
+            if firstAfterPreceding[resetDay] == nil,
+               let preceding = precedingObservations[resetDay], sample.observedAtMs > preceding {
+                firstAfterPreceding[resetDay] = sample
+            }
             let bucketWidth = resetDay == detailedCycle
                 ? Int64(15 * 60 * 1000)
                 : CreditCycleSummary.dayMs
@@ -420,12 +429,12 @@ enum SyncAggregate {
                     peakByCompletedDay[bucket] = sample
                 }
             }
-            lastByCycle[resetDay] = sample
         }
         var retained: [RetainedKey: CreditSample] = [:]
         for group in [
             Array(firstByBucket.values), Array(peakByCompletedDay.values),
-            Array(lastByCompletedDay.values), Array(lastByCycle.values)
+            Array(lastByCompletedDay.values), Array(lastByCycle.values),
+            Array(firstAfterPreceding.values)
         ] {
             for sample in group {
                 retained[RetainedKey(
@@ -491,11 +500,8 @@ enum SyncAggregate {
         local: [CreditCycleSummary],
         additionalSamples: [CreditSample]
     ) -> [CreditCycleSummary] {
-        var cyclesByDay = Dictionary(
-            uniqueKeysWithValues: local.map {
-                ($0.resetDayMs, $0)
-            }
-        )
+        let localByDay = Dictionary(uniqueKeysWithValues: local.map { ($0.resetDayMs, $0) })
+        var cyclesByDay = localByDay
         for sample in additionalSamples {
             let day = CreditCycleSummary.dayStart(for: sample.resetAtMs)
             guard let previous = cyclesByDay[day] else {
@@ -506,11 +512,43 @@ enum SyncAggregate {
             let latest = previous.latestSample
             let isNewer = sample.observedAtMs > latest.observedAtMs
                 || (sample.observedAtMs == latest.observedAtMs && sample.capturedAtMs >= latest.capturedAtMs)
+            guard isNewer || earlier < previous.firstObservedAtMs else { continue }
             cyclesByDay[day] = CreditCycleSummary(
                 latestSample: isNewer ? sample : latest, firstObservedAtMs: earlier
             )
         }
-        return cyclesByDay.values.sorted { $0.resetDayMs > $1.resetDayMs }
+
+        let precedingObservations = precedingCycleObservations(latestByCycle: cyclesByDay.mapValues(\.latestSample))
+        var firstAfterPreceding: [Int64: Int64] = [:]
+        for sample in additionalSamples {
+            let day = CreditCycleSummary.dayStart(for: sample.resetAtMs)
+            let observedAt = sample.observedAtMs
+            if let preceding = precedingObservations[day], observedAt > preceding {
+                firstAfterPreceding[day] = min(firstAfterPreceding[day] ?? observedAt, observedAt)
+            }
+        }
+        return cyclesByDay.values.map { cycle in
+            guard let preceding = precedingObservations[cycle.resetDayMs],
+                  cycle.firstObservedAtMs <= preceding else {
+                return CreditCycleSummary(latestSample: cycle.latestSample, firstObservedAtMs: cycle.firstObservedAtMs)
+            }
+            let local = localByDay[cycle.resetDayMs]
+            let firstAfter = [
+                local?.firstObservedAtMs, local?.firstObservationAfterPrecedingCycleAtMs,
+                firstAfterPreceding[cycle.resetDayMs], cycle.latestSample.observedAtMs
+            ].compactMap { $0 }.filter { $0 > preceding }.min()
+            return CreditCycleSummary(
+                latestSample: cycle.latestSample, firstObservedAtMs: cycle.firstObservedAtMs,
+                firstObservationAfterPrecedingCycleAtMs: firstAfter
+            )
+        }.sorted { $0.resetDayMs > $1.resetDayMs }
+    }
+
+    private static func precedingCycleObservations(latestByCycle: [Int64: CreditSample]) -> [Int64: Int64] {
+        let ordered = latestByCycle.sorted { $0.key < $1.key }
+        return Dictionary(uniqueKeysWithValues: zip(ordered.dropFirst(), ordered).map { current, preceding in
+            (current.key, preceding.value.observedAtMs)
+        })
     }
 
     /// Select the newest valid account-counter observation available to this

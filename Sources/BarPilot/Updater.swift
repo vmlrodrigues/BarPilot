@@ -26,6 +26,7 @@ final class Updater {
     private static let recoveryArgument = "--recovered-staged-update"
     @MainActor private static var isChecking = false
     @MainActor private static var installer: Process?
+    @MainActor private static var startupLease: BundleLease?
     private let interval: TimeInterval = 6 * 60 * 60   // re-check every 6 hours
     private var timer: Timer?
 
@@ -170,6 +171,11 @@ final class Updater {
 
     @MainActor
     private static func installAndRelaunch(_ installation: UpdateInstallation) {
+        guard installation.canBeginInstall({ isRunningFromInstalledBundle(installation.installed) }) else {
+            installation.discardUnrecordedStaging()
+            NSLog("BarPilot: update deferred because the installation is busy or needs recovery")
+            return
+        }
         guard let helper = launchHelper(installArgument, installation: installation) else {
             installation.discardStaging()
             NSLog("BarPilot: could not start the update helper")
@@ -239,6 +245,7 @@ final class Updater {
         return installation.apply(
             expectedIdentifier: expectedIdentifier,
             installedIsRunning: { hasRunningApp(at: installation.installed, excluding: parent) },
+            canReopenDeferredInstallation: { isRunningFromInstalledBundle(installation.installed) },
             launch: launchReplacement,
             reopen: reopenInstalled,
             waitForStartup: { waitOnMain(for: 15, until: $0) }
@@ -254,8 +261,14 @@ final class Updater {
     /// Run before creating the delegate or exposing a provisional app's UI.
     @MainActor
     static func prepareStartup() -> Bool {
-        guard isReleaseBuild else { return true }
+        guard !isDevBuild else { return true }
         let installed = Bundle.main.bundleURL.resolvingSymlinksInPath()
+        // Keep the running bundle in place even before LaunchServices reports
+        // this process. An exchange needs an exclusive lock on this inode.
+        guard let lease = startupLease ?? (try? BundleLease(at: installed, operation: LOCK_SH)),
+              isRunningFromInstalledBundle(installed) else { return false }
+        startupLease = lease
+        guard isReleaseBuild else { return true }
         guard let state = UpdateInstallation.withInstallLock(at: installed, timeout: 0, {
             UpdateInstallation.startupState(at: installed, cleanSettled: true)
         }) else {
@@ -433,6 +446,32 @@ final class Updater {
         return true
     }
 
+    private final class BundleLease {
+        enum Failure: Error { case busy, unavailable }
+
+        private let descriptor: Int32
+
+        init(at url: URL, operation: Int32) throws {
+            let descriptor = Darwin.open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard descriptor >= 0 else { throw Failure.unavailable }
+            guard flock(descriptor, operation | LOCK_NB) == 0 else {
+                let failure: Failure = errno == EWOULDBLOCK ? .busy : .unavailable
+                _ = Darwin.close(descriptor)
+                throw failure
+            }
+            var opened = stat()
+            var current = stat()
+            guard fstat(descriptor, &opened) == 0, lstat(url.path, &current) == 0,
+                  opened.st_dev == current.st_dev, opened.st_ino == current.st_ino else {
+                _ = Darwin.close(descriptor)
+                throw Failure.unavailable
+            }
+            self.descriptor = descriptor
+        }
+
+        deinit { _ = Darwin.close(descriptor) }
+    }
+
     private struct UpdateInstallation: Sendable {
         let installed: URL
         let id: UUID
@@ -557,14 +596,15 @@ final class Updater {
                 guard let journal = attempt.readJournal() else { return .deferMaintenance }
                 switch (attempt.layout(journal), journal.committedPID) {
                 case (.original, nil), (.originalWithoutCandidate, nil):
-                    if cleanSettled { attempt.cleanSettled(journal) }
+                    if cleanSettled, !attempt.cleanSettled(journal) { return .deferMaintenance }
                 case (.replacement, nil):
                     guard pending == nil else { return .deferMaintenance }
                     pending = attempt
                 case (.replacement, .some), (.committedWithoutBackup, .some):
                     if cleanSettled {
-                        guard attempt.syncJournal() else { return .deferMaintenance }
-                        attempt.cleanSettled(journal)
+                        guard attempt.syncJournal(), attempt.cleanSettled(journal) else {
+                            return .deferMaintenance
+                        }
                     }
                 default:
                     return .deferMaintenance
@@ -577,7 +617,8 @@ final class Updater {
         /// Detach the settled transaction from startup discovery before
         /// deleting files recursively. A crash during deletion can only leave
         /// a detached directory, never a partially erased pending record.
-        private func cleanSettled(_ journal: Journal) {
+        @discardableResult
+        private func cleanSettled(_ journal: Journal) -> Bool {
             let expected: BundleIdentity?
             switch (layout(journal), journal.committedPID) {
             case (.original, nil):
@@ -587,18 +628,28 @@ final class Updater {
             case (.originalWithoutCandidate, nil), (.committedWithoutBackup, .some):
                 expected = nil
             default:
-                return
+                return false
+            }
+            let lease: BundleLease?
+            if expected != nil {
+                guard let activeLease = try? BundleLease(at: staged, operation: LOCK_EX) else { return false }
+                lease = activeLease
+            } else {
+                lease = nil
             }
             let parent = installed.deletingLastPathComponent()
             let disposal = parent.appendingPathComponent(Self.disposalPrefix + id.uuidString, isDirectory: true)
-            guard syncExchangeDirectories(),
-                  renamex_np(stagingDirectory.path, disposal.path, UInt32(RENAME_EXCL)) == 0,
-                  Self.sync(parent, directory: true) else { return }
-            let disposedBundle = disposal.appendingPathComponent(installed.lastPathComponent)
-            if let expected {
-                guard BundleIdentity(disposedBundle) == expected else { return }
-            } else if Self.exists(disposedBundle) { return }
-            try? FileManager.default.removeItem(at: disposal)
+            return withExtendedLifetime(lease) {
+                guard syncExchangeDirectories(),
+                      renamex_np(stagingDirectory.path, disposal.path, UInt32(RENAME_EXCL)) == 0,
+                      Self.sync(parent, directory: true) else { return false }
+                let disposedBundle = disposal.appendingPathComponent(installed.lastPathComponent)
+                if let expected {
+                    guard BundleIdentity(disposedBundle) == expected else { return false }
+                } else if Self.exists(disposedBundle) { return false }
+                try? FileManager.default.removeItem(at: disposal)
+                return true
+            }
         }
 
         func restoreInterruptedExchange() -> Bool {
@@ -607,7 +658,7 @@ final class Updater {
         }
 
         private func restore(_ journal: Journal) -> Bool {
-            guard layout(journal) == .replacement, exchangeBundles() else { return false }
+            guard exchangeBundles(journal, from: .replacement) == .exchanged else { return false }
             if syncExchangeDirectories() { cleanSettled(journal) }
             return true
         }
@@ -647,6 +698,15 @@ final class Updater {
 
         func withInstallLock<T>(timeout: TimeInterval = 30, _ work: () -> T) -> T? {
             Self.withInstallLock(at: installed, timeout: timeout, work)
+        }
+
+        func canBeginInstall(_ isInstalledApp: () -> Bool) -> Bool {
+            withInstallLock(timeout: 0) {
+                guard isInstalledApp(), case .ready = Self.startupState(at: installed, cleanSettled: true) else {
+                    return false
+                }
+                return true
+            } ?? false
         }
 
         static func withInstallLock<T>(at installed: URL, timeout: TimeInterval, _ work: () -> T) -> T? {
@@ -694,12 +754,29 @@ final class Updater {
         func apply(
             expectedIdentifier: String?, lockTimeout: TimeInterval = 30,
             installedIsRunning: () -> Bool = { false },
+            canReopenDeferredInstallation: () -> Bool = { false },
             launch: (URL, [String]) -> ReplacementLaunch, reopen: (URL) -> Bool,
             waitForStartup: (() -> Bool) -> Bool
         ) -> Bool {
+            var shouldReopen = false
+            var installationDeferred = false
+            func reopenAfterUnlock(_: URL) -> Bool {
+                shouldReopen = true
+                return true
+            }
             let outcome = withInstallLock(timeout: lockTimeout) {
-                guard case .ready = Self.startupState(at: installed, cleanSettled: true),
-                      !installedIsRunning() else {
+                switch Self.startupState(at: installed, cleanSettled: true) {
+                case .ready:
+                    break
+                case .deferMaintenance:
+                    installationDeferred = true
+                    discardUnrecordedStaging()
+                    return false
+                case .restore:
+                    discardUnrecordedStaging()
+                    return false
+                }
+                guard !installedIsRunning() else {
                     discardUnrecordedStaging()
                     return false
                 }
@@ -707,20 +784,32 @@ final class Updater {
                 switch candidateState(expectedIdentifier: expectedIdentifier) {
                 case .ready:
                     runTool("/usr/bin/xattr", ["-dr", "com.apple.quarantine", staged.path])
-                    return install(launch: launch, reopen: reopen, waitForStartup: waitForStartup)
+                    return install(launch: launch, reopen: reopenAfterUnlock, waitForStartup: waitForStartup)
                 case .stale:
                     discardStaging()
-                    return reopen(installed)
+                    return reopenAfterUnlock(installed)
                 case .invalid:
                     discardStaging()
-                    _ = reopen(installed)
+                    _ = reopenAfterUnlock(installed)
                     return false
                 }
             }
-            if let outcome { return outcome }
+            if let outcome {
+                if shouldReopen || (installationDeferred && canReopenDeferredInstallation()) {
+                    return reopen(installed) && outcome
+                }
+                return outcome
+            }
             discardUnrecordedStaging()
             NSLog("BarPilot: unable to acquire the update installation lock")
-            _ = reopen(installed)
+            switch Self.startupState(at: installed) {
+            case .ready:
+                _ = reopen(installed)
+            case .deferMaintenance where canReopenDeferredInstallation():
+                _ = reopen(installed)
+            default:
+                break
+            }
             return false
         }
 
@@ -738,9 +827,20 @@ final class Updater {
             }
             let journal = Journal(id: id, installedPath: installed.path, original: original,
                                   candidate: candidate)
-            guard !Self.exists(journalURL), writeJournal(journal), layout(journal) == .original,
-                  exchangeBundles() else {
-                NSLog("BarPilot: could not record or exchange the update")
+            guard !Self.exists(journalURL), writeJournal(journal) else {
+                NSLog("BarPilot: could not record the update")
+                _ = reopen(installed)
+                return false
+            }
+            switch exchangeBundles(journal, from: .original) {
+            case .exchanged:
+                break
+            case .installedBusy:
+                cleanSettled(journal)
+                NSLog("BarPilot: update deferred because another launch holds the installed bundle")
+                return false
+            case .failed:
+                NSLog("BarPilot: could not exchange the update")
                 _ = reopen(installed)
                 return false
             }
@@ -805,13 +905,27 @@ final class Updater {
             }
         }
 
-        private func exchangeBundles() -> Bool {
-            installed.withUnsafeFileSystemRepresentation { installedPath in
-                staged.withUnsafeFileSystemRepresentation { stagedPath in
-                    guard let installedPath, let stagedPath else { return false }
-                    return renameatx_np(
-                        AT_FDCWD, installedPath, AT_FDCWD, stagedPath, UInt32(RENAME_SWAP)
-                    ) == 0
+        private enum ExchangeResult { case exchanged, installedBusy, failed }
+
+        private func exchangeBundles(_ journal: Journal, from expectedLayout: Layout) -> ExchangeResult {
+            let installedLease: BundleLease
+            do {
+                installedLease = try BundleLease(at: installed, operation: LOCK_EX)
+            } catch BundleLease.Failure.busy {
+                return .installedBusy
+            } catch {
+                return .failed
+            }
+            guard let stagedLease = try? BundleLease(at: staged, operation: LOCK_EX) else { return .failed }
+            return withExtendedLifetime((installedLease, stagedLease)) {
+                guard layout(journal) == expectedLayout else { return .failed }
+                return installed.withUnsafeFileSystemRepresentation { installedPath in
+                    staged.withUnsafeFileSystemRepresentation { stagedPath in
+                        guard let installedPath, let stagedPath else { return .failed }
+                        return renameatx_np(
+                            AT_FDCWD, installedPath, AT_FDCWD, stagedPath, UInt32(RENAME_SWAP)
+                        ) == 0 ? .exchanged : .failed
+                    }
                 }
             }
         }
@@ -965,6 +1079,26 @@ final class Updater {
         func checkImmediately(_ predicate: () -> Bool) -> Bool { predicate() }
 
         try createBundle(at: installed, content: "original")
+        precondition(installation.canBeginInstall({ true }))
+        precondition(!installation.canBeginInstall({ false }))
+
+        let lateLaunch = UpdateInstallation(installed: installed, id: UUID())
+        try createBundle(at: lateLaunch.staged, content: "late update")
+        let blockedByLaunch = lateLaunch.withInstallLock(timeout: 0) {
+            // The initial running-app check missed a process starting now.
+            // It takes the shared lease before the helper attempts the swap.
+            guard let running = try? BundleLease(at: installed, operation: LOCK_SH) else {
+                preconditionFailure("unable to admit the late launch")
+            }
+            return withExtendedLifetime(running) {
+                !lateLaunch.install(launch: { _, _ in preconditionFailure("running bundle cannot move") },
+                                    reopen: { _ in preconditionFailure("peer launch is already running") },
+                                    waitForStartup: checkImmediately)
+            }
+        }
+        precondition(blockedByLaunch == true && content(at: installed) == "original")
+        precondition(!fm.fileExists(atPath: lateLaunch.stagingDirectory.path))
+
         try createBundle(at: installation.staged, content: "update")
         let installedUpdate = installation.install(launch: { app, arguments in
             precondition(arguments == [startupArgument, installation.id.uuidString])
@@ -1033,6 +1167,12 @@ final class Updater {
                 waitForStartup: checkImmediately)
             precondition(!installedUnresolved && content(at: installed) == "undetermined update")
             precondition(content(at: attempt.staged) == "update", "keep the original when rollback is unsafe")
+            do {
+                let running = try BundleLease(at: installed, operation: LOCK_SH)
+                withExtendedLifetime(running) {
+                    precondition(!attempt.restoreInterruptedExchange(), "rollback must wait for the candidate to exit")
+                }
+            }
             let restarted = UpdateInstallation.withInstallLock(at: installed, timeout: 0) {
                 guard case .restore(let recovered) = UpdateInstallation.startupState(at: installed, cleanSettled: true),
                       recovered.id == attempt.id else { return false }
@@ -1107,6 +1247,24 @@ final class Updater {
             return !superseded.restoreInterruptedExchange()
         }
         precondition(restartedSuperseded == true && content(at: installed) == "third-party replacement")
+        precondition(content(at: superseded.staged) == "confirmed update")
+        let deferred = UpdateInstallation(installed: installed, id: UUID())
+        precondition(!deferred.canBeginInstall({ true }))
+        for canReopen in [false, true] {
+            try createBundle(at: deferred.staged, content: "next update")
+            var reopenedDeferred = false
+            let deferredUpdate = deferred.apply(expectedIdentifier: identifier, lockTimeout: 0,
+                canReopenDeferredInstallation: { canReopen },
+                launch: { _, _ in preconditionFailure("unknown journal prevents a new exchange") },
+                reopen: { app in
+                    precondition(deferred.withInstallLock(timeout: 0) { true } == true,
+                                 "reopen must happen outside the installation lock")
+                    reopenedDeferred = content(at: app) == "third-party replacement"
+                    return reopenedDeferred
+                }, waitForStartup: checkImmediately)
+            precondition(!deferredUpdate && reopenedDeferred == canReopen)
+            precondition(!fm.fileExists(atPath: deferred.stagingDirectory.path))
+        }
         precondition(content(at: superseded.staged) == "confirmed update")
         try fm.removeItem(at: installed)
         try fm.moveItem(at: unrelated, to: installed)

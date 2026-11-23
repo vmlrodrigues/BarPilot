@@ -1262,22 +1262,7 @@ final class UsageStore: ObservableObject {
     }
 
     private func upsertCreditCycle(_ sample: CreditSample) {
-        let summary = CreditCycleSummary(latestSample: sample)
-        if let index = creditCycles.firstIndex(where: {
-            $0.resetDayMs == summary.resetDayMs
-        }) {
-            let previous = creditCycles[index]
-            let latest = previous.latestSample
-            let isNewer = sample.observedAtMs > latest.observedAtMs
-                || (sample.observedAtMs == latest.observedAtMs && sample.capturedAtMs >= latest.capturedAtMs)
-            creditCycles[index] = CreditCycleSummary(
-                latestSample: isNewer ? sample : latest,
-                firstObservedAtMs: min(summary.firstObservedAtMs, previous.firstObservedAtMs)
-            )
-        } else {
-            creditCycles.append(summary)
-        }
-        creditCycles.sort { $0.resetDayMs > $1.resetDayMs }
+        creditCycles = SyncAggregate.mergedCreditCycles(local: creditCycles, additionalSamples: [sample])
     }
 
     private func refreshCreditCycles() async {
@@ -1364,7 +1349,7 @@ final class UsageStore: ObservableObject {
         }
         creditCycles = SyncAggregate.mergedCreditCycles(
             local: stored.cycles,
-            additionalSamples: remoteSamples
+            additionalSamples: remoteSamples + creditSamples
                 + [serverUsageSample].compactMap { $0 }
         )
         savedCreditActivityByCycle = Dictionary(uniqueKeysWithValues: creditCycles.map { cycle in
