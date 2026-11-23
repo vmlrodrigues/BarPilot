@@ -152,7 +152,8 @@ their telemetry rows are never used or republished by this version.
 
 Signed release builds also unload and remove the old Copilot Mac app telemetry
 login agent and helper after checking BarPilot's ownership marker, agent label,
-and program path. Session variables are cleared when the active file export
+and program path. Cleanup checks the loaded job's program and origin before
+unloading it. Session variables are cleared when the active file export
 path belongs to BarPilot and the variables still hold their original values.
 Cleanup retains the helper for retry if unloading or clearing fails. Relaunch
 the Copilot app afterwards so it picks up the updated session configuration.

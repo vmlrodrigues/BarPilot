@@ -21,6 +21,8 @@ final class Updater {
     private static let repo = "vmlrodrigues/BarPilot"
     private static let teamID = "9N354A3UZK"
     static let installArgument = "--apply-staged-update"
+    private static let startupArgument = "--confirm-staged-update"
+    private static let recoveryArgument = "--recovered-staged-update"
     @MainActor private static var isChecking = false
     @MainActor private static var installer: Process?
     private let interval: TimeInterval = 6 * 60 * 60   // re-check every 6 hours
@@ -34,7 +36,11 @@ final class Updater {
             NSLog("BarPilot: auto-update disabled (development build)")
             return
         }
-        Self.checkNow(afterSeconds: 20)
+        // A failed release may still be GitHub's latest. Give the restored app
+        // its normal periodic and manual checks without immediately retrying it.
+        if !CommandLine.arguments.contains(Self.recoveryArgument) {
+            Self.checkNow(afterSeconds: 20)
+        }
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { _ in
             Updater.checkNow()
         }
@@ -189,6 +195,7 @@ final class Updater {
         NSApp.terminate(nil)
     }
 
+    @MainActor
     static func applyStagedUpdate(_ arguments: ArraySlice<String>) -> Bool {
         guard !isDevBuild, arguments.count == 2,
               let id = UUID(uuidString: arguments[arguments.startIndex]),
@@ -211,32 +218,135 @@ final class Updater {
             Thread.sleep(forTimeInterval: 0.1)
         }
 
-        let installed = installation.withInstallLock {
-            func relaunch(_ app: URL, newInstance: Bool) -> Bool {
-                // Start the replacement, rather than activating the helper.
-                // On failure, let LaunchServices reuse an already open app.
-                let arguments = newInstance ? ["-n", app.path] : [app.path]
-                return runTool("/usr/bin/open", arguments).status == 0
-            }
-            // The helper may be invoked directly, and another helper may have
-            // installed a newer build. Read and verify again under the lock.
-            switch installation.candidateState(expectedIdentifier: expectedIdentifier) {
-            case .ready:
-                runTool("/usr/bin/xattr", ["-dr", "com.apple.quarantine", installation.staged.path])
-                return installation.install(relaunch: relaunch)
-            case .stale:
-                installation.discardStaging()
-                return true
-            case .invalid:
-                installation.discardStaging()
-                _ = relaunch(installation.installed, newInstance: false)
-                return false
+        return installation.apply(
+            expectedIdentifier: expectedIdentifier,
+            launch: launchReplacement,
+            reopen: reopenInstalled,
+            waitForStartup: { waitOnMain(for: 15, until: $0) }
+        )
+    }
+
+    /// Called from the first main-queue turn after the delegate has finished launch.
+    @MainActor
+    static func completeStartup(
+        statusItemReady: Bool, runMaintenance: @escaping @Sendable (Bool) -> Void
+    ) {
+        let arguments = CommandLine.arguments.dropFirst()
+        let release = isReleaseBuild
+        if !arguments.contains(startupArgument) {
+            // A recovery launch can occur while a different helper still has
+            // a provisional bundle installed. It has no matching commit.
+            let shouldRetire = release && !arguments.contains(recoveryArgument)
+            Task.detached(priority: .background) { runMaintenance(shouldRetire) }
+            return
+        }
+        guard statusItemReady, release,
+              arguments.count == 2, arguments.first == startupArgument,
+              let id = arguments.last.flatMap(UUID.init(uuidString:)) else { return }
+        let installation = UpdateInstallation(
+            installed: Bundle.main.bundleURL.resolvingSymlinksInPath(), id: id
+        )
+        let pid = ProcessInfo.processInfo.processIdentifier
+        guard installation.acknowledgeStartup(pid: pid) else { return }
+        Task.detached(priority: .background) {
+            // Startup acknowledgment alone does not commit the exchange. Wait
+            // for the helper before retiring data the original app still uses.
+            let deadline = ProcessInfo.processInfo.systemUptime + 20
+            while FileManager.default.fileExists(atPath: installation.stagingDirectory.path) {
+                if installation.finishStartupIfCommitted(pid: pid) {
+                    runMaintenance(true)
+                    return
+                }
+                guard ProcessInfo.processInfo.systemUptime < deadline else { return }
+                try? await Task.sleep(for: .milliseconds(100))
             }
         }
-        if let installed { return installed }
-        installation.discardStaging()
-        NSLog("BarPilot: unable to acquire the update installation lock")
-        return false
+    }
+
+    private enum WorkspaceLaunch {
+        case launched(NSRunningApplication)
+        case rejected
+        case unresolved
+    }
+
+    private enum ReplacementLaunch {
+        case started(pid: pid_t, isRunning: () -> Bool, stop: () -> Bool)
+        case rejected
+        case unresolved
+    }
+
+    @MainActor
+    private static func openApp(_ url: URL, arguments: [String], newInstance: Bool) -> WorkspaceLaunch {
+        @MainActor final class LaunchProbe {
+            var result: WorkspaceLaunch?
+        }
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.arguments = arguments
+        configuration.createsNewApplicationInstance = newInstance
+        configuration.promptsUserIfNeeded = false
+        configuration.addsToRecentItems = false
+        let probe = LaunchProbe()
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { application, _ in
+            DispatchQueue.main.async {
+                probe.result = application.map(WorkspaceLaunch.launched) ?? .rejected
+            }
+        }
+        _ = waitOnMain(for: 10) { probe.result != nil }
+        return probe.result ?? .unresolved
+    }
+
+    @MainActor
+    private static func launchReplacement(at url: URL, arguments: [String]) -> ReplacementLaunch {
+        let otherPIDs = Set(NSRunningApplication.runningApplications(
+            withBundleIdentifier: Bundle.main.bundleIdentifier ?? ""
+        ).map(\.processIdentifier))
+        switch openApp(url, arguments: arguments, newInstance: true) {
+        case .rejected: return .rejected
+        case .unresolved: return .unresolved
+        case .launched(let application):
+            if application.isTerminated { return .rejected }
+            let pid = application.processIdentifier
+            guard pid > 1, pid != getpid(), !otherPIDs.contains(pid),
+                  application.bundleURL?.resolvingSymlinksInPath().path == url.path else {
+                return .unresolved
+            }
+            return .started(pid: pid, isRunning: { !application.isTerminated }) {
+                if application.isTerminated { return true }
+                _ = application.terminate()
+                if waitOnMain(for: 2, until: { application.isTerminated }) { return true }
+                _ = application.forceTerminate()
+                return waitOnMain(for: 3, until: { application.isTerminated })
+            }
+        }
+    }
+
+    @MainActor
+    private static func reopenInstalled(_ url: URL) -> Bool {
+        let arguments = [recoveryArgument]
+        switch openApp(url, arguments: arguments, newInstance: false) {
+        case .rejected, .unresolved:
+            return false
+        case .launched(let application):
+            if application.processIdentifier != getpid(),
+               application.bundleURL?.resolvingSymlinksInPath().path == url.path {
+                return true
+            }
+            // The helper was launched from the installed bundle and may still
+            // have the same LaunchServices identity as the app we need to start.
+            if case .launched = openApp(url, arguments: arguments, newInstance: true) { return true }
+            return false
+        }
+    }
+
+    @MainActor
+    private static func waitOnMain(for timeout: TimeInterval, until predicate: () -> Bool) -> Bool {
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        while !predicate() {
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0 else { return false }
+            _ = RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(min(remaining, 0.05)))
+        }
+        return true
     }
 
     private struct UpdateInstallation: Sendable {
@@ -254,6 +364,36 @@ final class Updater {
 
         func discardStaging() {
             try? FileManager.default.removeItem(at: stagingDirectory)
+        }
+
+        func acknowledgeStartup(pid: pid_t) -> Bool {
+            FileManager.default.fileExists(atPath: staged.path)
+                && writeCheckpoint("startup-acknowledgment", pid: pid)
+        }
+
+        func finishStartupIfCommitted(pid: pid_t) -> Bool {
+            guard matchesCheckpoint("startup-commit", pid: pid) else { return false }
+            discardStaging()
+            return true
+        }
+
+        private func writeCheckpoint(_ name: String, pid: pid_t) -> Bool {
+            do {
+                try checkpoint(pid: pid).write(to: stagingDirectory.appendingPathComponent(name), options: .atomic)
+                return true
+            } catch {
+                NSLog("BarPilot: unable to write update checkpoint \(name)")
+                return false
+            }
+        }
+
+        private func matchesCheckpoint(_ name: String, pid: pid_t) -> Bool {
+            let data = try? Data(contentsOf: stagingDirectory.appendingPathComponent(name))
+            return data == checkpoint(pid: pid)
+        }
+
+        private func checkpoint(pid: pid_t) -> Data {
+            Data("\(id.uuidString)\n\(pid)\n".utf8)
         }
 
         func withInstallLock<T>(timeout: TimeInterval = 30, _ work: () -> T) -> T? {
@@ -297,25 +437,96 @@ final class Updater {
             return Updater.verify(app: staged) ? .ready : .invalid
         }
 
-        func install(relaunch: (URL, Bool) -> Bool) -> Bool {
-            guard exchangeBundles() else {
+        @MainActor
+        func apply(
+            expectedIdentifier: String?, lockTimeout: TimeInterval = 30,
+            launch: (URL, [String]) -> ReplacementLaunch, reopen: (URL) -> Bool,
+            waitForStartup: (() -> Bool) -> Bool
+        ) -> Bool {
+            let outcome = withInstallLock(timeout: lockTimeout) {
+                // Another helper may have installed a newer bundle while we waited.
+                switch candidateState(expectedIdentifier: expectedIdentifier) {
+                case .ready:
+                    runTool("/usr/bin/xattr", ["-dr", "com.apple.quarantine", staged.path])
+                    return install(launch: launch, reopen: reopen, waitForStartup: waitForStartup)
+                case .stale:
+                    discardStaging()
+                    return reopen(installed)
+                case .invalid:
+                    discardStaging()
+                    _ = reopen(installed)
+                    return false
+                }
+            }
+            if let outcome { return outcome }
+            discardStaging()
+            NSLog("BarPilot: unable to acquire the update installation lock")
+            _ = reopen(installed)
+            return false
+        }
+
+        @MainActor
+        func install(
+            launch: (URL, [String]) -> ReplacementLaunch, reopen: (URL) -> Bool,
+            waitForStartup: (() -> Bool) -> Bool
+        ) -> Bool {
+            guard let original = BundleIdentity(installed), let candidate = BundleIdentity(staged),
+                  exchangeBundles() else {
                 NSLog("BarPilot: could not replace the installed app")
                 discardStaging()
-                _ = relaunch(installed, false)
+                _ = reopen(installed)
                 return false
             }
-            if relaunch(installed, true) {
-                discardStaging()
-                return true
+
+            func exchangeIsUnchanged() -> Bool {
+                BundleIdentity(installed) == candidate && BundleIdentity(staged) == original
             }
-            guard exchangeBundles() else {
-                // Leave the original app in staging if rollback itself fails.
+            switch launch(installed, [Updater.startupArgument, id.uuidString]) {
+            case .started(let pid, let isRunning, let stop):
+                func acknowledged() -> Bool { matchesCheckpoint("startup-acknowledgment", pid: pid) }
+                if waitForStartup({ !isRunning() || acknowledged() }),
+                   isRunning(), acknowledged(), exchangeIsUnchanged(),
+                   writeCheckpoint("startup-commit", pid: pid) {
+                    // The confirmed replacement removes the backup after reading this commit.
+                    return true
+                }
+                guard exchangeIsUnchanged() else {
+                    NSLog("BarPilot: installed bundle changed during update. Original app kept in staging.")
+                    return false
+                }
+                guard stop() else {
+                    NSLog("BarPilot: could not stop the unconfirmed update. Original app kept in staging.")
+                    return false
+                }
+            case .rejected:
+                break
+            case .unresolved:
+                // LaunchServices may still start the app. Leave the original
+                // intact when we cannot safely identify and stop that process.
+                NSLog("BarPilot: replacement launch outcome unknown. Original app kept in staging.")
+                return false
+            }
+            guard exchangeIsUnchanged(), exchangeBundles() else {
                 NSLog("BarPilot: could not restore the original app after a failed relaunch")
                 return false
             }
             discardStaging()
-            _ = relaunch(installed, false)
+            _ = reopen(installed)
             return false
+        }
+
+        private struct BundleIdentity: Equatable {
+            let device: dev_t
+            let inode: ino_t
+            let info: Data?
+
+            init?(_ url: URL) {
+                var metadata = stat()
+                guard lstat(url.path, &metadata) == 0, metadata.st_mode & S_IFMT == S_IFDIR else { return nil }
+                device = metadata.st_dev
+                inode = metadata.st_ino
+                info = try? Data(contentsOf: url.appendingPathComponent("Contents/Info.plist"))
+            }
         }
 
         private func exchangeBundles() -> Bool {
@@ -458,6 +669,7 @@ final class Updater {
         print("Atomic update verification passed.")
     }
 
+    @MainActor
     private static func verifyInstallation() throws {
         let fm = FileManager.default
         let fixture = fm.temporaryDirectory.appendingPathComponent("barpilot-update-verify-\(UUID())")
@@ -465,7 +677,7 @@ final class Updater {
         defer { try? fm.removeItem(at: fixture) }
         let installed = fixture.appendingPathComponent("BarPilot's $ test.app", isDirectory: true)
         let installation = UpdateInstallation(installed: installed, id: UUID())
-        let competingInstallation = UpdateInstallation(installed: installed, id: UUID())
+        let pid: pid_t = 42
 
         func createBundle(at url: URL, content: String) throws {
             try fm.createDirectory(at: url, withIntermediateDirectories: true)
@@ -474,37 +686,78 @@ final class Updater {
         func content(at url: URL) -> String? {
             try? String(contentsOf: url.appendingPathComponent("fixture"), encoding: .utf8)
         }
+        func checkImmediately(_ predicate: () -> Bool) -> Bool { predicate() }
 
         try createBundle(at: installed, content: "original")
         try createBundle(at: installation.staged, content: "update")
-        let installedUpdate = installation.install { app, newInstance in
-            newInstance && content(at: app) == "update"
-        }
+        let installedUpdate = installation.install(launch: { app, arguments in
+            precondition(arguments == [startupArgument, installation.id.uuidString])
+            precondition(content(at: app) == "update" && content(at: installation.staged) == "original")
+            precondition(installation.acknowledgeStartup(pid: pid))
+            precondition(!installation.finishStartupIfCommitted(pid: pid), "acknowledgment alone is provisional")
+            return .started(pid: pid, isRunning: { true }, stop: { preconditionFailure("healthy replacement") })
+        }, reopen: { _ in preconditionFailure("healthy replacement") }, waitForStartup: checkImmediately)
         precondition(installedUpdate && content(at: installed) == "update")
+        precondition(content(at: installation.staged) == "original", "the replacement still has to read the commit")
+        precondition(!installation.finishStartupIfCommitted(pid: pid + 1))
+        precondition(installation.finishStartupIfCommitted(pid: pid))
         precondition(!fm.fileExists(atPath: installation.stagingDirectory.path))
 
-        try createBundle(at: installation.staged, content: "bad relaunch")
-        var relaunches: [String] = []
-        let installedBrokenUpdate = installation.install { app, newInstance in
-            guard let current = content(at: app) else { return false }
-            relaunches.append(current)
-            precondition(newInstance == (current == "bad relaunch"))
-            return current == "update"
+        for incorrectAcknowledgment in [false, true] {
+            let attempt = UpdateInstallation(installed: installed, id: UUID())
+            try createBundle(at: attempt.staged, content: "bad startup")
+            var steps: [String] = []
+            let installedBrokenUpdate = attempt.install(launch: { app, _ in
+                steps.append("launch accepted")
+                precondition(content(at: app) == "bad startup" && content(at: attempt.staged) == "update")
+                if incorrectAcknowledgment { precondition(attempt.acknowledgeStartup(pid: pid + 1)) }
+                return .started(pid: pid, isRunning: { true }, stop: {
+                    steps.append("stop failed replacement")
+                    return true
+                })
+            }, reopen: { app in
+                steps.append("reopen original")
+                return content(at: app) == "update"
+            }, waitForStartup: { predicate in
+                steps.append("wait for startup")
+                precondition(!predicate())
+                return false
+            })
+            precondition(!installedBrokenUpdate)
+            precondition(steps == ["launch accepted", "wait for startup", "stop failed replacement", "reopen original"])
+            precondition(content(at: installed) == "update")
+            precondition(!fm.fileExists(atPath: attempt.stagingDirectory.path))
         }
-        precondition(!installedBrokenUpdate && relaunches == ["bad relaunch", "update"])
-        precondition(content(at: installed) == "update")
-        precondition(!fm.fileExists(atPath: installation.stagingDirectory.path))
 
-        let installedMissingUpdate = installation.install { app, newInstance in
-            !newInstance && content(at: app) == "update"
+        let rejected = UpdateInstallation(installed: installed, id: UUID())
+        try createBundle(at: rejected.staged, content: "rejected update")
+        var reopened = false
+        func reopenOriginal(_ app: URL) -> Bool {
+            reopened = content(at: app) == "update"
+            return reopened
         }
-        precondition(!installedMissingUpdate && content(at: installed) == "update")
+        let rejectedUpdate = rejected.install(launch: { _, _ in .rejected },
+                                              reopen: reopenOriginal, waitForStartup: checkImmediately)
+        precondition(!rejectedUpdate && reopened)
+        precondition(!fm.fileExists(atPath: rejected.stagingDirectory.path))
 
-        let excludedContender = installation.withInstallLock(timeout: 0) {
-            competingInstallation.withInstallLock(timeout: 0) { true } == nil
+        reopened = false
+        let installedMissingUpdate = rejected.install(launch: { _, _ in preconditionFailure("no replacement") },
+                                                      reopen: reopenOriginal, waitForStartup: checkImmediately)
+        precondition(!installedMissingUpdate && reopened)
+
+        for launch in [ReplacementLaunch.unresolved, .started(pid: pid, isRunning: { true }, stop: { false })] {
+            let attempt = UpdateInstallation(installed: installed, id: UUID())
+            try createBundle(at: attempt.staged, content: "undetermined update")
+            let installedUnresolved = attempt.install(launch: { _, _ in launch },
+                reopen: { _ in preconditionFailure("replacement may still be running") },
+                waitForStartup: checkImmediately)
+            precondition(!installedUnresolved && content(at: installed) == "undetermined update")
+            precondition(content(at: attempt.staged) == "update", "keep the original when rollback is unsafe")
+            try fm.removeItem(at: installed)
+            try fm.moveItem(at: attempt.staged, to: installed)
+            attempt.discardStaging()
         }
-        precondition(excludedContender == true)
-        precondition(competingInstallation.withInstallLock(timeout: 0) { true } == true)
 
         let identifier = "org.example.barpilot.update-fixture"
         func writeMetadata(at app: URL, version: String) throws {
@@ -517,10 +770,40 @@ final class Updater {
             try plist.write(to: directory.appendingPathComponent("Info.plist"))
         }
         try writeMetadata(at: installed, version: "2.0.0")
+        let superseded = UpdateInstallation(installed: installed, id: UUID())
+        try createBundle(at: superseded.staged, content: "candidate update")
+        try writeMetadata(at: superseded.staged, version: "3.0.0")
+        let supersededUpdate = superseded.install(launch: { app, _ in
+            precondition(superseded.acknowledgeStartup(pid: pid))
+            try! writeMetadata(at: app, version: "4.0.0")
+            return .started(pid: pid, isRunning: { true }, stop: { preconditionFailure("bundle changed during launch") })
+        }, reopen: { _ in preconditionFailure("newer update must remain installed") }, waitForStartup: checkImmediately)
+        precondition(!supersededUpdate && content(at: superseded.staged) == "update")
+        precondition(content(at: installed) == "candidate update")
+        precondition(!superseded.finishStartupIfCommitted(pid: pid))
+
+        let competingInstallation = UpdateInstallation(installed: installed, id: UUID())
         try writeMetadata(at: competingInstallation.staged, version: "1.5.0")
-        let staleCandidate = competingInstallation.withInstallLock(timeout: 0) {
-            competingInstallation.candidateState(expectedIdentifier: identifier)
+        reopened = false
+        let staleCandidate = competingInstallation.apply(expectedIdentifier: identifier, lockTimeout: 0,
+            launch: { _, _ in preconditionFailure("stale replacement") }, reopen: { app in
+                reopened = app == installed
+                return reopened
+            }, waitForStartup: checkImmediately)
+        precondition(staleCandidate && reopened)
+        precondition(!fm.fileExists(atPath: competingInstallation.stagingDirectory.path))
+
+        try writeMetadata(at: competingInstallation.staged, version: "5.0.0")
+        reopened = false
+        let excludedContender = installation.withInstallLock(timeout: 0) {
+            !competingInstallation.apply(expectedIdentifier: identifier, lockTimeout: 0,
+                launch: { _, _ in preconditionFailure("lock is held") }, reopen: { app in
+                    reopened = app == installed
+                    return reopened
+                }, waitForStartup: checkImmediately)
         }
-        precondition(staleCandidate == .stale)
+        precondition(excludedContender == true && reopened)
+        precondition(!fm.fileExists(atPath: competingInstallation.stagingDirectory.path))
+        precondition(competingInstallation.withInstallLock(timeout: 0) { true } == true)
     }
 }

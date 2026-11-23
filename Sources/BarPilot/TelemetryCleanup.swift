@@ -72,8 +72,7 @@ struct TelemetryCleanup: Sendable {
         return Self.ownershipMarkers.contains { script.contains($0) }
     }
 
-    private var ownsLaunchAgent: Bool {
-        guard ownsHelperScript else { return false }
+    private var ownsLaunchAgentFile: Bool {
         guard let data = FileManager.default.contents(atPath: launchAgentPath),
               let plist = try? PropertyListSerialization.propertyList(from: data, format: nil)
                 as? [String: Any] else { return false }
@@ -81,41 +80,75 @@ struct TelemetryCleanup: Sendable {
             && plist["Program"] as? String == helperScriptPath
     }
 
-    private var hasLaunchAgentFile: Bool {
-        FileManager.default.fileExists(atPath: launchAgentPath)
+    private enum RegisteredAgent {
+        case absent, owned, foreign, unknown
+    }
+
+    private var launchAgentTarget: String {
+        "gui/\(getuid())/\(Self.launchAgentLabel)"
+    }
+
+    private func registeredAgent() -> RegisteredAgent {
+        let state = launchctl(["print", launchAgentTarget])
+        let lines = state.output.split(whereSeparator: \.isNewline)
+        guard state.status == 0 else {
+            let missing = "Could not find service \"\(Self.launchAgentLabel)\" in domain for user gui: \(getuid())"
+            return lines.contains(Substring(missing)) ? .absent : .unknown
+        }
+
+        // These are top-level fields in the registered service, independent
+        // of what now lives at the plist path on disk.
+        func field(_ name: String) -> Substring? {
+            let prefix = "\t\(name) = "
+            let matches = lines.filter { $0.hasPrefix(prefix) }
+            guard matches.count == 1, let line = matches.first else { return nil }
+            let value = line.dropFirst(prefix.count)
+            return value.isEmpty ? nil : value
+        }
+        guard lines.first == "\(launchAgentTarget) = {",
+              let path = field("path"), let program = field("program"),
+              let type = field("type") else { return .unknown }
+        return path == launchAgentPath && program == helperScriptPath && type == "LaunchAgent"
+            ? .owned : .foreign
     }
 
     /// Must run off the main thread: it waits on `launchctl` subprocesses.
     func run() -> Outcome {
         precondition(!Thread.isMainThread, "telemetry cleanup waits on subprocesses")
-        let ownsAgent = ownsLaunchAgent
-        let ownsScript = ownsHelperScript
-        guard ownsScript, !hasLaunchAgentFile || ownsAgent else {
-            return .nothingToClean
-        }
+        guard ownsHelperScript else { return .nothingToClean }
+        let fileManager = FileManager.default
+        let ownsAgentFile = ownsLaunchAgentFile
+        guard ownsAgentFile || !fileManager.fileExists(atPath: launchAgentPath)
+        else { return .nothingToClean }
 
         // Remove the agent first so nothing re-exports the variables.
-        if ownsAgent {
-            let target = "gui/\(getuid())/\(Self.launchAgentLabel)"
-            let result = launchctl(["bootout", target])
-            let state = launchctl(["print", target])
-            if state.status == 0
-                || !state.output.contains("Could not find service") {
-                return .failed(
-                    result.status == 0
-                        ? "telemetry login agent is still loaded"
-                        : "unable to unload telemetry login agent"
-                )
+        switch registeredAgent() {
+        case .absent:
+            break
+        case .owned:
+            let result = launchctl(["bootout", launchAgentTarget])
+            switch registeredAgent() {
+            case .absent:
+                break
+            case .unknown:
+                return .failed("unable to verify telemetry login agent was unloaded")
+            case .owned, .foreign:
+                return .failed(result.status == 0
+                    ? "telemetry login agent is still loaded"
+                    : "unable to unload telemetry login agent")
             }
+        case .foreign:
+            return .nothingToClean
+        case .unknown:
+            return .failed("unable to verify telemetry login agent ownership")
         }
         if let failure = clearOwnedEnvironment() {
             return .failed(failure)
         }
         // Files go last so a failed run is retried on the next launch.
-        let fileManager = FileManager.default
         do {
-            if ownsAgent { try fileManager.removeItem(atPath: launchAgentPath) }
-            if ownsScript { try fileManager.removeItem(atPath: helperScriptPath) }
+            if ownsAgentFile { try fileManager.removeItem(atPath: launchAgentPath) }
+            try fileManager.removeItem(atPath: helperScriptPath)
         } catch {
             return .failed("unable to remove telemetry helper files")
         }
@@ -168,20 +201,22 @@ struct TelemetryCleanup: Sendable {
         private var calls: [[String]] = []
         private let failUnset: Bool
         private let failGetenvCall: Int?
+        private let failPrintCall: Int?
         private var getenvCalls = 0
-        private var agentLoaded: Bool
-        private var failBootout: Bool
+        private var printCalls = 0
+        private var agentOutput: String?
+        private let failBootout: Bool
 
         init(
-            environment: [String: String], agentLoaded: Bool = false,
+            environment: [String: String],
             failUnset: Bool = false, failBootout: Bool = false,
-            failGetenvCall: Int? = nil
+            failGetenvCall: Int? = nil, failPrintCall: Int? = nil
         ) {
             self.environment = environment
-            self.agentLoaded = agentLoaded
             self.failUnset = failUnset
             self.failBootout = failBootout
             self.failGetenvCall = failGetenvCall
+            self.failPrintCall = failPrintCall
         }
 
         func run(_ arguments: [String]) -> (status: Int32, output: String) {
@@ -197,12 +232,18 @@ struct TelemetryCleanup: Sendable {
                 return (0, "")
             case "bootout":
                 guard !failBootout else { return (1, "failed to boot out") }
-                agentLoaded = false
+                agentOutput = nil
                 return (0, "")
             case "print":
-                return agentLoaded
-                    ? (0, "service is loaded")
-                    : (113, "Could not find service")
+                printCalls += 1
+                if printCalls == failPrintCall {
+                    return (113, "Could not find service \"test.other-agent\" in domain for user gui: \(getuid())")
+                }
+                if let agentOutput { return (0, agentOutput) }
+                return (113, """
+                    Bad request.
+                    Could not find service "\(launchAgentLabel)" in domain for user gui: \(getuid())
+                    """)
             default: return (1, "unsupported command")
             }
         }
@@ -212,38 +253,57 @@ struct TelemetryCleanup: Sendable {
             environment = values
         }
 
-        func setBootoutFailure(_ value: Bool) {
+        func setAgentOutput(_ value: String?) {
             lock.lock(); defer { lock.unlock() }
-            failBootout = value
+            agentOutput = value
         }
 
         var snapshot: (environment: [String: String], calls: [[String]], agentLoaded: Bool) {
             lock.lock(); defer { lock.unlock() }
-            return (environment, calls, agentLoaded)
+            return (environment, calls, agentOutput != nil)
         }
     }
 
-    private enum AgentProgram { case owned, matchingForeign, foreign }
+    private enum AgentProgram { case expected, foreign }
+    private enum TestAgentRegistration { case absent, owned, foreignProgram, foreignOrigin, missingProgram }
 
     private static func verifyFixtures() {
         let fileManager = FileManager.default
 
         func fixture(
             script: String?, agentProgram: AgentProgram?,
+            registration: TestAgentRegistration = .absent,
             environment: (TelemetryCleanup) -> [String: String],
             failUnset: Bool = false, failBootout: Bool = false,
-            failGetenvCall: Int? = nil,
+            failGetenvCall: Int? = nil, failPrintCall: Int? = nil,
             check: (TelemetryCleanup, FakeLaunchctl) -> Void
         ) {
             let home = NSTemporaryDirectory() + "barpilot-cleanup-\(UUID().uuidString)"
             defer { try? fileManager.removeItem(atPath: home) }
             let fake = FakeLaunchctl(
-                environment: [:], agentLoaded: agentProgram != nil,
+                environment: [:],
                 failUnset: failUnset, failBootout: failBootout,
-                failGetenvCall: failGetenvCall
+                failGetenvCall: failGetenvCall, failPrintCall: failPrintCall
             )
             let cleanup = TelemetryCleanup(home: home, launchctl: { fake.run($0) })
             fake.setEnvironment(environment(cleanup))
+            if registration != .absent {
+                let path = registration == .foreignOrigin
+                    ? home + "/Library/AnotherApp/telemetry.plist" : cleanup.launchAgentPath
+                let program = registration == .foreignProgram
+                    ? "/usr/local/bin/other" : cleanup.helperScriptPath
+                let programField = registration == .missingProgram ? "" : "\tprogram = \(program)\n"
+                fake.setAgentOutput("""
+                    \(cleanup.launchAgentTarget) = {
+                    \tactive count = 0
+                    \tpath = \(path)
+                    \ttype = LaunchAgent
+                    \(programField)\targuments = {
+                    \t\t\(program)
+                    \t}
+                    }
+                    """)
+            }
             let scriptDirectory = (cleanup.helperScriptPath as NSString).deletingLastPathComponent
             let agentDirectory = (cleanup.launchAgentPath as NSString).deletingLastPathComponent
             try! fileManager.createDirectory(atPath: scriptDirectory, withIntermediateDirectories: true)
@@ -273,7 +333,7 @@ struct TelemetryCleanup: Sendable {
 
         // Owned agent, script and matching variables are all removed, once.
         fixture(
-            script: ownedScript, agentProgram: .owned,
+            script: ownedScript, agentProgram: .expected, registration: .owned,
             environment: { cleanup in
                 var values = Dictionary(uniqueKeysWithValues:
                     cleanup.expectedEnvironment.map { ($0.name, $0.value) })
@@ -284,11 +344,76 @@ struct TelemetryCleanup: Sendable {
             precondition(cleanup.run() == .cleaned)
             let state = fake.snapshot
             precondition(state.environment == ["OTHER": "1"], "only BarPilot's variables are cleared")
-            precondition(state.calls.first?.first == "bootout", "agent must be unloaded first")
+            precondition(Array(state.calls.prefix(3)) == [
+                ["print", cleanup.launchAgentTarget],
+                ["bootout", cleanup.launchAgentTarget],
+                ["print", cleanup.launchAgentTarget],
+            ], "agent ownership and unloading must be verified before clearing the environment")
             precondition(!fileManager.fileExists(atPath: cleanup.helperScriptPath))
             precondition(!fileManager.fileExists(atPath: cleanup.launchAgentPath))
             precondition(!state.agentLoaded)
             precondition(cleanup.run() == .nothingToClean, "cleanup must be idempotent")
+        }
+
+        // Deleting the plist does not unload a previously registered BarPilot agent.
+        fixture(
+            script: ownedScript, agentProgram: nil, registration: .owned,
+            environment: { Dictionary(uniqueKeysWithValues: $0.expectedEnvironment) }
+        ) { cleanup, fake in
+            precondition(cleanup.run() == .cleaned)
+            precondition(fake.snapshot.calls.contains(["bootout", cleanup.launchAgentTarget]))
+            precondition(!fake.snapshot.agentLoaded && fake.snapshot.environment.isEmpty)
+            precondition(!fileManager.fileExists(atPath: cleanup.helperScriptPath))
+        }
+
+        // The plist on disk cannot authorize unloading a different registered job.
+        for registration in [TestAgentRegistration.foreignProgram, .foreignOrigin] {
+            fixture(
+                script: ownedScript, agentProgram: .expected, registration: registration,
+                environment: { Dictionary(uniqueKeysWithValues: $0.expectedEnvironment) }
+            ) { cleanup, fake in
+                let previous = fake.snapshot.environment
+                precondition(cleanup.run() == .nothingToClean)
+                precondition(fake.snapshot.calls == [["print", cleanup.launchAgentTarget]])
+                precondition(fake.snapshot.agentLoaded && fake.snapshot.environment == previous)
+                precondition(fileManager.fileExists(atPath: cleanup.helperScriptPath))
+                precondition(fileManager.fileExists(atPath: cleanup.launchAgentPath))
+            }
+        }
+
+        // A successful print without a top-level program cannot prove ownership.
+        fixture(
+            script: ownedScript, agentProgram: .expected, registration: .missingProgram,
+            environment: { Dictionary(uniqueKeysWithValues: $0.expectedEnvironment) }
+        ) { cleanup, fake in
+            let previous = fake.snapshot.environment
+            precondition(cleanup.run() == .failed("unable to verify telemetry login agent ownership"))
+            precondition(fake.snapshot.calls == [["print", cleanup.launchAgentTarget]])
+            precondition(fake.snapshot.agentLoaded && fake.snapshot.environment == previous)
+            precondition(fileManager.fileExists(atPath: cleanup.helperScriptPath))
+            precondition(fileManager.fileExists(atPath: cleanup.launchAgentPath))
+        }
+
+        // A failed launchctl lookup, either before or after bootout, keeps the
+        // files and environment available for a later verified cleanup.
+        for failedLookup in [1, 2] {
+            fixture(
+                script: ownedScript, agentProgram: .expected, registration: .owned,
+                environment: { Dictionary(uniqueKeysWithValues: $0.expectedEnvironment) },
+                failPrintCall: failedLookup
+            ) { cleanup, fake in
+                let previous = fake.snapshot.environment
+                let message = failedLookup == 1
+                    ? "unable to verify telemetry login agent ownership"
+                    : "unable to verify telemetry login agent was unloaded"
+                precondition(cleanup.run() == .failed(message))
+                precondition(fake.snapshot.agentLoaded == (failedLookup == 1))
+                precondition(fake.snapshot.environment == previous)
+                precondition(fileManager.fileExists(atPath: cleanup.helperScriptPath))
+                precondition(fileManager.fileExists(atPath: cleanup.launchAgentPath))
+                precondition(cleanup.run() == .cleaned)
+                precondition(!fake.snapshot.agentLoaded && fake.snapshot.environment.isEmpty)
+            }
         }
 
         // Helpers written before the rename are recognised too.
@@ -302,7 +427,8 @@ struct TelemetryCleanup: Sendable {
 
         // A matching plist does not confer ownership when another tool owns the script.
         fixture(
-            script: "#!/bin/sh\n# managed elsewhere\n", agentProgram: .matchingForeign,
+            script: "#!/bin/sh\n# managed elsewhere\n", agentProgram: .expected,
+            registration: .owned,
             environment: { _ in ["OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT": "true"] }
         ) { cleanup, fake in
             precondition(cleanup.run() == .nothingToClean)
@@ -313,7 +439,7 @@ struct TelemetryCleanup: Sendable {
 
         // A BarPilot helper does not authorize removal or disruption of a different agent.
         fixture(
-            script: ownedScript, agentProgram: .foreign,
+            script: ownedScript, agentProgram: .foreign, registration: .foreignProgram,
             environment: { _ in ["COPILOT_OTEL_EXPORTER_TYPE": "file"] }
         ) { cleanup, fake in
             precondition(cleanup.run() == .nothingToClean)
@@ -341,7 +467,7 @@ struct TelemetryCleanup: Sendable {
 
         // Another file exporter can use the same general flags with its own path.
         fixture(
-            script: ownedScript, agentProgram: .owned,
+            script: ownedScript, agentProgram: .expected, registration: .owned,
             environment: { cleanup in [
                 "COPILOT_OTEL_EXPORTER_TYPE": "file",
                 "COPILOT_OTEL_FILE_EXPORTER_PATH": cleanup.exporterPath.value + " ",
@@ -372,7 +498,7 @@ struct TelemetryCleanup: Sendable {
 
         // A failed unload preserves its files and variables so the next launch retries.
         fixture(
-            script: ownedScript, agentProgram: .owned,
+            script: ownedScript, agentProgram: .expected, registration: .owned,
             environment: { _ in ["COPILOT_OTEL_EXPORTER_TYPE": "file"] },
             failBootout: true
         ) { cleanup, fake in
@@ -423,11 +549,13 @@ struct TelemetryCleanup: Sendable {
 
         // A BarPilot helper can be removed when its agent is already unloaded.
         fixture(
-            script: ownedScript, agentProgram: nil,
+            script: ownedScript, agentProgram: .expected,
             environment: { _ in [:] }
-        ) { cleanup, _ in
+        ) { cleanup, fake in
             precondition(cleanup.run() == .cleaned)
+            precondition(!fake.snapshot.calls.contains { $0.first == "bootout" })
             precondition(!fileManager.fileExists(atPath: cleanup.helperScriptPath))
+            precondition(!fileManager.fileExists(atPath: cleanup.launchAgentPath))
         }
     }
 }

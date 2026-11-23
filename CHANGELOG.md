@@ -24,9 +24,13 @@ All notable changes to BarPilot are documented here.
 - Zero-usage cycles roll over correctly. Saved billing history remains browsable
   offline, the calendar uses observed month-end resets, and a selected day's
   spend follows the current account's observations.
+- Ambiguous rollover readings stay out of daily spend. Early resets use the
+  same boundary in the calendar and dashboard, and a fresh poll replaces any
+  previously cached activity for its cycle.
 - Multi-Mac sync verifies that its Gist is secret before using it.
 - Automatic and manual update checks share one installer. Bundle replacement is
-  atomic and the original app is available for rollback. (#44)
+  atomic, and the updater keeps the original until the replacement confirms
+  startup. (#44)
 - The pricing catalogue keeps the newer bundled snapshot when the offline cache
   predates it.
 

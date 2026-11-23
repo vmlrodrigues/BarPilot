@@ -523,11 +523,11 @@ struct CompactDashboard: View {
     }
 
     private var cycleRangeLabel: String {
-        guard let cycle = store.selectedCreditCycle,
-              let start = store.selectedCreditCycleStart else {
+        guard let start = store.selectedCreditCycleStart,
+              let end = store.selectedCreditCycleEnd else {
             return "Billing cycle"
         }
-        return "\(Self.cycleDateFormatter.string(from: start)) – \(Self.cycleDateFormatter.string(from: cycle.resetAt))"
+        return "\(Self.cycleDateFormatter.string(from: start)) – \(Self.cycleDateFormatter.string(from: end))"
     }
 
     private var spendCalendarOverlay: some View {
@@ -636,9 +636,9 @@ struct CompactDashboard: View {
                         Text(store.serverUsageError ?? "Current usage unavailable")
                             .font(.caption)
                     }
-                    if let cycle = store.selectedCreditCycle {
+                    if let end = store.selectedCreditCycleEnd {
                         Text("·")
-                        Text("\(store.isViewingCurrentCreditCycle ? "Resets" : "Ended") \(Self.resetFormatter.string(from: cycle.resetAt))")
+                        Text("\(store.isViewingCurrentCreditCycle ? "Resets" : "Ended") \(Self.resetFormatter.string(from: end))")
                             .font(.caption)
                     }
                 }
@@ -726,7 +726,7 @@ struct CompactDashboard: View {
             DailyCostBarChart(
                 points: timeline.daily,
                 cycleStart: store.selectedCreditCycleStart,
-                cycleReset: store.selectedCreditCycle?.resetAt,
+                cycleReset: store.selectedCreditCycleEnd,
                 cost: { store.displayCost(credits: $0) },
                 symbol: store.effectiveCurrency.symbol
             )
@@ -1059,7 +1059,7 @@ private struct SpendHistoryCalendar: View {
             guard let start = cycle.startAt(in: store.creditCycles) else { continue }
             var month = Self.monthStart(start)
             let last = Self.monthStart(
-                cycle.resetAt.addingTimeInterval(-0.001)
+                cycle.endAt(in: store.creditCycles).addingTimeInterval(-0.001)
             )
             var count = 0
             while month <= last && month <= today && count < 240 {

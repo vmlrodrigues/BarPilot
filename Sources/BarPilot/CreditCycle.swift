@@ -23,19 +23,26 @@ enum CreditCycle {
         )
     }
 
+    /// The direct API may respond with a server clock slightly ahead of this Mac.
+    /// Apply the tolerance to an explicit timestamp from a direct poll only.
+    static func hasArrived(
+        _ sample: CreditSample, directlyPolled: Bool, now: Date
+    ) -> Bool {
+        let futureTolerance: TimeInterval = directlyPolled && sample.serverAtMs != nil ? 30 : 0
+        return sample.observedAt.timeIntervalSince(now) <= futureTolerance
+    }
+
     /// Never present a missing, expired or failed poll as a real zero or as a
     /// current cached amount. History stays persisted for navigation and sync.
     static func visibleCurrentCredits(
         sample: CreditSample?, connected: Bool, pollFailed: Bool,
-        hasSuccessfulPoll: Bool,
-        now: Date = Date()
+        hasSuccessfulPoll: Bool, directlyPolled: Bool = false,
+        knownRange: Range<Date>? = nil, now: Date = Date()
     ) -> Double? {
         guard connected, !pollFailed, hasSuccessfulPoll, let sample,
-              isCurrentCycle(sample, now: now) else { return nil }
-        let age = now.timeIntervalSince(
-            Date(timeIntervalSince1970: Double(sample.observedAtMs) / 1_000)
-        )
-        guard age >= 0, age <= 5 * 60 else { return nil }
+              isCurrentCycle(sample, knownRange: knownRange, now: now),
+              hasArrived(sample, directlyPolled: directlyPolled, now: now),
+              now.timeIntervalSince(sample.observedAt) <= 5 * 60 else { return nil }
         return sample.creditsUsed
     }
 
@@ -54,12 +61,22 @@ enum CreditCycle {
 
     /// Guards against a nonsense reset far in the future being treated as the
     /// current cycle; the longest real cycle is a 31-day month.
-    private static let maxCycleLength: TimeInterval = 40 * 24 * 60 * 60
+    static let maximumCycleLength: TimeInterval = 40 * 24 * 60 * 60
 
-    static func isCurrentCycle(_ sample: CreditSample, now: Date = Date()) -> Bool {
-        guard sample.resetAt > now,
-              sample.resetAt.timeIntervalSince(now) <= maxCycleLength,
-              let start = cycleStart(for: sample) else { return false }
+    static func range(
+        for cycle: CreditCycleSummary, in cycles: [CreditCycleSummary]
+    ) -> Range<Date>? {
+        let end = cycle.endAt(in: cycles)
+        guard let start = cycle.startAt(in: cycles), start < end else { return nil }
+        return start..<end
+    }
+
+    static func isCurrentCycle(
+        _ sample: CreditSample, knownRange: Range<Date>? = nil, now: Date = Date()
+    ) -> Bool {
+        let end = knownRange?.upperBound ?? sample.resetAt
+        guard end > now, end.timeIntervalSince(now) <= maximumCycleLength,
+              let start = knownRange?.lowerBound ?? cycleStart(for: sample) else { return false }
         return start <= now
     }
 
@@ -106,6 +123,22 @@ enum CreditCycle {
             hasSuccessfulPoll: true,
             now: zero.resetAt
         ) == nil, "the prior cycle must not remain current after rollover")
+        let priorToEstimatedStart = Date(timeIntervalSince1970: Double(
+            CreditCycle.utcMidnightMs("2030-01-01") - 60_000
+        ) / 1_000)
+        let earlyCycle = CreditSample(
+            capturedAtMs: Int64(priorToEstimatedStart.timeIntervalSince1970 * 1_000),
+            serverAtMs: nil, resetAtMs: reset, creditsUsed: 3
+        )
+        precondition(!isCurrentCycle(earlyCycle, now: priorToEstimatedStart))
+        precondition(visibleCurrentCredits(
+            sample: earlyCycle, connected: true, pollFailed: false, hasSuccessfulPoll: true,
+            knownRange: priorToEstimatedStart..<earlyCycle.resetAt, now: priorToEstimatedStart
+        ) == 3, "observed early rollover must be eligible before the estimated start")
+        precondition(visibleCurrentCredits(
+            sample: zero, connected: true, pollFailed: false, hasSuccessfulPoll: true,
+            knownRange: priorToEstimatedStart..<now, now: now
+        ) == nil, "the observed cycle end is exclusive")
         let available = CreditSample(
             capturedAtMs: t2, serverAtMs: nil, resetAtMs: reset, creditsUsed: 123
         )
@@ -113,6 +146,32 @@ enum CreditCycle {
             sample: available, connected: true, pollFailed: false,
             hasSuccessfulPoll: true, now: now
         ) == 123, "a recovered poll must show the exact GitHub amount")
+        let slightlyFastServer = CreditSample(
+            capturedAtMs: t2, serverAtMs: t2 + 15_000,
+            resetAtMs: reset, creditsUsed: 123
+        )
+        precondition(visibleCurrentCredits(
+            sample: slightlyFastServer, connected: true, pollFailed: false,
+            hasSuccessfulPoll: true, directlyPolled: true, now: now
+        ) == 123, "a modest GitHub clock skew must not hide a successful direct poll")
+        precondition(visibleCurrentCredits(
+            sample: slightlyFastServer, connected: true, pollFailed: false,
+            hasSuccessfulPoll: true, now: now
+        ) == nil, "the direct clock allowance must not apply to cached or synced observations")
+        let farAheadServer = CreditSample(
+            capturedAtMs: t2, serverAtMs: t2 + 31_000,
+            resetAtMs: reset, creditsUsed: 123
+        )
+        let futureCapture = CreditSample(
+            capturedAtMs: t2 + 15_000, serverAtMs: nil,
+            resetAtMs: reset, creditsUsed: 123
+        )
+        for invalid in [farAheadServer, futureCapture] {
+            precondition(visibleCurrentCredits(
+                sample: invalid, connected: true, pollFailed: false,
+                hasSuccessfulPoll: true, directlyPolled: true, now: now
+            ) == nil, "future capture and excessive server clock skew must remain ineligible")
+        }
         let serverTimestampIsOld = CreditSample(
             capturedAtMs: t2, serverAtMs: t2 - 6 * 60_000,
             resetAtMs: reset, creditsUsed: 123

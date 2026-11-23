@@ -491,27 +491,26 @@ enum SyncAggregate {
         local: [CreditCycleSummary],
         additionalSamples: [CreditSample]
     ) -> [CreditCycleSummary] {
-        var latestByDay = Dictionary(
+        var cyclesByDay = Dictionary(
             uniqueKeysWithValues: local.map {
-                ($0.resetDayMs, $0.latestSample)
+                ($0.resetDayMs, $0)
             }
         )
         for sample in additionalSamples {
             let day = CreditCycleSummary.dayStart(for: sample.resetAtMs)
-            let sampleAt = sample.serverAtMs ?? sample.capturedAtMs
-            let previous = latestByDay[day]
-            let previousAt = previous.map {
-                $0.serverAtMs ?? $0.capturedAtMs
-            } ?? .min
-            if sampleAt > previousAt
-                || (sampleAt == previousAt
-                    && sample.capturedAtMs >= (previous?.capturedAtMs ?? .min)) {
-                latestByDay[day] = sample
+            guard let previous = cyclesByDay[day] else {
+                cyclesByDay[day] = CreditCycleSummary(latestSample: sample)
+                continue
             }
+            let earlier = min(sample.observedAtMs, previous.firstObservedAtMs)
+            let latest = previous.latestSample
+            let isNewer = sample.observedAtMs > latest.observedAtMs
+                || (sample.observedAtMs == latest.observedAtMs && sample.capturedAtMs >= latest.capturedAtMs)
+            cyclesByDay[day] = CreditCycleSummary(
+                latestSample: isNewer ? sample : latest, firstObservedAtMs: earlier
+            )
         }
-        return latestByDay.values
-            .map { CreditCycleSummary(latestSample: $0) }
-            .sorted { $0.resetDayMs > $1.resetDayMs }
+        return cyclesByDay.values.sorted { $0.resetDayMs > $1.resetDayMs }
     }
 
     /// Select the newest valid account-counter observation available to this
@@ -521,10 +520,20 @@ enum SyncAggregate {
         local: CreditSample?,
         remotes: [MachineSyncPayload],
         accountFingerprint: String?,
+        localWasDirectlyPolled: Bool = false,
+        knownCycles: [CreditCycleSummary] = [],
         now: Date = Date()
     ) -> CurrentCreditObservation? {
+        let rangesByDay = Dictionary(uniqueKeysWithValues: knownCycles.compactMap { cycle in
+            CreditCycle.range(for: cycle, in: knownCycles).map { (cycle.id, $0) }
+        })
+        func isEligible(_ sample: CreditSample, directlyPolled: Bool) -> Bool {
+            let cycleDay = CreditCycleSummary.dayStart(for: sample.resetAtMs)
+            return CreditCycle.isCurrentCycle(sample, knownRange: rangesByDay[cycleDay], now: now)
+                && CreditCycle.hasArrived(sample, directlyPolled: directlyPolled, now: now)
+        }
         var candidates: [CurrentCreditObservation] = []
-        if let local, CreditCycle.isCurrentCycle(local, now: now) {
+        if let local, isEligible(local, directlyPolled: localWasDirectlyPolled) {
             candidates.append(CurrentCreditObservation(
                 sample: local, cameFromRemote: false
             ))
@@ -534,14 +543,10 @@ enum SyncAggregate {
                 .filter { $0.accountFingerprint == accountFingerprint }
                 .flatMap { $0.creditSamples ?? [] }
                 .map(\.creditSample)
-                .filter { CreditCycle.isCurrentCycle($0, now: now) }
+                .filter { isEligible($0, directlyPolled: false) }
                 .map { CurrentCreditObservation(sample: $0, cameFromRemote: true) }
         }
-        // A Mac with a fast clock must not hide a valid observation by winning
-        // the ranking and then failing the dashboard's future-date check.
-        return candidates.filter {
-            Date(timeIntervalSince1970: Double($0.sample.observedAtMs) / 1_000) <= now
-        }.max {
+        return candidates.max {
             let lhs = $0.sample.observedAtMs
             let rhs = $1.sample.observedAtMs
             if lhs != rhs { return lhs < rhs }
@@ -1081,6 +1086,62 @@ enum SyncAggregate {
                 ) == remoteCurrentSample.creditsUsed,
             "future peer timestamps must not hide an eligible local observation"
         )
+        let modestFutureServer = CreditSample(
+            capturedAtMs: remoteCurrentSample.capturedAtMs,
+            serverAtMs: remoteCurrentSample.capturedAtMs + 15_000,
+            resetAtMs: remoteOnlyReset, creditsUsed: 126
+        )
+        let futureServerPeer = project(
+            creditSamples: [modestFutureServer],
+            accountFingerprint: "same-account",
+            machineId: "future-server-peer", label: nil, updatedAt: ""
+        )
+        precondition(
+            currentCreditObservation(
+                local: remoteCurrentSample, remotes: [futureServerPeer],
+                accountFingerprint: "same-account",
+                localWasDirectlyPolled: true, now: currentNow
+            )?.sample == remoteCurrentSample,
+            "even a modest future server timestamp must remain ineligible from a peer"
+        )
+        precondition(
+            currentCreditObservation(
+                local: modestFutureServer, remotes: [remoteCurrent],
+                accountFingerprint: "same-account",
+                localWasDirectlyPolled: true, now: currentNow
+            )?.sample == modestFutureServer,
+            "a direct poll with a modest server clock lead must be eligible"
+        )
+        precondition(
+            currentCreditObservation(
+                local: modestFutureServer, remotes: [remoteCurrent],
+                accountFingerprint: "same-account", now: currentNow
+            )?.sample == remoteCurrentSample,
+            "a persisted sample must not receive the direct-poll clock allowance"
+        )
+        let reportedReset = CreditCycle.utcMidnightMs("2030-09-01")
+        let beforeReportedReset = Date(timeIntervalSince1970: Double(reportedReset - 60_000) / 1_000)
+        let endingCycle = CreditSample(
+            capturedAtMs: reportedReset - 120_000, serverAtMs: nil,
+            resetAtMs: reportedReset, creditsUsed: 90
+        )
+        let earlyRollover = CreditSample(
+            capturedAtMs: reportedReset - 60_000, serverAtMs: nil,
+            resetAtMs: CreditCycle.utcMidnightMs("2030-10-01"), creditsUsed: 0
+        )
+        let rolloverPeer = project(
+            creditSamples: [earlyRollover], accountFingerprint: "same-account",
+            machineId: "rollover-peer", label: nil, updatedAt: ""
+        )
+        let observedCycles = mergedCreditCycles(
+            local: [CreditCycleSummary(latestSample: endingCycle)],
+            additionalSamples: [earlyRollover]
+        )
+        precondition(currentCreditObservation(
+            local: endingCycle, remotes: [rolloverPeer], accountFingerprint: "same-account",
+            knownCycles: observedCycles, now: beforeReportedReset
+        )?.sample == earlyRollover,
+        "a valid early rollover becomes current at its observed boundary")
         let skewReset = CreditCycle.utcMidnightMs("2030-04-01")
         let serverNewer = CreditSample(
             capturedAtMs: sampleStart,

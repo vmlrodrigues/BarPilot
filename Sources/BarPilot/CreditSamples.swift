@@ -5,13 +5,16 @@ private let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self
 
 struct CreditCycleSummary: Identifiable, Equatable {
     static let dayMs: Int64 = 24 * 60 * 60 * 1000
+    private static let adjacentResetTolerance: TimeInterval = 4 * 86_400
 
     let resetDayMs: Int64
     let latestSample: CreditSample
+    let firstObservedAtMs: Int64
 
-    init(latestSample: CreditSample) {
+    init(latestSample: CreditSample, firstObservedAtMs: Int64? = nil) {
         self.resetDayMs = Self.dayStart(for: latestSample.resetAtMs)
         self.latestSample = latestSample
+        self.firstObservedAtMs = firstObservedAtMs ?? latestSample.observedAtMs
     }
 
     var id: Int64 { resetDayMs }
@@ -20,16 +23,32 @@ struct CreditCycleSummary: Identifiable, Equatable {
     var startAt: Date? { CreditCycle.cycleStart(for: latestSample) }
 
     func startAt(in cycles: [CreditCycleSummary]) -> Date? {
-        guard let estimate = startAt else { return nil }
+        let preceding = cycles.first { $0.resetDayMs < resetDayMs }
+        return preceding.flatMap { startAt(after: $0) } ?? startAt
+    }
+
+    func endAt(in cycles: [CreditCycleSummary]) -> Date {
+        let following = cycles.last { $0.resetDayMs > resetDayMs }
+        return following.flatMap { $0.startAt(after: self) } ?? resetAt
+    }
+
+    private func startAt(after preceding: CreditCycleSummary) -> Date? {
         // Monthly date arithmetic can clamp to a shorter month's last day.
-        // Prefer the preceding observed reset when it fits the monthly cadence.
+        // Use the preceding cycle's reported reset when it fits the cadence.
         // Three days cover the difference in month lengths. The extra day
         // allows the API's reset fields to differ in time-of-day.
-        guard let preceding = cycles.first(where: { $0.resetDayMs < resetDayMs }),
-              preceding.resetAt <= latestSample.capturedAt,
-              abs(preceding.resetAt.timeIntervalSince(estimate)) < 4 * 86_400
-        else { return estimate }
-        return preceding.resetAt
+        guard let estimate = startAt,
+              abs(preceding.resetAt.timeIntervalSince(estimate)) < Self.adjacentResetTolerance
+        else { return nil }
+
+        // An accepted new-cycle observation can establish an earlier boundary.
+        // Use the same instant as the preceding cycle's exclusive end.
+        let observed = Date(timeIntervalSince1970: Double(firstObservedAtMs) / 1_000)
+        if observed < preceding.resetAt,
+           preceding.resetAt.timeIntervalSince(observed) < Self.adjacentResetTolerance {
+            return observed
+        }
+        return preceding.resetAt <= latestSample.capturedAt ? preceding.resetAt : nil
     }
 
     static func dayStart(for resetAtMs: Int64) -> Int64 {
@@ -58,8 +77,9 @@ struct CreditCycleSummary: Identifiable, Equatable {
         let dateMs = Int64(date.timeIntervalSince1970 * 1000)
         let dayStartMs = Self.dayStart(for: dateMs)
         let dayEndMs = dayStartMs + Self.dayMs
-        let startMs = Int64(start.timeIntervalSince1970 * 1000)
-        return max(0, min(dayEndMs, resetAtMs) - max(dayStartMs, startMs))
+        let startMs = Int64((start.timeIntervalSince1970 * 1000).rounded())
+        let endMs = Int64((endAt(in: cycles).timeIntervalSince1970 * 1000).rounded())
+        return max(0, min(dayEndMs, endMs) - max(dayStartMs, startMs))
     }
 
     static func overlapsUTCMonth(
@@ -74,7 +94,7 @@ struct CreditCycleSummary: Identifiable, Equatable {
             from: calendar.dateComponents([.year, .month], from: date)
         ), let monthEnd = calendar.date(byAdding: .month, value: 1, to: monthStart)
         else { return false }
-        return start < monthEnd && cycle.resetAt > monthStart
+        return start < monthEnd && cycle.endAt(in: cycles) > monthStart
     }
 
     static func utcMonthKey(for date: Date) -> String {
@@ -104,8 +124,8 @@ struct CreditCycleNavigation {
     let newer: CreditCycleSummary?
     let canReturnToCurrent: Bool
 
-    init(cycles: [CreditCycleSummary], selectedDay: Int64?, now: Date = Date()) {
-        let completed = cycles.filter { $0.resetAt <= now }
+    init(cycles: [CreditCycleSummary], selectedDay: Int64?, liveDay: Int64? = nil, now: Date = Date()) {
+        let completed = cycles.filter { Self.isCompleted($0, in: cycles, liveDay: liveDay, now: now) }
         if let selectedDay {
             older = completed.first { $0.resetDayMs < selectedDay }
             newer = completed.last { $0.resetDayMs > selectedDay }
@@ -115,6 +135,13 @@ struct CreditCycleNavigation {
             newer = nil
             canReturnToCurrent = false
         }
+    }
+
+    static func isCompleted(
+        _ cycle: CreditCycleSummary, in cycles: [CreditCycleSummary], liveDay: Int64?, now: Date
+    ) -> Bool {
+        if let liveDay { return cycle.resetDayMs < liveDay }
+        return cycle.endAt(in: cycles) <= now
     }
 
     static func verify() {
@@ -157,6 +184,47 @@ struct CreditCycleNavigation {
                      "the newer arrow from the latest completed cycle must return to the current view")
         let older = CreditCycleNavigation(cycles: historical, selectedDay: january.resetDayMs, now: now)
         precondition(older.older == nil && older.newer == february && !older.canReturnToCurrent)
+
+        let planned = CreditCycle.utcMidnightMs("2030-02-01")
+        let observed = planned - 15 * 60_000
+        let nextReset = CreditCycle.utcMidnightMs("2030-03-01")
+        let previousSample = CreditSample(
+            capturedAtMs: observed - 60_000, serverAtMs: nil, resetAtMs: planned, creditsUsed: 60
+        )
+        let early = CreditSample(
+            capturedAtMs: observed, serverAtMs: nil, resetAtMs: nextReset, creditsUsed: 0
+        )
+        let later = CreditSample(
+            capturedAtMs: observed + 10 * 60_000, serverAtMs: nil, resetAtMs: nextReset, creditsUsed: 25
+        )
+        CreditSampleStore.withTemporaryStore {
+            for sample in [previousSample, early, later] {
+                precondition(CreditSampleStore.save(sample, account: "fixture"))
+            }
+            let cycles = CreditSampleStore.cycles(account: "fixture")
+            precondition(cycles.count == 2)
+            precondition(cycles == CreditSampleStore.compactedHistory(account: "fixture")?.cycles)
+            let live = cycles[0]
+            let prior = cycles[1]
+            precondition(live.firstObservedAtMs == observed)
+            precondition(live.startAt(in: cycles) == early.capturedAt)
+            precondition(prior.endAt(in: cycles) == early.capturedAt)
+            let nav = CreditCycleNavigation(cycles: cycles, selectedDay: nil,
+                                            liveDay: live.id, now: later.capturedAt)
+            precondition(nav.older == prior, "a confirmed early reset must make the previous cycle navigable")
+            let beforeMidnight = date("2030-01-31")
+            precondition(CreditCycleSummary.cycle(containingUTCDate: beforeMidnight, in: cycles) == prior)
+            precondition(live.overlapOnUTCDay(beforeMidnight, in: cycles) == 15 * 60_000)
+            precondition(CreditCycleSummary.overlapsUTCMonth(live, containing: beforeMidnight, in: cycles),
+                         "the calendar must include a new cycle that recorded spend in the previous month")
+            let daily = CreditTimeline.combinedDaily(samplesByCycle: [[previousSample], [early, later]],
+                                                      monthKey: "2030-01")
+            precondition(daily["2030-01-31"] == 25)
+            let merged = SyncAggregate.mergedCreditCycles(
+                local: [CreditCycleSummary(latestSample: later), prior], additionalSamples: [early]
+            )
+            precondition(merged == cycles, "an earlier peer observation must keep the early reset after a merge")
+        }
     }
 }
 
@@ -1108,7 +1176,9 @@ enum CreditSampleStore {
         }
         guard budgetStep == SQLITE_DONE else { return nil }
         let cycles = latestByCycle
-            .map { CreditCycleSummary(latestSample: $0.value) }
+            .map { day, sample in
+                CreditCycleSummary(latestSample: sample, firstObservedAtMs: samplesByCycle[day]?.first?.observedAtMs)
+            }
             .sorted { $0.resetDayMs > $1.resetDayMs }
         return HistorySnapshot(
             cycles: cycles,
@@ -1150,7 +1220,8 @@ enum CreditSampleStore {
         for resetDay in resetDays {
             let end = resetDay + CreditCycleSummary.dayMs
             let latestSQL = """
-            SELECT captured_at_ms, server_at_ms, reset_at_ms, credits_used
+            SELECT captured_at_ms, server_at_ms, reset_at_ms, credits_used,
+                   MIN(COALESCE(server_at_ms, captured_at_ms)) OVER ()
             FROM credit_samples
             WHERE reset_at_ms >= \(resetDay) AND reset_at_ms < \(end)
               AND \(accountClause)
@@ -1170,7 +1241,7 @@ enum CreditSampleStore {
                         ? nil : sqlite3_column_int64(latestStmt, 1),
                     resetAtMs: sqlite3_column_int64(latestStmt, 2),
                     creditsUsed: sqlite3_column_double(latestStmt, 3)
-                )))
+                ), firstObservedAtMs: sqlite3_column_int64(latestStmt, 4)))
             }
             sqlite3_finalize(latestStmt)
         }

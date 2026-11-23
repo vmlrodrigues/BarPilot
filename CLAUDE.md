@@ -240,7 +240,8 @@ column or date reveals that day’s date, credits and display-currency cost.
   after a failed poll or disconnect, even if a peer has a saved counter. Persisted
   history is not erased. A cached sample is not presented as current until this
   launch completes a successful poll; its GitHub observation must be no more
-  than five minutes old.
+  than five minutes old. A direct poll in this process tolerates up to 30 seconds
+  of server clock lead. Future-dated peer observations are excluded.
 - **Multi-machine sync uses schema v3 counter observations and cycle budgets.** Each Mac publishes
   the live cycle's first locally captured observation in each 15-minute UTC
   bucket plus its moving close. Completed cycles retain the first, high-water
@@ -306,10 +307,11 @@ column or date reveals that day’s date, credits and display-currency cost.
   `credit_samples.account` records which account observed each row, and
   `Store.loadCycleSamples` reads by UTC reset day + account. Exact reset instants
   remain stored, but same-day variants are coalesced for navigation because the
-  API's reset fields can disagree on time-of-day. Near a reset, a sample for the
-  new cycle needs a lower counter if the previous cycle ended above zero. A
-  post-reset observation after a zero-usage cycle can be accepted immediately.
-  The confirmation window ends after 24 hours. The former baseline
+  API's reset fields can disagree on time-of-day. An accepted early reset sets
+  the shared boundary for both adjacent cycles. A new cycle can be confirmed by
+  a counter drop, a zero reading following an observed zero after reset, or a
+  reset that shows an intervening cycle has passed. Ambiguous readings stay out
+  of history. The former baseline
   pointer is **deleted, not repurposed** — it was the only account-isolation
   mechanism, so it had to be shoved forward on every reconnect, and any change to
   fingerprint derivation made the *same* account look new and hid the whole cycle.
@@ -336,8 +338,9 @@ column or date reveals that day’s date, credits and display-currency cost.
   across manual and scheduled triggers. It stages the bundle beside the running
   app, verifies its identity, Developer ID signature and Gatekeeper assessment,
   and uses a helper process to exchange the two bundles atomically. The helper
-  retains the original bundle until the relaunch command succeeds. Developer ID
-  release builds use this updater.
+  retains the original bundle until the replacement confirms startup. It restores
+  the original if the replacement fails startup and can safely be stopped.
+  Developer ID release builds use this updater.
 - **Start at Login** via `SMAppService.mainApp` (`LoginItem.swift`), toggled from
   Settings — no third-party dependency.
 - **Currency (USD/AUD):** everything is computed/stored in USD; AUD is a

@@ -106,27 +106,23 @@ enum BudgetPersistenceCompletionPolicy {
 }
 
 enum CreditCycleTransitionPolicy {
-    private static let boundaryWindowMs: Int64 = 24 * 60 * 60 * 1_000
-
-    /// GitHub can advance the reset boundary one response before its cumulative
-    /// counter resets. Do not persist that ambiguous first response into the new
-    /// cycle: if it is the old counter, it would become an artificial high-water
-    /// mark for the entire month.
+    /// GitHub can advance the reset boundary before the cumulative counter.
+    /// A previous-cycle balance stored under the new reset would permanently
+    /// suppress its daily increases, so a repeated balance stays ambiguous
+    /// across retries and restarts.
     static func needsConfirmation(
         previous: CreditSample?, current: CreditSample
     ) -> Bool {
         guard let previous,
               CreditCycleSummary.dayStart(for: current.resetAtMs)
-                > CreditCycleSummary.dayStart(for: previous.resetAtMs) else { return false }
-        let distanceFromBoundary = abs(
-            Double(current.capturedAtMs) - Double(previous.resetAtMs)
-        )
-        guard distanceFromBoundary <= Double(boundaryWindowMs),
-              current.creditsUsed >= previous.creditsUsed else { return false }
+                > CreditCycleSummary.dayStart(for: previous.resetAtMs),
+              current.creditsUsed >= previous.creditsUsed,
+              current.resetAt.timeIntervalSince(previous.resetAt)
+                <= CreditCycle.maximumCycleLength else { return false }
 
-        // A previous zero cannot drop. Once the old boundary passes, accept
-        // the new-cycle observation even if the counter is still zero.
-        return previous.creditsUsed > 0 || current.observedAtMs < previous.resetAtMs
+        // Accept an unchanged zero after the boundary. With a positive value
+        // the old cycle might have accrued spend since the last observation.
+        return current.creditsUsed > 0 || current.observedAtMs < previous.resetAtMs
     }
 
     static func changed(previous: CreditSample?, current: CreditSample) -> Bool {
@@ -166,9 +162,16 @@ enum CreditCycleTransitionPolicy {
             resetAtMs: newReset,
             creditsUsed: 1_200
         )
-        precondition(!needsConfirmation(
+        precondition(needsConfirmation(
             previous: previous, current: delayedReconnect
-        ))
+        ), "elapsed time alone cannot confirm an adjacent nonzero rollover")
+        let skippedCycle = CreditSample(
+            capturedAtMs: newReset + 3 * CreditCycleSummary.dayMs,
+            serverAtMs: nil,
+            resetAtMs: CreditCycle.utcMidnightMs("2030-03-01"), creditsUsed: 1_200
+        )
+        precondition(!needsConfirmation(previous: previous, current: skippedCycle),
+                     "an intervening cycle invalidates the old comparison counter")
         let resetCounter = CreditSample(
             capturedAtMs: oldReset + 1, serverAtMs: nil,
             resetAtMs: newReset, creditsUsed: 10
@@ -190,12 +193,12 @@ enum CreditCycleTransitionPolicy {
         )
         precondition(needsConfirmation(previous: previous, current: growingNewCounter),
                      "rerunning an ambiguous poll near reset must still wait")
-        let afterWindow = CreditSample(
-            capturedAtMs: oldReset + boundaryWindowMs + 1, serverAtMs: nil,
+        let repeatedAfterOneDay = CreditSample(
+            capturedAtMs: oldReset + CreditCycleSummary.dayMs + 1, serverAtMs: nil,
             resetAtMs: newReset, creditsUsed: growingNewCounter.creditsUsed
         )
-        precondition(!needsConfirmation(previous: previous, current: afterWindow),
-                     "ambiguous rollover must not keep blocking after its window")
+        precondition(needsConfirmation(previous: previous, current: repeatedAfterOneDay),
+                     "an ambiguous high-water mark must stay out of history after 24 hours")
 
         let zeroPrevious = CreditSample(
             capturedAtMs: oldReset - 1, serverAtMs: nil,
@@ -207,6 +210,26 @@ enum CreditCycleTransitionPolicy {
         )
         precondition(!needsConfirmation(previous: zeroPrevious, current: zeroBoundary),
                      "a new zero counter can follow an old zero after reset")
+        let delayedOldSpend = CreditSample(
+            capturedAtMs: oldReset + 1, serverAtMs: nil,
+            resetAtMs: newReset, creditsUsed: 80
+        )
+        precondition(needsConfirmation(previous: zeroPrevious, current: delayedOldSpend),
+                     "new reset metadata and an old zero do not validate a positive counter")
+        let confirmedZero = CreditSample(
+            capturedAtMs: oldReset + 2, serverAtMs: nil,
+            resetAtMs: newReset, creditsUsed: 0
+        )
+        let newSpend = CreditSample(
+            capturedAtMs: oldReset + 3, serverAtMs: nil,
+            resetAtMs: newReset, creditsUsed: 50
+        )
+        precondition(!needsConfirmation(previous: zeroPrevious, current: confirmedZero))
+        precondition(!needsConfirmation(previous: confirmedZero, current: newSpend))
+        precondition(CreditTimeline.build(samples: [
+            confirmedZero, newSpend
+        ]).observedCredits == 50,
+        "waiting for reset confirmation must preserve the first genuine increases")
         let earlyZero = CreditSample(
             capturedAtMs: oldReset - 1, serverAtMs: nil,
             resetAtMs: newReset, creditsUsed: 0
@@ -226,6 +249,17 @@ enum CreditHistoryMergePolicy {
         SyncAggregate.compactCycleBudgets(stored + live)
     }
 
+    static func rollingActivity(
+        live: [ObservedDayCredits], liveCycleDay: Int64?,
+        savedByCycle: [Int64: [ObservedDayCredits]]
+    ) -> [ObservedDayCredits] {
+        CreditTimeline.mergedDailyRows(
+            [live] + savedByCycle.compactMap { day, rows in
+                day == liveCycleDay ? nil : rows
+            }
+        )
+    }
+
     static func verify() {
         let day = CreditCycle.utcMidnightMs("2030-02-01")
         let stale = SyncedCycleBudget(
@@ -237,6 +271,21 @@ enum CreditHistoryMergePolicy {
         precondition(cycleBudgets(
             stored: [stale], live: [edited]
         ).first?.budgetUSD == 200)
+        let splitDay = "2030-01-31"
+        let saved = [
+            day: [ObservedDayCredits(id: splitDay, day: splitDay, credits: 10)],
+            day - CreditCycleSummary.dayMs: [
+                ObservedDayCredits(id: splitDay, day: splitDay, credits: 5)
+            ]
+        ]
+        precondition(rollingActivity(
+            live: [], liveCycleDay: nil, savedByCycle: saved
+        ).first?.credits == 15, "saved rows remain visible before a live cycle resolves")
+        precondition(rollingActivity(
+            live: [ObservedDayCredits(id: splitDay, day: splitDay, credits: 12)],
+            liveCycleDay: day, savedByCycle: saved
+        ).first?.credits == 17,
+        "a newly eligible live cycle replaces its cached rows without hiding another cycle's spend")
     }
 }
 
@@ -388,15 +437,16 @@ final class UsageStore: ObservableObject {
     @Published private(set) var serverUsageError: String?
     @Published private(set) var isConnectingServerUsage = false
     /// A persisted sample is not shown as current until this process has
-    /// completed a successful account-counter poll.
-    private var hasSuccessfulServerUsagePoll = false
+    /// completed a successful account-counter poll. Keep the direct observation
+    /// distinct from the newest local row, which can be recovered through sync.
+    private var lastSuccessfulServerUsagePoll: CreditSample?
     /// The in-flight device-flow poll, retained so the user can cancel it.
     private var serverUsageConnectTask: Task<Void, Never>?
     /// Cached in `recompute()` — see `updateCreditCycleView()`.
     @Published private(set) var creditTimeline: CreditTimeline = .empty
-    /// Completed-cycle rows retained beside the live cycle so Recent activity
-    /// remains a true rolling history when a new billing cycle begins.
-    @Published private(set) var previousCreditActivity: [ObservedDayCredits] = []
+    /// Keep cycle IDs until display so a change in live eligibility can
+    /// replace the saved rows without loading the history again.
+    @Published private var savedCreditActivityByCycle: [Int64: [ObservedDayCredits]] = [:]
     @Published private(set) var creditCycles: [CreditCycleSummary] = []
     @Published private(set) var selectedCreditCycleDayMs: Int64?
     @Published private(set) var isLoadingCreditCycle = false
@@ -539,11 +589,13 @@ final class UsageStore: ObservableObject {
         // even though the samples were sitting in the database.
         let latest = CreditSampleStore.latest(account: serverUsageAccountFingerprint)
         if let latest {
-            creditCycles = [CreditCycleSummary(latestSample: latest)]
             serverUsageSample = latest
             creditSamples = Self.loadCycleSamples(
                 resetAtMs: latest.resetAtMs, account: serverUsageAccountFingerprint
             )
+            creditCycles = [CreditCycleSummary(
+                latestSample: latest, firstObservedAtMs: creditSamples.lazy.map(\.observedAtMs).min()
+            )]
             syncCreditSamples = creditSamples
             selectedCreditCycleSamples = creditSamples
         }
@@ -1109,7 +1161,7 @@ final class UsageStore: ObservableObject {
     private func finishServerUsageConnectionAwaitingTransition(fingerprint: String) -> Bool {
         resetCreditCycleSelection()
         resetSpendCalendar()
-        hasSuccessfulServerUsagePoll = false
+        lastSuccessfulServerUsagePoll = nil
         serverUsageAccountFingerprint = fingerprint
         UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
         serverUsageEnabled = true
@@ -1132,10 +1184,11 @@ final class UsageStore: ObservableObject {
         resetCreditCycleSelection()
         resetSpendCalendar()
         serverUsageAccountFingerprint = fingerprint
-        hasSuccessfulServerUsagePoll = true
+        lastSuccessfulServerUsagePoll = sample
         if accountChanged {
             syncCycleBudgets = []
             localCreditHistory = nil
+            savedCreditActivityByCycle = [:]
         }
         UserDefaults.standard.set(fingerprint, forKey: Self.serverUsageAccountKey)
         serverUsageEnabled = true
@@ -1186,9 +1239,12 @@ final class UsageStore: ObservableObject {
         if let index = creditCycles.firstIndex(where: {
             $0.resetDayMs == summary.resetDayMs
         }) {
-            if sample.capturedAtMs >= creditCycles[index].latestSample.capturedAtMs {
-                creditCycles[index] = summary
-            }
+            let previous = creditCycles[index]
+            let latest = sample.capturedAtMs >= previous.latestSample.capturedAtMs
+                ? sample : previous.latestSample
+            creditCycles[index] = CreditCycleSummary(
+                latestSample: latest, firstObservedAtMs: min(summary.firstObservedAtMs, previous.firstObservedAtMs)
+            )
         } else {
             creditCycles.append(summary)
         }
@@ -1262,7 +1318,7 @@ final class UsageStore: ObservableObject {
         // The history load above exists only to keep the sync upload complete;
         // do not leak retained account-counter rows back into that fallback UI.
         guard serverUsageEnabled else {
-            previousCreditActivity = []
+            savedCreditActivityByCycle = [:]
             recompute()
             return
         }
@@ -1282,25 +1338,16 @@ final class UsageStore: ObservableObject {
             additionalSamples: remoteSamples
                 + [serverUsageSample].compactMap { $0 }
         )
-        refreshCurrentCreditObservation()
-        let liveDay = currentServerUsageSample.map {
-            CreditCycleSummary.dayStart(for: $0.resetAtMs)
-        }
-        previousCreditActivity = CreditTimeline.combinedDailyRows(
-            samplesByCycle: creditCycles.compactMap { cycle in
-                guard cycle.resetDayMs != liveDay else { return nil }
-                let local = stored.samplesByCycle[cycle.resetDayMs] ?? []
-                if let account {
-                    return SyncAggregate.mergedCreditSamples(
-                        local: local,
-                        remotes: remotes,
-                        resetAtMs: cycle.resetAtMs,
-                        accountFingerprint: account
-                    )
-                }
-                return local
-            }
-        )
+        savedCreditActivityByCycle = Dictionary(uniqueKeysWithValues: creditCycles.map { cycle in
+            let local = stored.samplesByCycle[cycle.resetDayMs] ?? []
+            let samples = account.map {
+                SyncAggregate.mergedCreditSamples(
+                    local: local, remotes: remotes,
+                    resetAtMs: cycle.resetAtMs, accountFingerprint: $0
+                )
+            } ?? local
+            return (cycle.resetDayMs, CreditTimeline.build(samples: samples).daily)
+        })
         if let selectedCreditCycleDayMs,
            !creditCycles.contains(where: {
                $0.resetDayMs == selectedCreditCycleDayMs
@@ -1320,9 +1367,9 @@ final class UsageStore: ObservableObject {
 
     private func transitionToDisconnectedServerUsage(error: String?) {
         serverUsageEnabled = false
-        hasSuccessfulServerUsagePoll = false
+        lastSuccessfulServerUsagePoll = nil
         budgetMigrationCycleDayMs = nil
-        previousCreditActivity = []
+        savedCreditActivityByCycle = [:]
         resetCreditCycleSelection()
         resetSpendCalendar()
         UserDefaults.standard.set(false, forKey: Self.serverUsageKey)
@@ -1471,7 +1518,7 @@ final class UsageStore: ObservableObject {
                 return .notNeeded
             }
             budgetPersistenceError = nil
-            hasSuccessfulServerUsagePoll = true
+            lastSuccessfulServerUsagePoll = sample
             upsertLocalCycleBudget(
                 resetDayMs: CreditCycleSummary.dayStart(for: sample.resetAtMs),
                 budgetUSD: budgetUSD, updatedAtMs: budgetChangedAtMs
@@ -1609,9 +1656,11 @@ final class UsageStore: ObservableObject {
     }
 
     var rollingCreditActivity: [ObservedDayCredits] {
-        CreditTimeline.mergedDailyRows([
-            creditTimeline.daily, previousCreditActivity
-        ])
+        CreditHistoryMergePolicy.rollingActivity(
+            live: creditTimeline.daily,
+            liveCycleDay: selectedCreditCycle?.resetDayMs,
+            savedByCycle: savedCreditActivityByCycle
+        )
     }
     private func refreshCurrentCreditObservation() {
         // Gated on the connection too: an explicit disconnect clears the current
@@ -1624,7 +1673,9 @@ final class UsageStore: ObservableObject {
         resolvedCurrentCreditObservation = SyncAggregate.currentCreditObservation(
             local: serverUsageSample,
             remotes: syncEnabled ? currentRemoteAggregates() : [],
-            accountFingerprint: serverUsageAccountFingerprint
+            accountFingerprint: serverUsageAccountFingerprint,
+            localWasDirectlyPolled: serverUsageSample == lastSuccessfulServerUsagePoll,
+            knownCycles: creditCycles
         )
     }
     private var currentServerUsageObservation: CurrentCreditObservation? {
@@ -1637,10 +1688,7 @@ final class UsageStore: ObservableObject {
         currentServerUsageObservation?.cameFromRemote == true
     }
     var currentServerUsageObservedAt: Date? {
-        guard let sample = currentServerUsageSample else { return nil }
-        return Date(timeIntervalSince1970: Double(
-            sample.serverAtMs ?? sample.capturedAtMs
-        ) / 1000)
+        currentServerUsageSample?.observedAt
     }
     var compactTotalCredits: Double? {
         if selectedCreditCycleDayMs != nil {
@@ -1651,11 +1699,21 @@ final class UsageStore: ObservableObject {
     }
 
     private var currentCompactTotalCredits: Double? {
-        CreditCycle.visibleCurrentCredits(
-            sample: currentServerUsageSample,
+        let sample = currentServerUsageSample
+        let range = sample.flatMap { current in
+            let day = CreditCycleSummary.dayStart(for: current.resetAtMs)
+            return creditCycles.first { $0.resetDayMs == day }.flatMap {
+                CreditCycle.range(for: $0, in: creditCycles)
+            }
+        }
+        return CreditCycle.visibleCurrentCredits(
+            sample: sample,
             connected: serverUsageEnabled,
             pollFailed: serverUsageError != nil,
-            hasSuccessfulPoll: hasSuccessfulServerUsagePoll
+            hasSuccessfulPoll: lastSuccessfulServerUsagePoll != nil,
+            directlyPolled: !currentServerUsageSampleIsRemote
+                && sample == lastSuccessfulServerUsagePoll,
+            knownRange: range
         )
     }
 
@@ -1755,7 +1813,13 @@ final class UsageStore: ObservableObject {
     }
 
     private var creditCycleNavigation: CreditCycleNavigation {
-        CreditCycleNavigation(cycles: creditCycles, selectedDay: selectedCreditCycleDayMs)
+        CreditCycleNavigation(
+            cycles: creditCycles, selectedDay: selectedCreditCycleDayMs, liveDay: currentCreditCycleDay
+        )
+    }
+
+    private var currentCreditCycleDay: Int64? {
+        currentServerUsageSample.map { CreditCycleSummary.dayStart(for: $0.resetAtMs) }
     }
 
     var canSelectOlderCreditCycle: Bool {
@@ -1792,11 +1856,13 @@ final class UsageStore: ObservableObject {
               ) else {
             return false
         }
-        if target.resetAt > Date() {
+        if CreditCycleNavigation.isCompleted(target, in: creditCycles, liveDay: currentCreditCycleDay, now: Date()) {
+            selectCreditCycle(target.resetDayMs)
+        } else if currentCreditCycleDay == nil || currentCreditCycleDay == target.resetDayMs {
             resetCreditCycleSelection()
             updateCreditCycleView()
         } else {
-            selectCreditCycle(target.resetDayMs)
+            return false
         }
         return true
     }
@@ -1956,13 +2022,13 @@ final class UsageStore: ObservableObject {
         selectedCreditCycle?.startAt(in: creditCycles)
     }
 
+    var selectedCreditCycleEnd: Date? {
+        selectedCreditCycle?.endAt(in: creditCycles)
+    }
+
     func calendarSamples(on date: Date) -> [Int64: [CreditSample]] {
         guard spendCalendarMonthKey == CreditCycleSummary.utcMonthKey(for: date) else { return [:] }
-        return Dictionary(uniqueKeysWithValues: creditCycles.compactMap { cycle in
-            guard cycle.overlapOnUTCDay(date, in: creditCycles) > 0,
-                  let samples = spendCalendarLocalSamples[cycle.id] else { return nil }
-            return (cycle.id, samples)
-        })
+        return spendCalendarLocalSamples
     }
 
     func observedCredits(on date: Date, calendarSamples: [Int64: [CreditSample]]) -> Double? {
@@ -1979,7 +2045,7 @@ final class UsageStore: ObservableObject {
             CreditCycleSummary.dayStart(for: $0.resetAtMs)
         }
         for cycle in creditCycles where cycle.id != selectedID
-            && cycle.overlapOnUTCDay(date, in: creditCycles) > 0 {
+            && (calendarSamples[cycle.id] != nil || cycle.id == currentCreditCycleDay) {
             let local = localCycleDay == cycle.id
                 ? creditSamples : calendarSamples[cycle.id] ?? []
             let samples = serverUsageAccountFingerprint.map {
@@ -2209,13 +2275,13 @@ final class UsageStore: ObservableObject {
     var compactSpendProjection: SpendProjection? {
         guard isViewingCurrentCreditCycle,
               let totalCredits = currentCompactTotalCredits,
-              let cycle = selectedCreditCycle,
-              let startAt = selectedCreditCycleStart else { return nil }
+              let startAt = selectedCreditCycleStart,
+              let endAt = selectedCreditCycleEnd else { return nil }
         return SpendProjection.computeBillingCycle(
             totalCredits: totalCredits,
             monthlyBudgetUSD: monthlyBudget,
             startAt: startAt,
-            resetAt: cycle.resetAt,
+            resetAt: endAt,
             now: Date(),
             calendar: Self.utcCalendar,
             excludeWeekends: excludeWeekendsFromProjection)

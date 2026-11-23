@@ -143,12 +143,6 @@ struct CreditTimeline {
         }.sorted { $0.day > $1.day }
     }
 
-    static func combinedDailyRows(
-        samplesByCycle: [[CreditSample]]
-    ) -> [ObservedDayCredits] {
-        mergedDailyRows(samplesByCycle.map { build(samples: $0).daily })
-    }
-
     /// Expand sparse observed-day totals into the complete selected billing
     /// cycle. The reset instant is exclusive: a midnight reset belongs to the
     /// next cycle, while a non-midnight reset legitimately leaves a partial

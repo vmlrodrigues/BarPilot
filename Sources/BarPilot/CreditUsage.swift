@@ -23,6 +23,7 @@ struct CreditSample: Equatable {
     let creditsUsed: Double
 
     var observedAtMs: Int64 { serverAtMs ?? capturedAtMs }
+    var observedAt: Date { Date(timeIntervalSince1970: Double(observedAtMs) / 1000) }
     var capturedAt: Date { Date(timeIntervalSince1970: Double(capturedAtMs) / 1000) }
     var resetAt: Date { Date(timeIntervalSince1970: Double(resetAtMs) / 1000) }
 }

@@ -193,20 +193,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSWorkspace.screensDidWakeNotification,
             object: nil
         )
-        let shouldRetireTelemetry = Updater.isReleaseBuild
-        Task.detached(priority: .background) {
-            if shouldRetireTelemetry, !CreditSampleStore.retireLegacyTelemetry() {
-                DiagLog.write("storage: legacy telemetry cleanup failed; will retry next launch")
-            }
-            CreditSampleStore.prune()
-            if shouldRetireTelemetry, case .failed(let reason) = TelemetryCleanup.live.run() {
-                DiagLog.write("telemetry setup cleanup: \(reason); will retry next launch")
-            }
-        }
-
         // A crowded menu bar (or a notch) can push the status item somewhere the
         // user can't reach, which would otherwise make settings unreachable too.
         if CommandLine.arguments.contains("--settings") { openSettings() }
+
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            Updater.completeStartup(statusItemReady: self.statusItem.button != nil) { shouldRetireTelemetry in
+                if shouldRetireTelemetry, !CreditSampleStore.retireLegacyTelemetry() {
+                    DiagLog.write("storage: legacy telemetry cleanup failed; will retry next launch")
+                }
+                CreditSampleStore.prune()
+                if shouldRetireTelemetry, case .failed(let reason) = TelemetryCleanup.live.run() {
+                    DiagLog.write("telemetry setup cleanup: \(reason); will retry next launch")
+                }
+            }
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
